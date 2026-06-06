@@ -54,7 +54,7 @@ LDFLAGS_WASM := \
 	-Wl,--stack-first -Wl,-z,stack-size=$(WASM_STACK_SIZE) \
 	-Wl,--export-table
 
-.PHONY: all wasm jsbundle deps clean provenance test verify-assets release
+.PHONY: all wasm jsbundle deps clean provenance test verify-assets release chrome-globals
 
 all: wasm jsbundle
 
@@ -112,6 +112,14 @@ $(BUNDLE_OUT): build/js/build.mjs build/js/shim.js build/js/dom.js build/js/entr
 
 $(ASSETS):
 	mkdir -p $(ASSETS)
+
+# chrome-globals refreshes the shim audit's Chrome reference fixture. The
+# fixture is captured data rather than a reproducible build output, so this
+# target is intentionally excluded from all and verify-assets. Run it on Windows
+# with WX_CHROME_EXECUTABLE pointing to the pinned Chrome for Testing build, then
+# review the JSON diff.
+chrome-globals:
+	cd build/js && npm install --no-audit --no-fund --silent && node capture-globals.mjs
 
 # deps fetches pinned toolchains into .toolchains/ and is idempotent.
 deps:

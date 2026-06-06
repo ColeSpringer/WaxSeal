@@ -934,8 +934,6 @@
   };
   var SVGUseElement = class extends SVGGraphicsElement {
   };
-  var SVGViewSpec = class {
-  };
   var SVGViewElement = class extends SVGElement {
   };
   var SVGGeometryElement = class extends SVGGraphicsElement {
@@ -1138,6 +1136,36 @@
     }
     end() {
       return 0;
+    }
+  };
+  var FontFaceSet = class extends EventTarget {
+    get size() {
+      return 0;
+    }
+    get status() {
+      return "loaded";
+    }
+    get ready() {
+      return Promise.resolve(this);
+    }
+    check() {
+      return true;
+    }
+    load() {
+      return Promise.resolve([]);
+    }
+    add() {
+      return this;
+    }
+    delete() {
+      return false;
+    }
+    has() {
+      return false;
+    }
+    clear() {
+    }
+    forEach() {
     }
   };
   var MediaStream = class extends EventTarget {
@@ -1560,6 +1588,10 @@
     get body() {
       return this._body;
     }
+    // document.fonts is a lazily created [SameObject] value.
+    get fonts() {
+      return this._fonts || (this._fonts = new FontFaceSet());
+    }
     get defaultView() {
       return G.window || G;
     }
@@ -1626,8 +1658,6 @@
   var Window = class extends EventTarget {
   };
   var Navigator = class {
-  };
-  var WorkerNavigator = class {
   };
   var NavigatorUAData = class {
   };
@@ -2113,7 +2143,6 @@
     SVGImageElement,
     SVGUseElement,
     SVGViewElement,
-    SVGViewSpec,
     SVGGeometryElement,
     SVGCircleElement,
     SVGEllipseElement,
@@ -2160,6 +2189,7 @@
     MediaError,
     TimeRanges,
     MediaStream,
+    FontFaceSet,
     Event,
     CustomEvent,
     UIEvent,
@@ -2196,7 +2226,6 @@
     HTMLCollection,
     Window,
     Navigator,
-    WorkerNavigator,
     NavigatorUAData,
     Screen,
     Location,
@@ -2289,10 +2318,10 @@
       return shifted(this).getUTCMilliseconds();
     });
   }
-  var EVENT_BATTERY = "AnimationEvent AnimationPlaybackEvent BeforeInstallPromptEvent BeforeUnloadEvent BlobEvent ClipboardEvent CloseEvent CompositionEvent ContentVisibilityAutoStateChangeEvent DeviceMotionEvent DeviceOrientationEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent HashChangeEvent IDBVersionChangeEvent InputEvent MediaEncryptedEvent MediaQueryListEvent MediaRecorderErrorEvent MediaStreamTrackEvent MutationEvent OfflineAudioCompletionEvent PageTransitionEvent PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent TouchEvent TrackEvent TransitionEvent WebGLContextEvent SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent".split(" ");
+  var EVENT_BATTERY = "AnimationEvent AnimationPlaybackEvent BeforeInstallPromptEvent BeforeUnloadEvent BlobEvent ClipboardEvent CloseEvent CompositionEvent ContentVisibilityAutoStateChangeEvent DeviceMotionEvent DeviceOrientationEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent HashChangeEvent IDBVersionChangeEvent InputEvent MediaEncryptedEvent MediaQueryListEvent MediaStreamTrackEvent OfflineAudioCompletionEvent PageTransitionEvent PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent TouchEvent TrackEvent TransitionEvent WebGLContextEvent SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent SpeechRecognitionEvent SpeechRecognitionErrorEvent USBConnectionEvent HIDConnectionEvent HIDInputReportEvent NavigateEvent NavigationCurrentEntryChangeEvent".split(" ");
   var PRESENCE_BATTERY = (
     // IndexedDB
-    "IDBFactory IDBDatabase IDBObjectStore IDBIndex IDBCursor IDBCursorWithValue IDBKeyRange IDBRequest IDBOpenDBRequest IDBTransaction MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack CanvasCaptureMediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities MediaKeys MediaKeySession MediaKeySystemAccess MediaKeyStatusMap RemotePlayback AudioContext BaseAudioContext OfflineAudioContext AudioNode AudioParam AudioBuffer AudioBufferSourceNode AudioDestinationNode AudioListener AnalyserNode GainNode BiquadFilterNode OscillatorNode DynamicsCompressorNode ConvolverNode DelayNode PannerNode StereoPannerNode WaveShaperNode ChannelMergerNode ChannelSplitterNode ConstantSourceNode IIRFilterNode PeriodicWave AudioWorklet AudioWorkletNode ScriptProcessorNode CSSStyleSheet StyleSheet StyleSheetList MediaList CSSRule CSSRuleList CSSStyleRule CSSMediaRule CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSFontFaceRule CSSSupportsRule CSSNamespaceRule CSSPageRule StylePropertyMap StylePropertyMapReadOnly CSSStyleValue CSSUnitValue CSSKeywordValue CSSMathValue CSSNumericValue CSSTransformValue CSSTransformComponent CSSPerspective CSSImageValue CSSUnparsedValue FontFace FontFaceSet WebGLBuffer WebGLProgram WebGLShader WebGLTexture WebGLFramebuffer WebGLRenderbuffer WebGLUniformLocation WebGLActiveInfo WebGLShaderPrecisionFormat WebGLVertexArrayObject WebGLQuery WebGLSampler WebGLSync WebGLTransformFeedback Worker SharedWorker ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration MessageChannel MessagePort BroadcastChannel Worklet WorkletGlobalScope MutationObserver MutationRecord ResizeObserver ResizeObserverEntry ResizeObserverSize IntersectionObserver IntersectionObserverEntry PerformanceObserver PerformanceObserverEntryList ReportingObserver ReadableStream WritableStream TransformStream ReadableStreamDefaultReader ReadableStreamBYOBReader ReadableStreamDefaultController WritableStreamDefaultWriter ByteLengthQueuingStrategy CountQueuingStrategy SubtleCrypto CryptoKey Crypto FileReader FileList FormData WebSocket EventSource XMLHttpRequest XMLHttpRequestUpload XMLHttpRequestEventTarget TextEncoderStream TextDecoderStream CompressionStream DecompressionStream DOMException DOMImplementation DOMParser XMLSerializer DOMStringList DOMStringMap DOMTokenList Attr CharacterData CDATASection ProcessingInstruction DocumentType Range StaticRange Selection NodeIterator TreeWalker ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult AbortPaymentEvent Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceNavigationTiming PerformanceResourceTiming PerformancePaintTiming PerformanceServerTiming PerformanceEventTiming PerformanceLongTaskTiming PerformanceTiming PerformanceNavigation Animation AnimationEffect KeyframeEffect AnimationTimeline DocumentTimeline Notification Permissions PermissionStatus Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates GeolocationPositionError Gamepad GamepadButton BatteryManager NetworkInformation VisualViewport BarProp External Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D IdleDeadline Image Audio Option Observable PressureRecord XRInputSource IdentityCredentialError Keyboard UserActivation Ink InkPresenter CrashReportContext WindowControlsOverlay RTCPeerConnection RTCDataChannel RTCSessionDescription RTCIceCandidate RTCRtpSender RTCRtpReceiver RTCRtpTransceiver SVGAngle SVGLength SVGLengthList SVGNumber SVGNumberList SVGPoint SVGPointList SVGRect SVGMatrix SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes SVGZoomAndPan SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGComponentTransferFunctionElement SVGFEBlendElement SVGFEColorMatrixElement SVGFEComponentTransferElement SVGFECompositeElement SVGFEConvolveMatrixElement SVGFEDiffuseLightingElement SVGFEDisplacementMapElement SVGFEDistantLightElement SVGFEDropShadowElement SVGFEFloodElement SVGFEFuncAElement SVGFEFuncBElement SVGFEFuncGElement SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement SVGFEMergeElement SVGFEMergeNodeElement SVGFEMorphologyElement SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement FileSystem FileSystemDirectoryEntry FileSystemDirectoryReader FileSystemEntry FileSystemFileEntry FileSystemHandle FileSystemFileHandle FileSystemDirectoryHandle FileSystemWritableFileStream ManagedMediaSource ManagedSourceBuffer DataTransfer DataTransferItem DataTransferItemList PointerEvent ScreenOrientation MediaQueryList NamedFlow Highlight HighlightRegistry".split(" ")
+    "IDBFactory IDBDatabase IDBObjectStore IDBIndex IDBCursor IDBCursorWithValue IDBKeyRange IDBRequest IDBOpenDBRequest IDBTransaction MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack CanvasCaptureMediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities MediaKeys MediaKeySession MediaKeySystemAccess MediaKeyStatusMap RemotePlayback AudioContext BaseAudioContext OfflineAudioContext AudioNode AudioParam AudioBuffer AudioBufferSourceNode AudioDestinationNode AudioListener AnalyserNode GainNode BiquadFilterNode OscillatorNode DynamicsCompressorNode ConvolverNode DelayNode PannerNode StereoPannerNode WaveShaperNode ChannelMergerNode ChannelSplitterNode ConstantSourceNode IIRFilterNode PeriodicWave AudioWorklet AudioWorkletNode ScriptProcessorNode CSSStyleSheet StyleSheet StyleSheetList MediaList CSSRule CSSRuleList CSSStyleRule CSSMediaRule CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSFontFaceRule CSSSupportsRule CSSNamespaceRule CSSPageRule StylePropertyMap StylePropertyMapReadOnly CSSStyleValue CSSUnitValue CSSKeywordValue CSSMathValue CSSNumericValue CSSTransformValue CSSTransformComponent CSSPerspective CSSImageValue CSSUnparsedValue FontFace WebGLBuffer WebGLProgram WebGLShader WebGLTexture WebGLFramebuffer WebGLRenderbuffer WebGLUniformLocation WebGLActiveInfo WebGLShaderPrecisionFormat WebGLVertexArrayObject WebGLQuery WebGLSampler WebGLSync WebGLTransformFeedback Worker SharedWorker MessageChannel MessagePort BroadcastChannel Worklet MutationObserver MutationRecord ResizeObserver ResizeObserverEntry ResizeObserverSize IntersectionObserver IntersectionObserverEntry PerformanceObserver PerformanceObserverEntryList ReportingObserver ReadableStream WritableStream TransformStream ReadableStreamDefaultReader ReadableStreamBYOBReader ReadableStreamDefaultController WritableStreamDefaultWriter ByteLengthQueuingStrategy CountQueuingStrategy SubtleCrypto CryptoKey Crypto FileReader FileList FormData WebSocket EventSource XMLHttpRequest XMLHttpRequestUpload XMLHttpRequestEventTarget TextEncoderStream TextDecoderStream CompressionStream DecompressionStream DOMException DOMImplementation DOMParser XMLSerializer DOMStringList DOMStringMap DOMTokenList Attr CharacterData CDATASection ProcessingInstruction DocumentType Range StaticRange Selection NodeIterator TreeWalker ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceNavigationTiming PerformanceResourceTiming PerformancePaintTiming PerformanceServerTiming PerformanceEventTiming PerformanceLongTaskTiming PerformanceTiming PerformanceNavigation Animation AnimationEffect KeyframeEffect AnimationTimeline DocumentTimeline Notification Permissions Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates GeolocationPositionError Gamepad GamepadButton VisualViewport BarProp External Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D IdleDeadline Image Audio Option Observable PressureRecord XRInputSource IdentityCredentialError Keyboard UserActivation Ink InkPresenter CrashReportContext WindowControlsOverlay RTCPeerConnection RTCDataChannel RTCSessionDescription RTCIceCandidate RTCRtpSender RTCRtpReceiver RTCRtpTransceiver SVGAngle SVGLength SVGLengthList SVGNumber SVGNumberList SVGPoint SVGPointList SVGRect SVGMatrix SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGComponentTransferFunctionElement SVGFEBlendElement SVGFEColorMatrixElement SVGFEComponentTransferElement SVGFECompositeElement SVGFEConvolveMatrixElement SVGFEDiffuseLightingElement SVGFEDisplacementMapElement SVGFEDistantLightElement SVGFEDropShadowElement SVGFEFloodElement SVGFEFuncAElement SVGFEFuncBElement SVGFEFuncGElement SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement SVGFEMergeElement SVGFEMergeNodeElement SVGFEMorphologyElement SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement FileSystemHandle FileSystemFileHandle FileSystemDirectoryHandle FileSystemWritableFileStream DataTransfer DataTransferItem DataTransferItemList PointerEvent ScreenOrientation MediaQueryList Highlight HighlightRegistry GPU GPUAdapter GPUCanvasContext GPUDeviceLostInfo USBDevice BluetoothRemoteGATTServer CredentialsContainer Credential StorageManager LockManager Lock StorageBucketManager StorageBucket Scheduling MediaSession MediaMetadata Presentation WakeLock GamepadHapticActuator SpeechGrammar SpeechSynthesisVoice SpeechSynthesis NavigationDestination NavigationTransition NavigationActivation NavigationPrecommitController NavigationPreloadManager TrustedTypePolicyFactory TrustedTypePolicy TrustedHTML TrustedScript TrustedScriptURL IdentityProvider FetchLaterResult GPUQueue".split(" ")
   );
   function rename(fn, name) {
     try {
@@ -2301,6 +2330,40 @@
     }
     return fn;
   }
+  var EVENTTARGET_CONSTRUCTIBLE_BATTERY = "SpeechRecognition SpeechSynthesisUtterance CloseWatcher".split(" ");
+  var PLAIN_CONSTRUCTIBLE_BATTERY = "SpeechGrammarList SpeechRecognitionPhrase PressureObserver".split(" ");
+  var WEBKIT_ALIASES = {
+    webkitSpeechRecognition: "SpeechRecognition",
+    webkitSpeechRecognitionError: "SpeechRecognitionErrorEvent",
+    webkitSpeechRecognitionEvent: "SpeechRecognitionEvent",
+    webkitSpeechGrammar: "SpeechGrammar",
+    webkitSpeechGrammarList: "SpeechGrammarList",
+    webkitMediaStream: "MediaStream"
+  };
+  var EVENTTARGET_PRESENCE_BATTERY = "GPUDevice USB HID HIDDevice Serial SerialPort Bluetooth BluetoothDevice XRSystem XRSession XRLayer PresentationRequest PresentationConnection WakeLockSentinel DevicePosture VirtualKeyboard NavigatorManagedData ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration PermissionStatus BatteryManager NetworkInformation Navigation NavigationHistoryEntry TextTrackCue".split(" ");
+  var DERIVED_PRESENCE_BATTERY = [
+    ["CSSGroupingRule", "CSSRule"],
+    ["CSSFunctionRule", "CSSGroupingRule"],
+    ["CSSPositionValue", "CSSStyleValue"],
+    ["SharedStorageModifierMethod", null],
+    ["SharedStorageAppendMethod", "SharedStorageModifierMethod"],
+    ["SharedStorageSetMethod", "SharedStorageModifierMethod"],
+    ["SharedStorageDeleteMethod", "SharedStorageModifierMethod"],
+    ["SharedStorageClearMethod", "SharedStorageModifierMethod"],
+    // Credential and WebXR subclasses are constructable in the Chrome snapshot.
+    ["FederatedCredential", "Credential"],
+    ["PasswordCredential", "Credential"],
+    ["PublicKeyCredential", "Credential"],
+    ["IdentityCredential", "Credential"],
+    ["XRWebGLLayer", "XRLayer"],
+    // WebXR layer hierarchy.
+    ["XRCompositionLayer", "XRLayer"],
+    ["XRCylinderLayer", "XRCompositionLayer"],
+    ["XRProjectionLayer", "XRCompositionLayer"],
+    ["XRQuadLayer", "XRCompositionLayer"],
+    ["XREquirectLayer", "XRCompositionLayer"],
+    ["XRCubeLayer", "XRCompositionLayer"]
+  ];
   function installPlatformBattery(target) {
     const define = (name, C) => {
       try {
@@ -2311,6 +2374,41 @@
     for (const name of EVENT_BATTERY) {
       if (typeof target[name] !== "undefined") continue;
       const C = class extends Event {
+      };
+      rename(C, name);
+      markNative(C, name);
+      define(name, C);
+    }
+    if (typeof target.SpeechSynthesisErrorEvent === "undefined" && typeof target.SpeechSynthesisEvent === "function") {
+      const C = class extends target.SpeechSynthesisEvent {
+      };
+      rename(C, "SpeechSynthesisErrorEvent");
+      markNative(C, "SpeechSynthesisErrorEvent");
+      define("SpeechSynthesisErrorEvent", C);
+    }
+    for (const name of EVENTTARGET_CONSTRUCTIBLE_BATTERY) {
+      if (typeof target[name] !== "undefined") continue;
+      const C = class extends EventTarget {
+      };
+      rename(C, name);
+      markNative(C, name);
+      define(name, C);
+    }
+    for (const name of PLAIN_CONSTRUCTIBLE_BATTERY) {
+      if (typeof target[name] !== "undefined") continue;
+      const C = class {
+      };
+      rename(C, name);
+      markNative(C, name);
+      define(name, C);
+    }
+    for (const name of EVENTTARGET_PRESENCE_BATTERY) {
+      if (typeof target[name] !== "undefined") continue;
+      const C = class extends EventTarget {
+        constructor() {
+          super();
+          illegal();
+        }
       };
       rename(C, name);
       markNative(C, name);
@@ -2346,6 +2444,25 @@
       markNative(C, name);
       define(name, C);
     }
+    for (const [name, parent] of DERIVED_PRESENCE_BATTERY) {
+      if (typeof target[name] !== "undefined") continue;
+      const Base = parent ? target[parent] : null;
+      const C = typeof Base === "function" ? class extends Base {
+        constructor() {
+          super();
+          illegal();
+        }
+      } : function() {
+        illegal();
+      };
+      rename(C, name);
+      markNative(C, name);
+      define(name, C);
+    }
+    for (const alias in WEBKIT_ALIASES) {
+      const base = target[WEBKIT_ALIASES[alias]];
+      if (typeof target[alias] === "undefined" && typeof base !== "undefined") define(alias, base);
+    }
   }
   installInterfaces(G);
   installPlatformBattery(G);
@@ -2370,6 +2487,36 @@
       return fn;
     };
     const defHidden2 = (name, value) => Object.defineProperty(G3, name, { value, configurable: true, writable: true, enumerable: false });
+    const ifaceStore = /* @__PURE__ */ new WeakMap();
+    function iface(Ctor, spec) {
+      const proto = Ctor.prototype;
+      const state = {};
+      for (const name of Object.keys(spec)) {
+        const v = spec[name];
+        if (typeof v === "function") {
+          if (!Object.prototype.hasOwnProperty.call(proto, name))
+            Object.defineProperty(proto, name, { value: asNative(v, name), writable: true, enumerable: false, configurable: true });
+          continue;
+        }
+        state[name] = v;
+        if (!Object.prototype.hasOwnProperty.call(proto, name))
+          Object.defineProperty(proto, name, {
+            get: markNative(function() {
+              const s = ifaceStore.get(this);
+              return s ? s[name] : void 0;
+            }, "get " + name),
+            set: markNative(function(x) {
+              const s = ifaceStore.get(this);
+              if (s) s[name] = x;
+            }, "set " + name),
+            enumerable: false,
+            configurable: true
+          });
+      }
+      const inst = Object.create(proto);
+      ifaceStore.set(inst, state);
+      return inst;
+    }
     const mklog = (level) => asNative(function() {
       let s = "";
       for (let i = 0; i < arguments.length; i++) {
@@ -2400,8 +2547,7 @@
     Math.random = asNative(function random() {
       return __wx_random_double();
     }, "random");
-    const subtleObj = Object.create(G3.SubtleCrypto.prototype);
-    Object.assign(subtleObj, {
+    const subtleObj = iface(G3.SubtleCrypto, {
       digest: asNative(function digest() {
         return Promise.resolve(new ArrayBuffer(32));
       }, "digest"),
@@ -2427,8 +2573,7 @@
         return Promise.resolve(true);
       }, "verify")
     });
-    const cryptoObj = Object.create(G3.Crypto.prototype);
-    Object.assign(cryptoObj, {
+    const cryptoObj = iface(G3.Crypto, {
       getRandomValues: asNative(function getRandomValues(arr) {
         if (arr == null || arr.buffer === void 0)
           throw new TypeError("getRandomValues expects an integer TypedArray");
@@ -2596,6 +2741,17 @@
       "__wxGetProbes",
       "__wxClearProbes"
     ]);
+    const INTERNAL_INTERFACES = /* @__PURE__ */ new Set([
+      "VideoTrack",
+      "AudioTrack",
+      "VideoTrackList",
+      "AudioTrackList",
+      "InkPresenter",
+      // FontFaceSet remains reachable through document.fonts.
+      "FontFaceSet"
+    ]);
+    const fullyHidden = (k) => typeof k === "string" && (HIDDEN.has(k) || INTERNAL_INTERFACES.has(k));
+    const internalField = (k) => typeof k === "string" && k.charCodeAt(0) === 95;
     const ALLOW = /* @__PURE__ */ new Set([
       "then",
       "toJSON",
@@ -2643,22 +2799,25 @@
     function discoveryProxy(target, label) {
       return new Proxy(target, {
         get(t, prop, recv) {
-          if (typeof prop === "string" && HIDDEN.has(prop)) return void 0;
+          if (fullyHidden(prop)) return void 0;
+          if (internalField(prop) && Object.prototype.hasOwnProperty.call(t, prop)) return void 0;
           if (prop in t || typeof prop === "symbol" || ALLOW.has(prop))
-            return Reflect.get(t, prop, recv);
+            return Reflect.get(t, prop, t);
           logProbe(label + "." + String(prop));
           return G3.__wxAutoStub ? universalStub(label + "." + String(prop)) : void 0;
         },
         has(t, prop) {
-          if (typeof prop === "string" && HIDDEN.has(prop)) return false;
+          if (fullyHidden(prop)) return false;
+          if (internalField(prop) && Object.prototype.hasOwnProperty.call(t, prop)) return false;
           if (typeof prop === "string" && !ALLOW.has(prop) && !Reflect.has(t, prop))
             logProbe(label + "." + String(prop));
           if (G3.__wxAutoStub && typeof prop === "string") return true;
           return Reflect.has(t, prop);
         },
         getOwnPropertyDescriptor(t, prop) {
-          if (typeof prop === "string" && HIDDEN.has(prop)) return void 0;
+          if (fullyHidden(prop)) return void 0;
           const d = Reflect.getOwnPropertyDescriptor(t, prop);
+          if (d && internalField(prop)) return void 0;
           if (d) return d;
           if (typeof prop === "string" && !ALLOW.has(prop) && !Reflect.has(t, prop)) {
             logProbe(label + "." + String(prop));
@@ -2672,9 +2831,9 @@
           }
           return void 0;
         },
-        // Hidden names are configurable, so omitting them satisfies Proxy invariants.
+        // All omitted properties are configurable, which satisfies Proxy invariants.
         ownKeys(t) {
-          return Reflect.ownKeys(t).filter((k) => !(typeof k === "string" && HIDDEN.has(k)));
+          return Reflect.ownKeys(t).filter((k) => !(fullyHidden(k) || internalField(k)));
         },
         set(t, prop, val, recv) {
           return Reflect.set(t, prop, val, recv);
@@ -2824,41 +2983,43 @@
       }
       const t0 = Date.now();
       if (!baseNow) baseNow = () => Date.now() - t0;
-      const perf = Object.create(G3.Performance.prototype);
-      perf.timeOrigin = t0;
-      perf.now = asNative(function now() {
-        return baseNow();
-      }, "now");
-      perf.mark = asNative(function mark() {
-        return null;
-      }, "mark");
-      perf.measure = asNative(function measure() {
-        return null;
-      }, "measure");
-      perf.clearMarks = asNative(function clearMarks() {
-      }, "clearMarks");
-      perf.clearMeasures = asNative(function clearMeasures() {
-      }, "clearMeasures");
-      perf.getEntries = asNative(function getEntries() {
-        return [];
-      }, "getEntries");
-      perf.getEntriesByName = asNative(function getEntriesByName() {
-        return [];
-      }, "getEntriesByName");
-      perf.getEntriesByType = asNative(function getEntriesByType() {
-        return [];
-      }, "getEntriesByType");
-      perf.toJSON = asNative(function toJSON() {
-        return { timeOrigin: this.timeOrigin };
-      }, "toJSON");
+      const perf = iface(G3.Performance, {
+        timeOrigin: t0,
+        now: asNative(function now() {
+          return baseNow();
+        }, "now"),
+        mark: asNative(function mark() {
+          return null;
+        }, "mark"),
+        measure: asNative(function measure() {
+          return null;
+        }, "measure"),
+        clearMarks: asNative(function clearMarks() {
+        }, "clearMarks"),
+        clearMeasures: asNative(function clearMeasures() {
+        }, "clearMeasures"),
+        getEntries: asNative(function getEntries() {
+          return [];
+        }, "getEntries"),
+        getEntriesByName: asNative(function getEntriesByName() {
+          return [];
+        }, "getEntriesByName"),
+        getEntriesByType: asNative(function getEntriesByType() {
+          return [];
+        }, "getEntriesByType"),
+        toJSON: asNative(function toJSON() {
+          return { timeOrigin: this.timeOrigin };
+        }, "toJSON")
+      });
       def("performance", perf);
     })();
     let currentProfile = null;
+    let batteryPromise = null;
     defHidden2("__wxApplyProfile", function __wxApplyProfile(p) {
       const prof = Object.assign({}, DEFAULT_PROFILE, p || {});
       currentProfile = prof;
-      const navBase = Object.create(G3.Navigator.prototype);
-      Object.assign(navBase, {
+      const navSpec = {};
+      Object.assign(navSpec, {
         userAgent: prof.userAgent,
         appVersion: prof.userAgent.replace(/^Mozilla\//, ""),
         appName: "Netscape",
@@ -2878,11 +3039,13 @@
         webdriver: false,
         doNotTrack: null,
         pdfViewerEnabled: true,
-        userAgentData: prof.userAgentData ? Object.assign(Object.create(G3.NavigatorUAData.prototype), {
+        userAgentData: prof.userAgentData ? iface(G3.NavigatorUAData, {
           brands: prof.userAgentData.brands.map((b) => Object.assign({}, b)),
           mobile: prof.userAgentData.mobile,
           platform: prof.userAgentData.platform,
           getHighEntropyValues: asNative(function getHighEntropyValues(hints) {
+            const uad = currentProfile && currentProfile.userAgentData;
+            const brand0 = this.brands && this.brands[0];
             const full = {
               brands: this.brands,
               mobile: this.mobile,
@@ -2891,8 +3054,8 @@
               architecture: "x86",
               bitness: "64",
               model: "",
-              uaFullVersion: prof.userAgentData.uaFullVersion || prof.userAgentData.brands[0].version + ".0.0.0",
-              fullVersionList: prof.userAgentData.fullVersionList || this.brands
+              uaFullVersion: uad && uad.uaFullVersion || (brand0 && brand0.version || "0") + ".0.0.0",
+              fullVersionList: uad && uad.fullVersionList || this.brands
             };
             const out = { brands: this.brands, mobile: this.mobile, platform: this.platform };
             (hints || []).forEach((h) => {
@@ -2949,7 +3112,7 @@
           return false;
         }, "canLoadAdAuctionFencedFrame"),
         // Use interface instances so navigator properties pass instanceof checks.
-        mediaDevices: Object.assign(Object.create(G3.MediaDevices.prototype), {
+        mediaDevices: iface(G3.MediaDevices, {
           ondevicechange: null,
           enumerateDevices: asNative(function enumerateDevices() {
             return Promise.resolve([]);
@@ -2964,14 +3127,14 @@
             return Promise.reject(Object.assign(new Error("Permission denied"), { name: "NotAllowedError" }));
           }, "getDisplayMedia")
         }),
-        connection: Object.assign(Object.create(G3.NetworkInformation.prototype), {
+        connection: iface(G3.NetworkInformation, {
           effectiveType: "4g",
           rtt: 50,
           downlink: 10,
           saveData: false,
           onchange: null
         }),
-        keyboard: Object.assign(Object.create(G3.Keyboard.prototype), {
+        keyboard: iface(G3.Keyboard, {
           getLayoutMap: asNative(function getLayoutMap() {
             return Promise.resolve(/* @__PURE__ */ new Map());
           }, "getLayoutMap"),
@@ -2981,11 +3144,11 @@
           unlock: asNative(function unlock() {
           }, "unlock")
         }),
-        userActivation: Object.assign(Object.create(G3.UserActivation.prototype), {
+        userActivation: iface(G3.UserActivation, {
           hasBeenActive: false,
           isActive: false
         }),
-        windowControlsOverlay: Object.assign(Object.create(G3.WindowControlsOverlay.prototype), {
+        windowControlsOverlay: iface(G3.WindowControlsOverlay, {
           visible: false,
           ongeometrychange: null,
           getTitlebarAreaRect: asNative(function getTitlebarAreaRect() {
@@ -2993,9 +3156,9 @@
           }, "getTitlebarAreaRect")
         }),
         // Use Ink and InkPresenter instances to preserve instanceof behavior.
-        ink: Object.assign(Object.create(G3.Ink.prototype), {
+        ink: iface(G3.Ink, {
           requestPresenter: asNative(function requestPresenter(param) {
-            return Promise.resolve(Object.assign(Object.create(G3.InkPresenter.prototype), {
+            return Promise.resolve(iface(G3.InkPresenter, {
               presentationArea: null,
               updateInkTrailStartPoint: asNative(function updateInkTrailStartPoint(event, style) {
               }, "updateInkTrailStartPoint")
@@ -3003,8 +3166,240 @@
           }, "requestPresenter")
         })
       });
+      const rejectNotAllowed = () => Promise.reject(Object.assign(new Error("Permission denied"), { name: "NotAllowedError" }));
+      Object.assign(navSpec, {
+        gpu: iface(G3.GPU, {
+          requestAdapter: asNative(function requestAdapter() {
+            return Promise.resolve(null);
+          }, "requestAdapter"),
+          getPreferredCanvasFormat: asNative(function getPreferredCanvasFormat() {
+            return "bgra8unorm";
+          }, "getPreferredCanvasFormat")
+        }),
+        usb: iface(G3.USB, {
+          onconnect: null,
+          ondisconnect: null,
+          getDevices: asNative(function getDevices() {
+            return Promise.resolve([]);
+          }, "getDevices"),
+          requestDevice: asNative(function requestDevice() {
+            return rejectNotAllowed();
+          }, "requestDevice")
+        }),
+        hid: iface(G3.HID, {
+          onconnect: null,
+          ondisconnect: null,
+          getDevices: asNative(function getDevices() {
+            return Promise.resolve([]);
+          }, "getDevices"),
+          requestDevice: asNative(function requestDevice() {
+            return Promise.resolve([]);
+          }, "requestDevice")
+        }),
+        serial: iface(G3.Serial, {
+          onconnect: null,
+          ondisconnect: null,
+          getPorts: asNative(function getPorts() {
+            return Promise.resolve([]);
+          }, "getPorts"),
+          requestPort: asNative(function requestPort() {
+            return rejectNotAllowed();
+          }, "requestPort")
+        }),
+        bluetooth: iface(G3.Bluetooth, {
+          onavailabilitychanged: null,
+          getAvailability: asNative(function getAvailability() {
+            return Promise.resolve(false);
+          }, "getAvailability"),
+          getDevices: asNative(function getDevices() {
+            return Promise.resolve([]);
+          }, "getDevices"),
+          requestDevice: asNative(function requestDevice() {
+            return rejectNotAllowed();
+          }, "requestDevice")
+        }),
+        xr: iface(G3.XRSystem, {
+          ondevicechange: null,
+          isSessionSupported: asNative(function isSessionSupported() {
+            return Promise.resolve(false);
+          }, "isSessionSupported"),
+          requestSession: asNative(function requestSession() {
+            return rejectNotAllowed();
+          }, "requestSession")
+        }),
+        credentials: iface(G3.CredentialsContainer, {
+          get: asNative(function get() {
+            return Promise.resolve(null);
+          }, "get"),
+          store: asNative(function store() {
+            return Promise.resolve();
+          }, "store"),
+          create: asNative(function create2() {
+            return Promise.resolve(null);
+          }, "create"),
+          preventSilentAccess: asNative(function preventSilentAccess() {
+            return Promise.resolve();
+          }, "preventSilentAccess")
+        }),
+        geolocation: iface(G3.Geolocation, {
+          // Chrome reports geolocation errors asynchronously.
+          getCurrentPosition: asNative(function getCurrentPosition(_ok, err) {
+            if (typeof err === "function") Promise.resolve().then(function() {
+              err(iface(G3.GeolocationPositionError, { code: 1, message: "User denied Geolocation" }));
+            });
+          }, "getCurrentPosition"),
+          watchPosition: asNative(function watchPosition() {
+            return 0;
+          }, "watchPosition"),
+          clearWatch: asNative(function clearWatch() {
+          }, "clearWatch")
+        }),
+        permissions: iface(G3.Permissions, {
+          query: asNative(function query(desc) {
+            return Promise.resolve(iface(G3.PermissionStatus, { name: desc && desc.name || "", state: "prompt", onchange: null }));
+          }, "query")
+        }),
+        serviceWorker: iface(G3.ServiceWorkerContainer, {
+          controller: null,
+          oncontrollerchange: null,
+          onmessage: null,
+          onmessageerror: null,
+          ready: Promise.resolve(iface(G3.ServiceWorkerRegistration, {
+            installing: null,
+            waiting: null,
+            active: null,
+            scope: "https://www.youtube.com/",
+            updateViaCache: "imports",
+            unregister: asNative(function unregister() {
+              return Promise.resolve(true);
+            }, "unregister"),
+            update: asNative(function update() {
+              return Promise.resolve();
+            }, "update")
+          })),
+          register: asNative(function register() {
+            return rejectNotAllowed();
+          }, "register"),
+          getRegistration: asNative(function getRegistration() {
+            return Promise.resolve(void 0);
+          }, "getRegistration"),
+          getRegistrations: asNative(function getRegistrations() {
+            return Promise.resolve([]);
+          }, "getRegistrations"),
+          startMessages: asNative(function startMessages() {
+          }, "startMessages")
+        }),
+        storage: iface(G3.StorageManager, {
+          estimate: asNative(function estimate() {
+            return Promise.resolve({ quota: 0, usage: 0, usageDetails: {} });
+          }, "estimate"),
+          persist: asNative(function persist() {
+            return Promise.resolve(false);
+          }, "persist"),
+          persisted: asNative(function persisted() {
+            return Promise.resolve(false);
+          }, "persisted"),
+          getDirectory: asNative(function getDirectory() {
+            return rejectNotAllowed();
+          }, "getDirectory")
+        }),
+        locks: iface(G3.LockManager, {
+          // Supply a Lock instance because callbacks commonly inspect its name and mode.
+          request: asNative(function request(name, opts, cb) {
+            const fn = typeof opts === "function" ? opts : cb;
+            const lock = iface(G3.Lock, { name: String(name), mode: opts && typeof opts === "object" && opts.mode === "shared" ? "shared" : "exclusive" });
+            return Promise.resolve().then(function() {
+              return fn ? fn(lock) : void 0;
+            });
+          }, "request"),
+          query: asNative(function query() {
+            return Promise.resolve({ held: [], pending: [] });
+          }, "query")
+        }),
+        mediaCapabilities: iface(G3.MediaCapabilities, {
+          decodingInfo: asNative(function decodingInfo() {
+            return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+          }, "decodingInfo"),
+          encodingInfo: asNative(function encodingInfo() {
+            return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+          }, "encodingInfo")
+        }),
+        mediaSession: iface(G3.MediaSession, {
+          metadata: null,
+          playbackState: "none",
+          setActionHandler: asNative(function setActionHandler() {
+          }, "setActionHandler"),
+          setPositionState: asNative(function setPositionState() {
+          }, "setPositionState"),
+          setMicrophoneActive: asNative(function setMicrophoneActive() {
+          }, "setMicrophoneActive"),
+          setCameraActive: asNative(function setCameraActive() {
+          }, "setCameraActive")
+        }),
+        presentation: iface(G3.Presentation, { defaultRequest: null, receiver: null }),
+        wakeLock: iface(G3.WakeLock, {
+          request: asNative(function request() {
+            return rejectNotAllowed();
+          }, "request")
+        }),
+        devicePosture: iface(G3.DevicePosture, { type: "continuous", onchange: null }),
+        virtualKeyboard: iface(G3.VirtualKeyboard, {
+          boundingRect: new G3.DOMRect(0, 0, 0, 0),
+          overlaysContent: false,
+          ongeometrychange: null,
+          show: asNative(function show() {
+          }, "show"),
+          hide: asNative(function hide() {
+          }, "hide")
+        }),
+        storageBuckets: iface(G3.StorageBucketManager, {
+          open: asNative(function open() {
+            return rejectNotAllowed();
+          }, "open"),
+          keys: asNative(function keys() {
+            return Promise.resolve([]);
+          }, "keys"),
+          delete: asNative(function _delete() {
+            return Promise.resolve();
+          }, "delete")
+        }),
+        scheduling: iface(G3.Scheduling, {
+          isInputPending: asNative(function isInputPending() {
+            return false;
+          }, "isInputPending")
+        }),
+        vibrate: asNative(function vibrate() {
+          return false;
+        }, "vibrate"),
+        getBattery: asNative(function getBattery() {
+          if (!batteryPromise) batteryPromise = Promise.resolve(iface(G3.BatteryManager, { charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null }));
+          return batteryPromise;
+        }, "getBattery"),
+        getGamepads: asNative(function getGamepads() {
+          return [null, null, null, null];
+        }, "getGamepads"),
+        share: asNative(function share() {
+          return rejectNotAllowed();
+        }, "share"),
+        canShare: asNative(function canShare() {
+          return false;
+        }, "canShare"),
+        setAppBadge: asNative(function setAppBadge() {
+          return Promise.resolve();
+        }, "setAppBadge"),
+        requestMIDIAccess: asNative(function requestMIDIAccess() {
+          return rejectNotAllowed();
+        }, "requestMIDIAccess"),
+        requestMediaKeySystemAccess: asNative(function requestMediaKeySystemAccess() {
+          return rejectNotAllowed();
+        }, "requestMediaKeySystemAccess"),
+        getInstalledRelatedApps: asNative(function getInstalledRelatedApps() {
+          return Promise.resolve([]);
+        }, "getInstalledRelatedApps")
+      });
+      const navBase = iface(G3.Navigator, navSpec);
       def("navigator", discoveryProxy(navBase, "navigator"));
-      const screenBase = Object.assign(Object.create(G3.Screen.prototype), {
+      const screenBase = iface(G3.Screen, {
         width: prof.screen[0],
         height: prof.screen[1],
         availWidth: prof.screen[0],
@@ -3025,7 +3420,7 @@
       def("screenLeft", 0);
       def("screenTop", 0);
       def("devicePixelRatio", 1);
-      const loc = Object.assign(Object.create(G3.Location.prototype), {
+      const loc = iface(G3.Location, {
         href: "https://www.youtube.com/",
         origin: "https://www.youtube.com",
         protocol: "https:",
@@ -3047,6 +3442,41 @@
       });
       def("location", loc);
       def("origin", loc.origin);
+      def("trustedTypes", iface(G3.TrustedTypePolicyFactory, {
+        emptyHTML: "",
+        emptyScript: "",
+        defaultPolicy: null,
+        createPolicy: asNative(function createPolicy(name) {
+          return iface(G3.TrustedTypePolicy, {
+            name: String(name == null ? "" : name),
+            createHTML: asNative(function createHTML(s) {
+              return String(s);
+            }, "createHTML"),
+            createScript: asNative(function createScript(s) {
+              return String(s);
+            }, "createScript"),
+            createScriptURL: asNative(function createScriptURL(s) {
+              return String(s);
+            }, "createScriptURL")
+          });
+        }, "createPolicy"),
+        getAttributeType: asNative(function getAttributeType() {
+          return null;
+        }, "getAttributeType"),
+        getPropertyType: asNative(function getPropertyType() {
+          return null;
+        }, "getPropertyType"),
+        isHTML: asNative(function isHTML() {
+          return false;
+        }, "isHTML"),
+        isScript: asNative(function isScript() {
+          return false;
+        }, "isScript"),
+        isScriptURL: asNative(function isScriptURL() {
+          return false;
+        }, "isScriptURL")
+      }));
+      def("crashReport", iface(G3.CrashReportContext, {}));
       const doc = createDocument();
       doc._title = "";
       def("document", discoveryProxy(doc, "document"));
@@ -3090,11 +3520,9 @@
         } };
       });
       defFn("getComputedStyle", function getComputedStyle() {
-        const s = Object.create(G3.CSSStyleDeclaration.prototype);
-        s.getPropertyValue = asNative(function getPropertyValue() {
+        return iface(G3.CSSStyleDeclaration, { getPropertyValue: asNative(function getPropertyValue() {
           return "";
-        }, "getPropertyValue");
-        return s;
+        }, "getPropertyValue") });
       });
       defFn("addEventListener", function addEventListener() {
       });

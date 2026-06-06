@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "roots": [
+    {
+      "target": "window",
+      "name": "CSSFunctionRule",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "CSSPositionValue",
+      "firstObservedMissing": "2026-06-06T21:32:33Z",
+      "lastObservedMissing": "2026-06-06T21:32:33Z"
+    },
+    {
+      "target": "window",
+      "name": "CloseWatcher",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "FetchLaterResult",
+      "firstObservedMissing": "2026-06-06T21:32:33Z",
+      "lastObservedMissing": "2026-06-06T21:32:33Z"
+    },
+    {
+      "target": "window",
+      "name": "GPUQueue",
+      "firstObservedMissing": "2026-06-06T21:38:00Z",
+      "lastObservedMissing": "2026-06-06T21:38:00Z"
+    },
+    {
+      "target": "window",
+      "name": "IdentityProvider",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "NavigationDestination",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "PressureObserver",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "SharedStorageAppendMethod",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "SpeechRecognitionErrorEvent",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "TextTrackCue",
+      "firstObservedMissing": "2026-06-06T21:38:00Z",
+      "lastObservedMissing": "2026-06-06T21:38:00Z"
+    },
+    {
+      "target": "window",
+      "name": "XRCylinderLayer",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "crashReport",
+      "firstObservedMissing": "2026-06-06T21:38:00Z",
+      "lastObservedMissing": "2026-06-06T21:38:00Z"
+    },
+    {
+      "target": "window",
+      "name": "trustedTypes",
+      "firstObservedMissing": "2026-06-06T00:00:00Z",
+      "lastObservedMissing": "2026-06-06T00:00:00Z"
+    },
+    {
+      "target": "window",
+      "name": "webkitMediaStream",
+      "firstObservedMissing": "2026-06-06T21:32:33Z",
+      "lastObservedMissing": "2026-06-06T21:32:33Z"
+    }
+  ],
+  "rawPaths": [
+    "window.CSSFunctionRule",
+    "window.CSSPositionValue",
+    "window.CSSPositionValue.prototype",
+    "window.CloseWatcher",
+    "window.FetchLaterResult",
+    "window.FetchLaterResult.prototype",
+    "window.GPUQueue",
+    "window.GPUQueue.prototype",
+    "window.IdentityProvider",
+    "window.NavigationDestination",
+    "window.PressureObserver",
+    "window.SharedStorageAppendMethod",
+    "window.SpeechRecognitionErrorEvent",
+    "window.TextTrackCue",
+    "window.TextTrackCue.prototype",
+    "window.XRCylinderLayer",
+    "window.crashReport",
+    "window.crashReport.call",
+    "window.trustedTypes",
+    "window.webkitMediaStream",
+    "window.webkitMediaStream.call"
+  ],
+  "updatedAt": "2026-06-06T21:38:00Z"
+}

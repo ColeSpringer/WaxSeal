@@ -53,6 +53,33 @@ import {
   const defHidden = (name, value) =>
     Object.defineProperty(G, name, { value, configurable: true, writable: true, enumerable: false });
 
+  // Build Web IDL-style instances: methods and attributes live on the prototype,
+  // while a WeakMap holds per-instance attribute values. The returned object has
+  // no own properties but retains instanceof and inherited EventTarget behavior.
+  const ifaceStore = new WeakMap();
+  function iface(Ctor, spec) {
+    const proto = Ctor.prototype;
+    const state = {};
+    for (const name of Object.keys(spec)) {
+      const v = spec[name];
+      if (typeof v === 'function') {
+        if (!Object.prototype.hasOwnProperty.call(proto, name))
+          Object.defineProperty(proto, name, { value: asNative(v, name), writable: true, enumerable: false, configurable: true });
+        continue;
+      }
+      state[name] = v;
+      if (!Object.prototype.hasOwnProperty.call(proto, name))
+        Object.defineProperty(proto, name, {
+          get: markNative(function () { const s = ifaceStore.get(this); return s ? s[name] : undefined; }, 'get ' + name),
+          set: markNative(function (x) { const s = ifaceStore.get(this); if (s) s[name] = x; }, 'set ' + name),
+          enumerable: false, configurable: true,
+        });
+    }
+    const inst = Object.create(proto);
+    ifaceStore.set(inst, state);
+    return inst;
+  }
+
   // Console.
   const mklog = (level) => asNative(function () {
     let s = '';
@@ -80,8 +107,7 @@ import {
   }, 'random');
   // A real Crypto instance keeps `crypto instanceof Crypto` true. `subtle` is a
   // SubtleCrypto instance for the same reason.
-  const subtleObj = Object.create(G.SubtleCrypto.prototype);
-  Object.assign(subtleObj, {
+  const subtleObj = iface(G.SubtleCrypto, {
     digest: asNative(function digest() { return Promise.resolve(new ArrayBuffer(32)); }, 'digest'),
     generateKey: asNative(function generateKey() { return Promise.resolve(Object.create(G.CryptoKey.prototype)); }, 'generateKey'),
     importKey: asNative(function importKey() { return Promise.resolve(Object.create(G.CryptoKey.prototype)); }, 'importKey'),
@@ -91,8 +117,7 @@ import {
     sign: asNative(function sign() { return Promise.resolve(new ArrayBuffer(0)); }, 'sign'),
     verify: asNative(function verify() { return Promise.resolve(true); }, 'verify')
   });
-  const cryptoObj = Object.create(G.Crypto.prototype);
-  Object.assign(cryptoObj, {
+  const cryptoObj = iface(G.Crypto, {
     getRandomValues: asNative(function getRandomValues(arr) {
       if (arr == null || arr.buffer === undefined)
         throw new TypeError("getRandomValues expects an integer TypedArray");
@@ -269,6 +294,16 @@ import {
     'runBotguard', 'newMinter', 'mint', '__wx_runTimers', '__wxApplyProfile',
     '__wxDiscovery', '__wxAutoStub', '__wxGetProbes', '__wxClearProbes',
   ]);
+  // Classes used internally by the shim but not exposed as Chrome window globals.
+  const INTERNAL_INTERFACES = new Set([
+    'VideoTrack', 'AudioTrack', 'VideoTrackList', 'AudioTrackList', 'InkPresenter',
+    // FontFaceSet remains reachable through document.fonts.
+    'FontFaceSet',
+  ]);
+  // Hide host bindings, internal classes, and own underscore-prefixed state from
+  // the browser-visible surface.
+  const fullyHidden = (k) => typeof k === 'string' && (HIDDEN.has(k) || INTERNAL_INTERFACES.has(k));
+  const internalField = (k) => typeof k === 'string' && k.charCodeAt(0) === 95;
   const ALLOW = new Set(['then', 'toJSON', 'constructor', 'valueOf', 'toString',
     Symbol.toPrimitive, Symbol.iterator, Symbol.toStringTag]);
 
@@ -308,14 +343,20 @@ import {
   function discoveryProxy(target, label) {
     return new Proxy(target, {
       get(t, prop, recv) {
-        if (typeof prop === 'string' && HIDDEN.has(prop)) return undefined;
+        if (fullyHidden(prop)) return undefined;
+        // Hide own implementation fields, but preserve inherited underscore
+        // members such as Object.prototype.__proto__.
+        if (internalField(prop) && Object.prototype.hasOwnProperty.call(t, prop)) return undefined;
         if (prop in t || typeof prop === 'symbol' || ALLOW.has(prop))
-          return Reflect.get(t, prop, recv);
+          return Reflect.get(t, prop, t);
         logProbe(label + '.' + String(prop));
         return G.__wxAutoStub ? universalStub(label + '.' + String(prop)) : undefined;
       },
       has(t, prop) {
-        if (typeof prop === 'string' && HIDDEN.has(prop)) return false;
+        if (fullyHidden(prop)) return false;
+        // Hide only own implementation fields. Inherited underscore members and
+        // probes for unknown underscore names still pass through.
+        if (internalField(prop) && Object.prototype.hasOwnProperty.call(t, prop)) return false;
         // Record feature detection through the `in` operator.
         if (typeof prop === 'string' && !ALLOW.has(prop) && !Reflect.has(t, prop))
           logProbe(label + '.' + String(prop));
@@ -323,8 +364,10 @@ import {
         return Reflect.has(t, prop);
       },
       getOwnPropertyDescriptor(t, prop) {
-        if (typeof prop === 'string' && HIDDEN.has(prop)) return undefined;
+        if (fullyHidden(prop)) return undefined;
         const d = Reflect.getOwnPropertyDescriptor(t, prop);
+        // Unknown underscore names still fall through to drift logging below.
+        if (d && internalField(prop)) return undefined;
         if (d) return d;
         // Inherited properties are reachable even though they have no own
         // descriptor, so they are not API drift.
@@ -338,9 +381,9 @@ import {
         }
         return undefined;
       },
-      // Hidden names are configurable, so omitting them satisfies Proxy invariants.
+      // All omitted properties are configurable, which satisfies Proxy invariants.
       ownKeys(t) {
-        return Reflect.ownKeys(t).filter((k) => !(typeof k === 'string' && HIDDEN.has(k)));
+        return Reflect.ownKeys(t).filter((k) => !(fullyHidden(k) || internalField(k)));
       },
       set(t, prop, val, recv) { return Reflect.set(t, prop, val, recv); }
     });
@@ -435,29 +478,32 @@ import {
     try { baseNow = (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now.bind(performance) : null; } catch (_) { baseNow = null; }
     const t0 = Date.now();
     if (!baseNow) baseNow = () => Date.now() - t0;
-    const perf = Object.create(G.Performance.prototype);
-    perf.timeOrigin = t0;
-    perf.now = asNative(function now() { return baseNow(); }, 'now');
-    perf.mark = asNative(function mark() { return null; }, 'mark');
-    perf.measure = asNative(function measure() { return null; }, 'measure');
-    perf.clearMarks = asNative(function clearMarks() {}, 'clearMarks');
-    perf.clearMeasures = asNative(function clearMeasures() {}, 'clearMeasures');
-    perf.getEntries = asNative(function getEntries() { return []; }, 'getEntries');
-    perf.getEntriesByName = asNative(function getEntriesByName() { return []; }, 'getEntriesByName');
-    perf.getEntriesByType = asNative(function getEntriesByType() { return []; }, 'getEntriesByType');
-    perf.toJSON = asNative(function toJSON() { return { timeOrigin: this.timeOrigin }; }, 'toJSON');
+    const perf = iface(G.Performance, {
+      timeOrigin: t0,
+      now: asNative(function now() { return baseNow(); }, 'now'),
+      mark: asNative(function mark() { return null; }, 'mark'),
+      measure: asNative(function measure() { return null; }, 'measure'),
+      clearMarks: asNative(function clearMarks() {}, 'clearMarks'),
+      clearMeasures: asNative(function clearMeasures() {}, 'clearMeasures'),
+      getEntries: asNative(function getEntries() { return []; }, 'getEntries'),
+      getEntriesByName: asNative(function getEntriesByName() { return []; }, 'getEntriesByName'),
+      getEntriesByType: asNative(function getEntriesByType() { return []; }, 'getEntriesByType'),
+      toJSON: asNative(function toJSON() { return { timeOrigin: this.timeOrigin }; }, 'toJSON'),
+    });
     def('performance', perf);
   })();
 
   let currentProfile = null;
+  // Chrome returns the same getBattery() promise for the life of the document.
+  let batteryPromise = null;
   // entrypoint.js, Go, and tests call this by name.
   defHidden('__wxApplyProfile', function __wxApplyProfile(p) {
     const prof = Object.assign({}, DEFAULT_PROFILE, p || {});
     currentProfile = prof;
 
     // navigator: a real Navigator instance (so `navigator instanceof Navigator`).
-    const navBase = Object.create(G.Navigator.prototype);
-    Object.assign(navBase, {
+    const navSpec = {};
+    Object.assign(navSpec, {
       userAgent: prof.userAgent,
       appVersion: prof.userAgent.replace(/^Mozilla\//, ''),
       appName: 'Netscape',
@@ -477,17 +523,21 @@ import {
       webdriver: false,
       doNotTrack: null,
       pdfViewerEnabled: true,
-      userAgentData: prof.userAgentData ? Object.assign(Object.create(G.NavigatorUAData.prototype), {
+      userAgentData: prof.userAgentData ? iface(G.NavigatorUAData, {
         brands: prof.userAgentData.brands.map((b) => Object.assign({}, b)),
         mobile: prof.userAgentData.mobile,
         platform: prof.userAgentData.platform,
         getHighEntropyValues: asNative(function getHighEntropyValues(hints) {
+          // This prototype method outlives a profile application, so read the
+          // current profile and tolerate missing userAgentData.
+          const uad = currentProfile && currentProfile.userAgentData;
+          const brand0 = this.brands && this.brands[0];
           const full = {
             brands: this.brands, mobile: this.mobile, platform: this.platform,
             platformVersion: '10.0.0', architecture: 'x86', bitness: '64',
             model: '',
-            uaFullVersion: prof.userAgentData.uaFullVersion || (prof.userAgentData.brands[0].version + '.0.0.0'),
-            fullVersionList: prof.userAgentData.fullVersionList || this.brands
+            uaFullVersion: (uad && uad.uaFullVersion) || (((brand0 && brand0.version) || '0') + '.0.0.0'),
+            fullVersionList: (uad && uad.fullVersionList) || this.brands
           };
           const out = { brands: this.brands, mobile: this.mobile, platform: this.platform };
           (hints || []).forEach((h) => { if (h in full) out[h] = full[h]; });
@@ -515,42 +565,156 @@ import {
       deprecatedURNToURL: asNative(function deprecatedURNToURL(urnOrConfig) { return Promise.resolve(null); }, 'deprecatedURNToURL'),
       canLoadAdAuctionFencedFrame: asNative(function canLoadAdAuctionFencedFrame() { return false; }, 'canLoadAdAuctionFencedFrame'),
       // Use interface instances so navigator properties pass instanceof checks.
-      mediaDevices: Object.assign(Object.create(G.MediaDevices.prototype), {
+      mediaDevices: iface(G.MediaDevices, {
         ondevicechange: null,
         enumerateDevices: asNative(function enumerateDevices() { return Promise.resolve([]); }, 'enumerateDevices'),
         getSupportedConstraints: asNative(function getSupportedConstraints() { return { width: true, height: true, aspectRatio: true, frameRate: true, facingMode: true, deviceId: true, groupId: true }; }, 'getSupportedConstraints'),
         getUserMedia: asNative(function getUserMedia() { return Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' })); }, 'getUserMedia'),
         getDisplayMedia: asNative(function getDisplayMedia() { return Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' })); }, 'getDisplayMedia')
       }),
-      connection: Object.assign(Object.create(G.NetworkInformation.prototype), {
+      connection: iface(G.NetworkInformation, {
         effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null
       }),
-      keyboard: Object.assign(Object.create(G.Keyboard.prototype), {
+      keyboard: iface(G.Keyboard, {
         getLayoutMap: asNative(function getLayoutMap() { return Promise.resolve(new Map()); }, 'getLayoutMap'),
         lock: asNative(function lock() { return Promise.resolve(); }, 'lock'),
         unlock: asNative(function unlock() {}, 'unlock')
       }),
-      userActivation: Object.assign(Object.create(G.UserActivation.prototype), {
+      userActivation: iface(G.UserActivation, {
         hasBeenActive: false, isActive: false
       }),
-      windowControlsOverlay: Object.assign(Object.create(G.WindowControlsOverlay.prototype), {
+      windowControlsOverlay: iface(G.WindowControlsOverlay, {
         visible: false, ongeometrychange: null,
         getTitlebarAreaRect: asNative(function getTitlebarAreaRect() { return new G.DOMRect(0, 0, 0, 0); }, 'getTitlebarAreaRect')
       }),
       // Use Ink and InkPresenter instances to preserve instanceof behavior.
-      ink: Object.assign(Object.create(G.Ink.prototype), {
+      ink: iface(G.Ink, {
         requestPresenter: asNative(function requestPresenter(param) {
-          return Promise.resolve(Object.assign(Object.create(G.InkPresenter.prototype), {
+          return Promise.resolve(iface(G.InkPresenter, {
             presentationArea: null,
             updateInkTrailStartPoint: asNative(function updateInkTrailStartPoint(event, style) {}, 'updateInkTrailStartPoint')
           }));
         }, 'requestPresenter')
       })
     });
+
+    // Navigator interfaces added from the committed Chrome snapshot.
+    const rejectNotAllowed = () => Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }));
+    Object.assign(navSpec, {
+      gpu: iface(G.GPU, {
+        requestAdapter: asNative(function requestAdapter() { return Promise.resolve(null); }, 'requestAdapter'),
+        getPreferredCanvasFormat: asNative(function getPreferredCanvasFormat() { return 'bgra8unorm'; }, 'getPreferredCanvasFormat'),
+      }),
+      usb: iface(G.USB, {
+        onconnect: null, ondisconnect: null,
+        getDevices: asNative(function getDevices() { return Promise.resolve([]); }, 'getDevices'),
+        requestDevice: asNative(function requestDevice() { return rejectNotAllowed(); }, 'requestDevice'),
+      }),
+      hid: iface(G.HID, {
+        onconnect: null, ondisconnect: null,
+        getDevices: asNative(function getDevices() { return Promise.resolve([]); }, 'getDevices'),
+        requestDevice: asNative(function requestDevice() { return Promise.resolve([]); }, 'requestDevice'),
+      }),
+      serial: iface(G.Serial, {
+        onconnect: null, ondisconnect: null,
+        getPorts: asNative(function getPorts() { return Promise.resolve([]); }, 'getPorts'),
+        requestPort: asNative(function requestPort() { return rejectNotAllowed(); }, 'requestPort'),
+      }),
+      bluetooth: iface(G.Bluetooth, {
+        onavailabilitychanged: null,
+        getAvailability: asNative(function getAvailability() { return Promise.resolve(false); }, 'getAvailability'),
+        getDevices: asNative(function getDevices() { return Promise.resolve([]); }, 'getDevices'),
+        requestDevice: asNative(function requestDevice() { return rejectNotAllowed(); }, 'requestDevice'),
+      }),
+      xr: iface(G.XRSystem, {
+        ondevicechange: null,
+        isSessionSupported: asNative(function isSessionSupported() { return Promise.resolve(false); }, 'isSessionSupported'),
+        requestSession: asNative(function requestSession() { return rejectNotAllowed(); }, 'requestSession'),
+      }),
+      credentials: iface(G.CredentialsContainer, {
+        get: asNative(function get() { return Promise.resolve(null); }, 'get'),
+        store: asNative(function store() { return Promise.resolve(); }, 'store'),
+        create: asNative(function create() { return Promise.resolve(null); }, 'create'),
+        preventSilentAccess: asNative(function preventSilentAccess() { return Promise.resolve(); }, 'preventSilentAccess'),
+      }),
+      geolocation: iface(G.Geolocation, {
+        // Chrome reports geolocation errors asynchronously.
+        getCurrentPosition: asNative(function getCurrentPosition(_ok, err) { if (typeof err === 'function') Promise.resolve().then(function () { err(iface(G.GeolocationPositionError, { code: 1, message: 'User denied Geolocation' })); }); }, 'getCurrentPosition'),
+        watchPosition: asNative(function watchPosition() { return 0; }, 'watchPosition'),
+        clearWatch: asNative(function clearWatch() {}, 'clearWatch'),
+      }),
+      permissions: iface(G.Permissions, {
+        query: asNative(function query(desc) { return Promise.resolve(iface(G.PermissionStatus, { name: (desc && desc.name) || '', state: 'prompt', onchange: null })); }, 'query'),
+      }),
+      serviceWorker: iface(G.ServiceWorkerContainer, {
+        controller: null, oncontrollerchange: null, onmessage: null, onmessageerror: null,
+        ready: Promise.resolve(iface(G.ServiceWorkerRegistration, {
+          installing: null, waiting: null, active: null, scope: 'https://www.youtube.com/', updateViaCache: 'imports',
+          unregister: asNative(function unregister() { return Promise.resolve(true); }, 'unregister'),
+          update: asNative(function update() { return Promise.resolve(); }, 'update'),
+        })),
+        register: asNative(function register() { return rejectNotAllowed(); }, 'register'),
+        getRegistration: asNative(function getRegistration() { return Promise.resolve(undefined); }, 'getRegistration'),
+        getRegistrations: asNative(function getRegistrations() { return Promise.resolve([]); }, 'getRegistrations'),
+        startMessages: asNative(function startMessages() {}, 'startMessages'),
+      }),
+      storage: iface(G.StorageManager, {
+        estimate: asNative(function estimate() { return Promise.resolve({ quota: 0, usage: 0, usageDetails: {} }); }, 'estimate'),
+        persist: asNative(function persist() { return Promise.resolve(false); }, 'persist'),
+        persisted: asNative(function persisted() { return Promise.resolve(false); }, 'persisted'),
+        getDirectory: asNative(function getDirectory() { return rejectNotAllowed(); }, 'getDirectory'),
+      }),
+      locks: iface(G.LockManager, {
+        // Supply a Lock instance because callbacks commonly inspect its name and mode.
+        request: asNative(function request(name, opts, cb) { const fn = typeof opts === 'function' ? opts : cb; const lock = iface(G.Lock, { name: String(name), mode: (opts && typeof opts === 'object' && opts.mode === 'shared') ? 'shared' : 'exclusive' }); return Promise.resolve().then(function () { return fn ? fn(lock) : undefined; }); }, 'request'),
+        query: asNative(function query() { return Promise.resolve({ held: [], pending: [] }); }, 'query'),
+      }),
+      mediaCapabilities: iface(G.MediaCapabilities, {
+        decodingInfo: asNative(function decodingInfo() { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true }); }, 'decodingInfo'),
+        encodingInfo: asNative(function encodingInfo() { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true }); }, 'encodingInfo'),
+      }),
+      mediaSession: iface(G.MediaSession, {
+        metadata: null, playbackState: 'none',
+        setActionHandler: asNative(function setActionHandler() {}, 'setActionHandler'),
+        setPositionState: asNative(function setPositionState() {}, 'setPositionState'),
+        setMicrophoneActive: asNative(function setMicrophoneActive() {}, 'setMicrophoneActive'),
+        setCameraActive: asNative(function setCameraActive() {}, 'setCameraActive'),
+      }),
+      presentation: iface(G.Presentation, { defaultRequest: null, receiver: null }),
+      wakeLock: iface(G.WakeLock, {
+        request: asNative(function request() { return rejectNotAllowed(); }, 'request'),
+      }),
+      devicePosture: iface(G.DevicePosture, { type: 'continuous', onchange: null }),
+      virtualKeyboard: iface(G.VirtualKeyboard, {
+        boundingRect: new G.DOMRect(0, 0, 0, 0), overlaysContent: false, ongeometrychange: null,
+        show: asNative(function show() {}, 'show'),
+        hide: asNative(function hide() {}, 'hide'),
+      }),
+      storageBuckets: iface(G.StorageBucketManager, {
+        open: asNative(function open() { return rejectNotAllowed(); }, 'open'),
+        keys: asNative(function keys() { return Promise.resolve([]); }, 'keys'),
+        delete: asNative(function _delete() { return Promise.resolve(); }, 'delete'),
+      }),
+      scheduling: iface(G.Scheduling, {
+        isInputPending: asNative(function isInputPending() { return false; }, 'isInputPending'),
+      }),
+      vibrate: asNative(function vibrate() { return false; }, 'vibrate'),
+      getBattery: asNative(function getBattery() { if (!batteryPromise) batteryPromise = Promise.resolve(iface(G.BatteryManager, { charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null })); return batteryPromise; }, 'getBattery'),
+      getGamepads: asNative(function getGamepads() { return [null, null, null, null]; }, 'getGamepads'),
+      share: asNative(function share() { return rejectNotAllowed(); }, 'share'),
+      canShare: asNative(function canShare() { return false; }, 'canShare'),
+      setAppBadge: asNative(function setAppBadge() { return Promise.resolve(); }, 'setAppBadge'),
+      requestMIDIAccess: asNative(function requestMIDIAccess() { return rejectNotAllowed(); }, 'requestMIDIAccess'),
+      requestMediaKeySystemAccess: asNative(function requestMediaKeySystemAccess() { return rejectNotAllowed(); }, 'requestMediaKeySystemAccess'),
+      getInstalledRelatedApps: asNative(function getInstalledRelatedApps() { return Promise.resolve([]); }, 'getInstalledRelatedApps'),
+    });
+    // iface installs navigator members on Navigator.prototype and stores this
+    // profile's attribute values on the instance.
+    const navBase = iface(G.Navigator, navSpec);
     def('navigator', discoveryProxy(navBase, 'navigator'));
 
     // screen: a real Screen instance.
-    const screenBase = Object.assign(Object.create(G.Screen.prototype), {
+    const screenBase = iface(G.Screen, {
       width: prof.screen[0], height: prof.screen[1],
       availWidth: prof.screen[0], availHeight: prof.screen[1] - 40,
       colorDepth: 24, pixelDepth: 24, availLeft: 0, availTop: 0,
@@ -570,7 +734,7 @@ import {
     def('devicePixelRatio', 1);
 
     // location: a real Location instance.
-    const loc = Object.assign(Object.create(G.Location.prototype), {
+    const loc = iface(G.Location, {
       href: 'https://www.youtube.com/', origin: 'https://www.youtube.com',
       protocol: 'https:', host: 'www.youtube.com', hostname: 'www.youtube.com',
       port: '', pathname: '/', search: '', hash: '',
@@ -578,6 +742,27 @@ import {
     });
     def('location', loc);
     def('origin', loc.origin);
+
+    // trustedTypes is a [SameObject] TrustedTypePolicyFactory value.
+    def('trustedTypes', iface(G.TrustedTypePolicyFactory, {
+      emptyHTML: '', emptyScript: '', defaultPolicy: null,
+      createPolicy: asNative(function createPolicy(name) {
+        return iface(G.TrustedTypePolicy, {
+          name: String(name == null ? '' : name),
+          createHTML: asNative(function createHTML(s) { return String(s); }, 'createHTML'),
+          createScript: asNative(function createScript(s) { return String(s); }, 'createScript'),
+          createScriptURL: asNative(function createScriptURL(s) { return String(s); }, 'createScriptURL'),
+        });
+      }, 'createPolicy'),
+      getAttributeType: asNative(function getAttributeType() { return null; }, 'getAttributeType'),
+      getPropertyType: asNative(function getPropertyType() { return null; }, 'getPropertyType'),
+      isHTML: asNative(function isHTML() { return false; }, 'isHTML'),
+      isScript: asNative(function isScript() { return false; }, 'isScript'),
+      isScriptURL: asNative(function isScriptURL() { return false; }, 'isScriptURL'),
+    }));
+
+    // crashReport is a [SameObject] CrashReportContext value.
+    def('crashReport', iface(G.CrashReportContext, {}));
 
     // document: the behaviorally coherent Document from dom.js (createElement returns
     // correctly-typed, instanceof-coherent elements; wrapped for discovery).
@@ -614,7 +799,7 @@ import {
     defFn('requestIdleCallback', function requestIdleCallback(cb) { return G.setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1); });
     defFn('cancelIdleCallback', function cancelIdleCallback(id) { return G.clearTimeout(id); });
     defFn('matchMedia', function matchMedia(q) { return { matches: false, media: String(q), onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } }; });
-    defFn('getComputedStyle', function getComputedStyle() { const s = Object.create(G.CSSStyleDeclaration.prototype); s.getPropertyValue = asNative(function getPropertyValue() { return ''; }, 'getPropertyValue'); return s; });
+    defFn('getComputedStyle', function getComputedStyle() { return iface(G.CSSStyleDeclaration, { getPropertyValue: asNative(function getPropertyValue() { return ''; }, 'getPropertyValue') }); });
     defFn('addEventListener', function addEventListener() {});
     defFn('removeEventListener', function removeEventListener() {});
     defFn('dispatchEvent', function dispatchEvent() { return true; });

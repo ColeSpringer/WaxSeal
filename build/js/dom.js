@@ -17,8 +17,8 @@
  *     method reports `function name() { [native code] }`, never its JS source.
  *   - A canvas/WebGL/media surface with believable, coherent values (the usual
  *     fingerprinting probes) rather than `undefined`.
- *   - SVG chains plus SVGViewSpec and the media-track interfaces the discovery
- *     trap has seen in live probes.
+ *   - SVG chains plus the media-track interfaces the discovery trap has seen in
+ *     live probes.
  *
  * This is hand-built instead of using `@thetadevcode/jsdom-minimal`: it avoids
  * Node-specific globals under QuickJS, keeps the bundle small, and is testable
@@ -416,7 +416,6 @@ class SVGRectElement extends SVGGraphicsElement {}
 class SVGTextElement extends SVGGraphicsElement {}
 class SVGImageElement extends SVGGraphicsElement {}
 class SVGUseElement extends SVGGraphicsElement {}
-class SVGViewSpec {} // interface object BotGuard probes for presence
 class SVGViewElement extends SVGElement {}
 /* The broader SVG element set; live probes have included window.SVGSetElement.
  * Real chains plus createElementNS mappings keep presence and instanceof
@@ -482,6 +481,19 @@ class AudioTrackList extends EventTarget { get length() { return 0; } getTrackBy
 class TextTrackList extends EventTarget { get length() { return 0; } getTrackById() { return null; } }
 class MediaError { get code() { return 0; } get message() { return ''; } }
 class TimeRanges { get length() { return 0; } start() { return 0; } end() { return 0; } }
+// Chrome exposes FontFaceSet through document.fonts but not as a window global.
+class FontFaceSet extends EventTarget {
+  get size() { return 0; }
+  get status() { return 'loaded'; }
+  get ready() { return Promise.resolve(this); }
+  check() { return true; }
+  load() { return Promise.resolve([]); }
+  add() { return this; }
+  delete() { return false; }
+  has() { return false; }
+  clear() {}
+  forEach() {}
+}
 class MediaStream extends EventTarget { get active() { return false; } get id() { return ''; } getTracks() { return []; } getVideoTracks() { return []; } getAudioTracks() { return []; } }
 
 /* Events. */
@@ -609,6 +621,8 @@ class Document extends Node {
   get documentElement() { return this._documentElement; }
   get head() { return this._head; }
   get body() { return this._body; }
+  // document.fonts is a lazily created [SameObject] value.
+  get fonts() { return this._fonts || (this._fonts = new FontFaceSet()); }
   get defaultView() { return G.window || G; }
   get location() { return G.location; }
   get cookie() { return this._cookie || ''; }
@@ -640,7 +654,6 @@ class HTMLDocument extends Document {}
  */
 class Window extends EventTarget {}
 class Navigator {}
-class WorkerNavigator {}
 class NavigatorUAData {}
 class Screen {}
 class Location {}
@@ -821,7 +834,7 @@ const INTERFACES = {
   HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement,
   CanvasRenderingContext2D, WebGLRenderingContext, WebGL2RenderingContext,
   SVGElement, SVGGraphicsElement, SVGSVGElement, SVGGElement, SVGPathElement, SVGRectElement,
-  SVGTextElement, SVGImageElement, SVGUseElement, SVGViewElement, SVGViewSpec,
+  SVGTextElement, SVGImageElement, SVGUseElement, SVGViewElement,
   SVGGeometryElement, SVGCircleElement, SVGEllipseElement, SVGLineElement, SVGPolygonElement,
   SVGPolylineElement, SVGDefsElement, SVGGradientElement, SVGLinearGradientElement,
   SVGRadialGradientElement, SVGStopElement, SVGSymbolElement, SVGMarkerElement, SVGPatternElement,
@@ -831,14 +844,14 @@ const INTERFACES = {
   SVGSetElement, SVGAnimateElement, SVGAnimateMotionElement, SVGAnimateTransformElement,
   Crypto, SubtleCrypto, CryptoKey,
   VideoTrack, AudioTrack, TextTrack, VideoTrackList, AudioTrackList, TextTrackList,
-  MediaError, TimeRanges, MediaStream,
+  MediaError, TimeRanges, MediaStream, FontFaceSet,
   Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, FocusEvent, PointerEvent,
   WheelEvent, ErrorEvent, MessageEvent,
   DOMRect, DOMRectReadOnly, DOMMatrix, DOMPoint, TextMetrics, ImageData, Blob, File,
   Headers, Request, Response, AbortController, AbortSignal, URLSearchParams,
   Document, HTMLDocument, DocumentFragment, CharacterData, Text, Comment,
   DOMTokenList, NamedNodeMap, NodeList, HTMLCollection,
-  Window, Navigator, WorkerNavigator, NavigatorUAData, Screen, Location, History,
+  Window, Navigator, NavigatorUAData, Screen, Location, History,
   Performance, PictureInPictureWindow, Storage, Plugin, PluginArray, MimeType, MimeTypeArray, CSSStyleDeclaration
 };
 
@@ -943,12 +956,18 @@ const EVENT_BATTERY = ('AnimationEvent AnimationPlaybackEvent BeforeInstallPromp
   'BlobEvent ClipboardEvent CloseEvent CompositionEvent ContentVisibilityAutoStateChangeEvent ' +
   'DeviceMotionEvent DeviceOrientationEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent ' +
   'HashChangeEvent IDBVersionChangeEvent InputEvent MediaEncryptedEvent MediaQueryListEvent ' +
-  'MediaRecorderErrorEvent MediaStreamTrackEvent MutationEvent OfflineAudioCompletionEvent PageTransitionEvent ' +
+  'MediaStreamTrackEvent OfflineAudioCompletionEvent PageTransitionEvent ' +
   'PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent ' +
   'RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent ' +
   'TouchEvent TrackEvent TransitionEvent WebGLContextEvent ' +
   // Chrome 144 added XRVisibilityMaskChangeEvent to the WebXR surface.
-  'SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent').split(' ');
+  'SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent ' +
+  // SpeechSynthesisErrorEvent has a different parent and is installed below.
+  'SpeechRecognitionEvent SpeechRecognitionErrorEvent ' +
+  // WebUSB and WebHID connection events.
+  'USBConnectionEvent HIDConnectionEvent HIDInputReportEvent ' +
+  // Navigation API events.
+  'NavigateEvent NavigationCurrentEntryChangeEvent').split(' ');
 
 // Other standard window interfaces: present native constructors (most platform
 // interfaces throw "Illegal constructor" on direct new, which is what we render).
@@ -967,13 +986,15 @@ const PRESENCE_BATTERY = (
   'CSSKeyframeRule CSSKeyframesRule CSSFontFaceRule CSSSupportsRule CSSNamespaceRule CSSPageRule ' +
   'StylePropertyMap StylePropertyMapReadOnly CSSStyleValue CSSUnitValue CSSKeywordValue CSSMathValue ' +
   'CSSNumericValue CSSTransformValue CSSTransformComponent CSSPerspective CSSImageValue CSSUnparsedValue ' +
-  'FontFace FontFaceSet ' +
+  // FontFaceSet is available only through document.fonts.
+  'FontFace ' +
   // WebGL objects
   'WebGLBuffer WebGLProgram WebGLShader WebGLTexture WebGLFramebuffer WebGLRenderbuffer WebGLUniformLocation ' +
   'WebGLActiveInfo WebGLShaderPrecisionFormat WebGLVertexArrayObject WebGLQuery WebGLSampler WebGLSync WebGLTransformFeedback ' +
   // Workers / messaging / channels
-  'Worker SharedWorker ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration MessageChannel MessagePort ' +
-  'BroadcastChannel Worklet WorkletGlobalScope ' +
+  // Service worker interfaces are EventTarget-derived and installed below.
+  'Worker SharedWorker MessageChannel MessagePort ' +
+  'BroadcastChannel Worklet ' +
   // Observers
   'MutationObserver MutationRecord ResizeObserver ResizeObserverEntry ResizeObserverSize IntersectionObserver ' +
   'IntersectionObserverEntry PerformanceObserver PerformanceObserverEntryList ReportingObserver ' +
@@ -986,15 +1007,16 @@ const PRESENCE_BATTERY = (
   // DOM / docs / ranges / shadow
   'DOMException DOMImplementation DOMParser XMLSerializer DOMStringList DOMStringMap DOMTokenList Attr ' +
   'CharacterData CDATASection ProcessingInstruction DocumentType Range StaticRange Selection NodeIterator TreeWalker ' +
-  'ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult AbortPaymentEvent ' +
+  'ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult ' +
   // Performance
   'Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceNavigationTiming PerformanceResourceTiming ' +
   'PerformancePaintTiming PerformanceServerTiming PerformanceEventTiming PerformanceLongTaskTiming PerformanceTiming PerformanceNavigation ' +
   // Animation
   'Animation AnimationEffect KeyframeEffect AnimationTimeline DocumentTimeline ' +
   // Device / perms / misc
-  'Notification Permissions PermissionStatus Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates ' +
-  'GeolocationPositionError Gamepad GamepadButton BatteryManager NetworkInformation VisualViewport BarProp External ' +
+  // EventTarget-derived navigator results are installed below.
+  'Notification Permissions Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates ' +
+  'GeolocationPositionError Gamepad GamepadButton VisualViewport BarProp External ' +
   'Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D ' +
   'IdleDeadline Image Audio Option ' +
   // Additional browser interfaces modeled by the shim.
@@ -1005,7 +1027,7 @@ const PRESENCE_BATTERY = (
   // SVG value types (not elements; presence is correct) plus the animated
   // wrappers and filter-effect element set.
   'SVGAngle SVGLength SVGLengthList SVGNumber SVGNumberList SVGPoint SVGPointList SVGRect SVGMatrix ' +
-  'SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes SVGZoomAndPan ' +
+  'SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes ' +
   'SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength ' +
   'SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio ' +
   'SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGComponentTransferFunctionElement ' +
@@ -1015,20 +1037,97 @@ const PRESENCE_BATTERY = (
   'SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement SVGFEMergeElement SVGFEMergeNodeElement ' +
   'SVGFEMorphologyElement SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement ' +
   'SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement ' +
-  // File System Access and Managed Media Source.
-  'FileSystem FileSystemDirectoryEntry FileSystemDirectoryReader FileSystemEntry FileSystemFileEntry ' +
+  // File System Access API.
   'FileSystemHandle FileSystemFileHandle FileSystemDirectoryHandle FileSystemWritableFileStream ' +
-  'ManagedMediaSource ManagedSourceBuffer DataTransfer DataTransferItem DataTransferItemList ' +
-  'PointerEvent ScreenOrientation MediaQueryList NamedFlow Highlight HighlightRegistry'
+  'DataTransfer DataTransferItem DataTransferItemList ' +
+  'PointerEvent ScreenOrientation MediaQueryList Highlight HighlightRegistry ' +
+  // Plain hardware, storage, credential, and media-session interfaces.
+  'GPU GPUAdapter GPUCanvasContext GPUDeviceLostInfo USBDevice BluetoothRemoteGATTServer ' +
+  'CredentialsContainer Credential ' +
+  'StorageManager LockManager Lock StorageBucketManager StorageBucket Scheduling ' +
+  'MediaSession MediaMetadata Presentation WakeLock GamepadHapticActuator ' +
+  // Web Speech interfaces that throw on direct construction. Chrome 149 does
+  // not expose the SpeechRecognition result interfaces as window globals.
+  'SpeechGrammar SpeechSynthesisVoice SpeechSynthesis ' +
+  // Navigation API no-constructor interfaces (no parent in the snapshot).
+  'NavigationDestination NavigationTransition NavigationActivation NavigationPrecommitController NavigationPreloadManager ' +
+  // Trusted Types interfaces and the FedCM IdentityProvider.
+  'TrustedTypePolicyFactory TrustedTypePolicy TrustedHTML TrustedScript TrustedScriptURL IdentityProvider ' +
+  // Additional no-constructor interfaces observed by shim discovery.
+  'FetchLaterResult GPUQueue'
 ).split(' ');
 
 function rename(fn, name) { try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_) {} return fn; }
+
+// Constructible interfaces grouped by prototype parent.
+const EVENTTARGET_CONSTRUCTIBLE_BATTERY = 'SpeechRecognition SpeechSynthesisUtterance CloseWatcher'.split(' ');
+const PLAIN_CONSTRUCTIBLE_BATTERY = 'SpeechGrammarList SpeechRecognitionPhrase PressureObserver'.split(' ');
+// webkit-prefixed names share their unprefixed constructor object.
+const WEBKIT_ALIASES = {
+  webkitSpeechRecognition: 'SpeechRecognition',
+  webkitSpeechRecognitionError: 'SpeechRecognitionErrorEvent',
+  webkitSpeechRecognitionEvent: 'SpeechRecognitionEvent',
+  webkitSpeechGrammar: 'SpeechGrammar',
+  webkitSpeechGrammarList: 'SpeechGrammarList',
+  webkitMediaStream: 'MediaStream',
+};
+// These interfaces throw on direct construction but inherit from EventTarget.
+const EVENTTARGET_PRESENCE_BATTERY = ('GPUDevice USB HID HIDDevice Serial SerialPort Bluetooth BluetoothDevice ' +
+  'XRSystem XRSession XRLayer PresentationRequest PresentationConnection WakeLockSentinel DevicePosture ' +
+  'VirtualKeyboard NavigatorManagedData ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration ' +
+  'PermissionStatus BatteryManager NetworkInformation ' +
+  // Navigation API and text-track base interfaces.
+  'Navigation NavigationHistoryEntry TextTrackCue').split(' ');
+// No-constructor interfaces with named parents. Parents must be installed first.
+const DERIVED_PRESENCE_BATTERY = [
+  ['CSSGroupingRule', 'CSSRule'],
+  ['CSSFunctionRule', 'CSSGroupingRule'],
+  ['CSSPositionValue', 'CSSStyleValue'],
+  ['SharedStorageModifierMethod', null],
+  ['SharedStorageAppendMethod', 'SharedStorageModifierMethod'],
+  ['SharedStorageSetMethod', 'SharedStorageModifierMethod'],
+  ['SharedStorageDeleteMethod', 'SharedStorageModifierMethod'],
+  ['SharedStorageClearMethod', 'SharedStorageModifierMethod'],
+  // Credential and WebXR subclasses are constructable in the Chrome snapshot.
+  ['FederatedCredential', 'Credential'],
+  ['PasswordCredential', 'Credential'],
+  ['PublicKeyCredential', 'Credential'],
+  ['IdentityCredential', 'Credential'],
+  ['XRWebGLLayer', 'XRLayer'],
+  // WebXR layer hierarchy.
+  ['XRCompositionLayer', 'XRLayer'],
+  ['XRCylinderLayer', 'XRCompositionLayer'],
+  ['XRProjectionLayer', 'XRCompositionLayer'],
+  ['XRQuadLayer', 'XRCompositionLayer'],
+  ['XREquirectLayer', 'XRCompositionLayer'],
+  ['XRCubeLayer', 'XRCompositionLayer'],
+];
 
 export function installPlatformBattery(target) {
   const define = (name, C) => { try { Object.defineProperty(target, name, { value: C, configurable: true, writable: true }); } catch (_) {} };
   for (const name of EVENT_BATTERY) {
     if (typeof target[name] !== 'undefined') continue; // do not overwrite a more specific def
     const C = class extends Event {};
+    rename(C, name); markNative(C, name); define(name, C);
+  }
+  // Install after its SpeechSynthesisEvent parent.
+  if (typeof target.SpeechSynthesisErrorEvent === 'undefined' && typeof target.SpeechSynthesisEvent === 'function') {
+    const C = class extends target.SpeechSynthesisEvent {};
+    rename(C, 'SpeechSynthesisErrorEvent'); markNative(C, 'SpeechSynthesisErrorEvent'); define('SpeechSynthesisErrorEvent', C);
+  }
+  for (const name of EVENTTARGET_CONSTRUCTIBLE_BATTERY) {
+    if (typeof target[name] !== 'undefined') continue;
+    const C = class extends EventTarget {};
+    rename(C, name); markNative(C, name); define(name, C);
+  }
+  for (const name of PLAIN_CONSTRUCTIBLE_BATTERY) {
+    if (typeof target[name] !== 'undefined') continue;
+    const C = class {};
+    rename(C, name); markNative(C, name); define(name, C);
+  }
+  for (const name of EVENTTARGET_PRESENCE_BATTERY) {
+    if (typeof target[name] !== 'undefined') continue;
+    const C = class extends EventTarget { constructor() { super(); illegal(); } };
     rename(C, name); markNative(C, name); define(name, C);
   }
   for (const name of PRESENCE_BATTERY) {
@@ -1041,6 +1140,20 @@ export function installPlatformBattery(target) {
     else if (name === 'Option') { C = function Option() { return createElement('option'); }; C.prototype = HTMLOptionElement.prototype; }
     else { C = function () { illegal(); }; }
     rename(C, name); markNative(C, name); define(name, C);
+  }
+  // Install no-constructor interfaces after their named parents.
+  for (const [name, parent] of DERIVED_PRESENCE_BATTERY) {
+    if (typeof target[name] !== 'undefined') continue;
+    const Base = parent ? target[parent] : null;
+    const C = (typeof Base === 'function')
+      ? class extends Base { constructor() { super(); illegal(); } }
+      : function () { illegal(); };
+    rename(C, name); markNative(C, name); define(name, C);
+  }
+  // Install aliases last so their base constructors already exist.
+  for (const alias in WEBKIT_ALIASES) {
+    const base = target[WEBKIT_ALIASES[alias]];
+    if (typeof target[alias] === 'undefined' && typeof base !== 'undefined') define(alias, base);
   }
 }
 

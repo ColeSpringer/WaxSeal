@@ -86,6 +86,35 @@ func TestDiscoveryInheritedIsNotDrift(t *testing.T) {
 	}
 }
 
+// TestDiscoveryInheritedUnderscoreVisible verifies that discovery hides own
+// underscore-prefixed state without hiding inherited Object members.
+func TestDiscoveryInheritedUnderscoreVisible(t *testing.T) {
+	rt := newBundledRT(t)
+	mustEval(t, rt, "globalThis.__wxClearProbes();")
+
+	for _, target := range []string{"window", "navigator", "document"} {
+		for _, name := range []string{"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "__proto__"} {
+			evalTrue(t, rt, "'"+name+"' in "+target, "('"+name+"' in "+target+") === true")
+		}
+		// The inherited member is also readable (the `get` trap passes through).
+		evalTrue(t, rt, target+".__defineGetter__ callable", "typeof "+target+".__defineGetter__ === 'function'")
+	}
+
+	// Own internal state is hidden while public accessors continue to work.
+	evalTrue(t, rt, "_body hidden from in", "('_body' in document) === false")
+	evalTrue(t, rt, "_body hidden from ownKeys", "Object.getOwnPropertyNames(document).indexOf('_body') === -1")
+	evalTrue(t, rt, "_body not readable externally", "document._body === undefined")
+	evalTrue(t, rt, "document.body still resolves", "document.body !== undefined")
+
+	// None of the inherited underscore members are reported as API drift.
+	probes := getProbes(t, rt)
+	for _, p := range []string{"window.__defineGetter__", "navigator.__proto__", "document.__lookupGetter__"} {
+		if slices.Contains(probes, p) {
+			t.Errorf("inherited %q wrongly reported as drift; probes=%v", p, probes)
+		}
+	}
+}
+
 // TestDiscoveryEmptyKeyIsNotDrift verifies that empty property names are ignored.
 func TestDiscoveryEmptyKeyIsNotDrift(t *testing.T) {
 	rt := newBundledRT(t)
