@@ -1,3 +1,5 @@
+// Package minter adds caching, retries, crash recovery, and tenant routing to
+// browser sessions.
 package minter
 
 import (
@@ -15,25 +17,17 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// Minter wraps a single browser.Session with the reliability the bare Session
-// lacks: single-flighted attestation (concurrent callers during a (re)launch
-// trigger one attestation, not N, since attestation is the per-IP-scarce step), a
-// generation-keyed token cache (a consumer retrying after a downstream 403 gets
-// the same cached token, never a fresh attestation), an escalation ladder on mint
-// failure (cache, then an in-place retry, then relaunch, so a transient blip does
-// not burn an attestation), proactive crash recovery, a max-age recycle, and
-// metrics.
-//
-// It is the single-identity minter; per-tenant contexts are handled by Tenants.
-// The mint runs on one page, so mints serialize on mintMu.
+// Minter adds token caching, single-flight attestation, retries, crash recovery,
+// session recycling, and metrics to one browser identity. Mint and PlayerContext
+// calls serialize because they share one page. Tenants manages multiple Minters.
 type Minter struct {
 	video  string
 	opts   browser.Options
 	log    *slog.Logger
 	maxAge time.Duration // recycle the session once it is older than this
 
-	// launch is the expensive launch+attest, injectable so the reliability logic
-	// (single-flight, cache, escalation, crash) is unit-testable without a browser.
+	// launch starts and attests a session. Tests replace it so the reliability
+	// logic can run without a browser.
 	launch func(ctx context.Context) (minterSession, error)
 
 	mu          sync.Mutex
@@ -43,14 +37,14 @@ type Minter struct {
 	watchCancel context.CancelFunc // cancels the live session's crash watcher on teardown
 	launching   chan struct{}      // non-nil while an attestation is in flight (single-flight)
 	cache       map[string]cachedToken
-	negCache    map[string]negEntry // video_id -> terminal player-context error + expiry (guarded by mu)
+	negCache    map[string]negEntry // terminal player-context errors by video_id, guarded by mu
 
 	mintMu  sync.Mutex // serializes the in-browser mint calls (single page)
 	metrics minterMetrics
 }
 
-// minterSession is the slice of *browser.Session the Minter needs; an interface so tests
-// can inject a fake. *browser.Session satisfies it.
+// minterSession is the part of browser.Session used by Minter. Tests replace it
+// with an in-memory implementation.
 type minterSession interface {
 	Mint(ctx context.Context, identifier string) (browser.MintResult, error)
 	PlayerContext(ctx context.Context, videoID string) (browser.PlayerContext, error)
@@ -66,18 +60,15 @@ type cachedToken struct {
 	gen    uint64
 }
 
-// negEntry is one negatively-cached player-context outcome: a terminal (unplayable)
-// error and when to forget it. It is generation-independent (an unplayable video
-// stays unplayable across relaunches), so it carries no gen.
+// negEntry records a terminal player-context error and its expiry. It is not tied
+// to a session generation because relaunching cannot make the video playable.
 type negEntry struct {
 	err    error
 	expiry time.Time
 }
 
-// minterMetrics are process-lifetime counters. Both *Failures counters count failed
-// ATTEMPTS, not requests: a request that exhausts the escalation ladder (first call,
-// in-place retry, post-relaunch call) adds three. PlayerContextFailures also counts a
-// negative-cache hit, where a known-unplayable id is rejected without a browser call.
+// minterMetrics contains process-lifetime counters. Failure counters count
+// attempts, not requests. PlayerContextFailures also counts negative-cache hits.
 type minterMetrics struct {
 	Attestations          atomic.Int64
 	LaunchFailures        atomic.Int64
@@ -88,7 +79,7 @@ type minterMetrics struct {
 	CacheMisses           atomic.Int64
 	Crashes               atomic.Int64
 	PlayerContexts        atomic.Int64
-	PlayerContextFailures atomic.Int64 // per attempt + negative-cache hits (see minterMetrics doc)
+	PlayerContextFailures atomic.Int64 // failed attempts and negative-cache hits
 }
 
 const (
@@ -118,7 +109,7 @@ func NewMinter(video string, opts browser.Options) *Minter {
 	return m
 }
 
-// launchReal is the default launcher: browser.Launch + the expensive Attest.
+// launchReal starts a browser session and attests it.
 func (m *Minter) launchReal(ctx context.Context) (minterSession, error) {
 	sess, err := browser.Launch(ctx, m.video, m.opts)
 	if err != nil {
@@ -131,16 +122,14 @@ func (m *Minter) launchReal(ctx context.Context) (minterSession, error) {
 	return sess, nil
 }
 
-// Warm forces the (single-flighted) attestation now, so the first request is fast
-// and startup fails loudly if the browser/IP can't attest.
+// Warm performs the single-flight attestation before the first request.
 func (m *Minter) Warm(ctx context.Context) error {
 	_, _, err := m.ensure(ctx)
 	return err
 }
 
-// ensure returns the live session and its generation, single-flighting the
-// launch+attest so concurrent callers coalesce into one attestation. It also
-// recycles a session older than maxAge.
+// ensure returns the live session and its generation. Concurrent launches
+// coalesce into one attestation, and sessions older than maxAge are recycled.
 func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 	for {
 		m.mu.Lock()
@@ -204,8 +193,8 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 	}
 }
 
-// retire closes the session of generation gen if it is still current, so the next
-// ensure relaunches. A stale gen (already retired / newer session) is a no-op.
+// retire closes generation gen if it is still current, causing the next ensure
+// call to relaunch. A stale generation is a no-op.
 func (m *Minter) retire(gen uint64, reason string) {
 	m.mu.Lock()
 	if m.sess == nil || m.gen != gen {
@@ -232,8 +221,8 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	if !ok || real.Page() == nil {
 		return
 	}
-	// Bind to the session-scoped ctx (not the page's transient launch ctx) so the
-	// watch lives until the session is torn down, then exits cleanly.
+	// Use a session-scoped context so the watcher survives the launch request and
+	// exits when the session is torn down.
 	wait := real.Page().Context(ctx).EachEvent(
 		func(*proto.InspectorTargetCrashed) (stop bool) {
 			m.metrics.Crashes.Add(1)
@@ -249,10 +238,9 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 }
 
 // Mint returns a token for (scope, binding), reporting whether it came from cache.
-// The escalation ladder: serve from cache, else mint; on failure retry once in
-// place, then relaunch, re-attest, and mint. A downstream 403 that makes the
-// consumer re-request the same binding is served from cache (no re-mint, no
-// re-attest).
+// The retry policy serves cached tokens first, retries one failed mint in place,
+// then relaunches and attests before the final attempt. Repeated requests for the
+// same binding continue to use the cached token.
 func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.MintResult, cached bool, err error) {
 	key := scope + "|" + binding
 	if r, ok := m.cacheGet(key); ok {
@@ -260,9 +248,9 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		return r, true, nil
 	}
 
-	m.mintMu.Lock() // one page → mints serialize
+	m.mintMu.Lock() // one page, so mints serialize
 	defer m.mintMu.Unlock()
-	// Double-check: a goroutine ahead of us on mintMu may have just minted this key.
+	// Another goroutine may have filled the cache while this call waited for mintMu.
 	if r, ok := m.cacheGet(key); ok {
 		m.metrics.CacheHits.Add(1)
 		return r, true, nil
@@ -297,16 +285,10 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 	return res, false, nil
 }
 
-// PlayerContext returns the attested browser's /player streaming context for
-// videoID (the status-1 serverAbrStreamingUrl + ustreamer config + visitor_data +
-// client version + audio formats). It reuses the warm attested session (the
-// genuine-browser provenance is what grades the url, so no fresh attestation is
-// needed), serialized on the single page like Mint. A transient failure gets one
-// in-place retry, then a relaunch+re-attest, mirroring the mint escalation ladder.
-// It is NOT cached (the url carries a per-request scrambled nonce and a short
-// expiry, so each consumer needs a fresh one), but an unplayable video_id IS cached
-// negatively so a repeat fails instantly without taking the page or escalating, and
-// a cancelled caller never triggers a relaunch.
+// PlayerContext returns the attested browser's streaming context for videoID. It
+// reuses the warm session and follows the same retry and relaunch policy as Mint.
+// Successful contexts are not cached because their URLs contain a short-lived
+// nonce. Terminal unplayable errors are cached briefly.
 func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.PlayerContext, error) {
 	// A known-unplayable video fails before mintMu and the session, so a consumer
 	// retrying a 502 (or a malicious caller) can't grind the tenant into relaunches.
@@ -315,7 +297,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, err
 	}
 
-	m.mintMu.Lock() // one page → player-context calls serialize with mints
+	m.mintMu.Lock() // one page, so player-context calls serialize with mints
 	defer m.mintMu.Unlock()
 
 	sess, gen, err := m.ensure(ctx)
@@ -363,10 +345,9 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	return pc, nil
 }
 
-// playerContextStop records a failed player-context attempt and reports whether the
-// escalation ladder must stop here rather than retry/relaunch: a terminal
-// ErrUnplayable (which it also caches negatively) or a cancelled caller context
-// (relaunching would burn the per-IP-scarce attestation for a request nobody awaits).
+// playerContextStop records a failed attempt and reports whether retries should
+// stop. Terminal unplayable errors are cached, and canceled requests never cause
+// a relaunch.
 func (m *Minter) playerContextStop(ctx context.Context, videoID string, err error) bool {
 	m.metrics.PlayerContextFailures.Add(1)
 	if errors.Is(err, browser.ErrUnplayable) {
@@ -376,9 +357,7 @@ func (m *Minter) playerContextStop(ctx context.Context, videoID string, err erro
 	return ctx.Err() != nil
 }
 
-// negCacheGet returns a remembered terminal (unplayable) error for videoID while it
-// is within its TTL, so a repeat of a known-unplayable video fails instantly without
-// taking mintMu or touching the session.
+// negCacheGet returns a cached terminal error for videoID until its TTL expires.
 func (m *Minter) negCacheGet(videoID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -393,11 +372,9 @@ func (m *Minter) negCacheGet(videoID string) error {
 	return e.err
 }
 
-// negCachePut remembers a terminal (unplayable) error for videoID for a short TTL.
-// It prunes expired entries first; if the map is still full it evicts one live entry
-// rather than dropping the new one, so the most recent unplayable id is always cached
-// and a consumer retrying its last 502 won't reach the session again. Map iteration
-// picks the victim arbitrarily, which is fine here: any live entry will do.
+// negCachePut remembers a terminal error for videoID for a short TTL. It removes
+// expired entries first and evicts an arbitrary live entry if the map remains
+// full.
 func (m *Minter) negCachePut(videoID string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -472,7 +449,7 @@ func (m *Minter) AttestKind(ctx context.Context) (string, error) {
 	return s.AttestKind(), nil
 }
 
-// MetricsSnapshot returns counters + current state for a /metrics endpoint.
+// MetricsSnapshot returns counters and current state for the /metrics endpoint.
 func (m *Minter) MetricsSnapshot() map[string]any {
 	m.mu.Lock()
 	gen := m.gen

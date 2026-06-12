@@ -1,18 +1,17 @@
 /*
  * WaxSeal BotGuard entrypoint for a real Chromium.
  *
- * In a real browser the genuine navigator/window/performance are the fingerprint,
- * so there is no shim: bgutils drives the BotGuard VM directly against the real
- * global scope (globalObj: globalThis).
+ * BgUtils runs the BotGuard VM against the browser's real global scope. No
+ * navigator, window, or performance shim is installed.
  *
- * Exposes runBotguard / newMinter / mint on globalThis, called from Go via
- * page.Eval. All HTTP (att/get challenge, GenerateIT) stays in Go.
+ * Exposes runBotguard, newMinter, and mint on globalThis for calls from Go via
+ * page.Eval. All HTTP requests remain in Go.
  */
 import { BG } from 'bgutils-js';
 
 const G = globalThis;
 
-// Non-enumerable so they do not look like page globals to anything probing.
+// Keep the helpers out of normal page-global enumeration.
 const defHidden = (name, value) =>
   Object.defineProperty(G, name, { value, configurable: true, writable: true, enumerable: false });
 

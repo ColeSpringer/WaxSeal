@@ -1,13 +1,9 @@
 // Package innertube fetches BotGuard challenges and guest visitor_data from
-// YouTube's InnerTube API. The session manager tries caller-provided challenges,
-// then att/get, then WAA Create; att/get returns a structured bgChallenge without
-// an extra Create request. browse provides guest visitor_data when a caller does
-// not have one.
+// YouTube's InnerTube API. att/get returns structured challenges, and browse
+// supplies visitor_data when a caller does not already have it.
 //
-// Requests go through the shared httpx layer for retries, body caps, and
-// Retry-After handling. The interpreter URL in a bgChallenge is resolved through
-// botguard.ResolveInterpreter, which applies the same host allowlist and bounded
-// fetch used by the Create path.
+// Requests use the shared httpx retry and response-limit behavior. Interpreter
+// URLs are resolved through botguard.ResolveInterpreter.
 package innertube
 
 import (
@@ -22,26 +18,25 @@ import (
 )
 
 const (
-	// clientVersion is a recent WEB InnerTube version; clientName WEB is required
-	// for these guest endpoints. Callers may override it with the current YouTube
-	// web client version from ytcfg.INNERTUBE_CLIENT_VERSION.
+	// clientVersion is a recent WEB InnerTube version. These guest endpoints
+	// require clientName WEB. Callers may replace it with the current version from
+	// ytcfg.INNERTUBE_CLIENT_VERSION.
 	clientName    = "WEB"
 	clientVersion = "2.20260603.05.00"
 
 	maxBody = 4 << 20 // response body cap
 )
 
-// Endpoints. att/get yields the bgChallenge; browse yields visitor_data. They
-// are vars (not consts) so tests can point them at an httptest server.
+// att/get returns the bgChallenge, and browse returns visitor_data. Variables let
+// tests point these endpoints at an httptest server.
 var (
 	attGetURL = "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false"
 	browseURL = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
 )
 
 // GetChallenge fetches a structured BotGuard challenge from att/get and resolves
-// its interpreter URL. innertubeContext, when non-empty, is sent verbatim as the
-// request "context" (callers such as the bgutil server pass their own); empty
-// uses a default guest WEB context. userAgent is the active profile's UA.
+// its interpreter URL. A non-empty innertubeContext is sent verbatim. An empty
+// value uses a default guest WEB context. userAgent is the active profile's UA.
 func GetChallenge(ctx context.Context, client *httpx.Client, userAgent string, innertubeContext json.RawMessage) (*botguard.Challenge, error) {
 	reqCtx := innertubeContext
 	if len(reqCtx) == 0 {
@@ -70,8 +65,8 @@ func GetChallenge(ctx context.Context, client *httpx.Client, userAgent string, i
 	return ch, nil
 }
 
-// bgChallengeEnvelope is the att/get response shape we read. Field names match
-// the InnerTube wire format (camelCase); unknown fields are ignored.
+// bgChallengeEnvelope is the part of the att/get response used by WaxSeal. Field
+// names match the camelCase InnerTube wire format.
 type bgChallengeEnvelope struct {
 	BGChallenge struct {
 		InterpreterURL struct {

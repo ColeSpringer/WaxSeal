@@ -2,7 +2,7 @@
   "name": "waxseal-bgbundle",
   "version": "0.0.0",
   "private": true,
-  "description": "WaxSeal BotGuard JS bundle build (esbuild: bgutils-js + browser entrypoint)",
+  "description": "Build the WaxSeal BotGuard browser bundle with esbuild",
   "type": "module",
   "scripts": {
     "build": "node build-browser.mjs"

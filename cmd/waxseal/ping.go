@@ -23,7 +23,7 @@ func newPingCmd() *cobra.Command {
 	var p pingOpts
 	c := &cobra.Command{
 		Use:   "ping",
-		Short: "Health-check a running waxseal server (exit 0 if healthy)",
+		Short: "Check the health of a running WaxSeal server",
 		Args:  cobra.NoArgs,
 		RunE:  func(cmd *cobra.Command, _ []string) error { return runPing(cmd, &p) },
 	}

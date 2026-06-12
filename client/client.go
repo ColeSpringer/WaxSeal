@@ -1,8 +1,6 @@
-// Package client is a Go client for the WaxSeal HTTP PO-token daemon. Any
-// application can use it to mint PO tokens (/get_pot) and adopt the coherent
-// guest session (/session), independent of WaxTap. The WaxTap potoken.Provider
-// adapter lives in waxseal/provider and is a thin wrapper over this client; other
-// consumers can use this client directly or build their own adapter.
+// Package client calls the WaxSeal HTTP API. It can mint PO tokens, fetch player
+// contexts, and export guest sessions without depending on WaxTap. The provider
+// module contains the optional WaxTap adapter.
 package client
 
 import (
@@ -30,9 +28,9 @@ type Token struct {
 	ExpiresAt time.Time // zero == unknown
 }
 
-// Session is WaxSeal's coherent guest identity: the visitor_data and youtube.com
-// cookies a consumer adopts so attestation, token binding, and the download are
-// one browser-as-origin session.
+// Session contains the guest identity and youtube.com cookies exported by
+// WaxSeal. A consumer can adopt this session so attestation, token binding, and
+// downloads use the same browser identity.
 type Session struct {
 	VisitorData   string
 	UserAgent     string
@@ -59,9 +57,9 @@ type PlayerContext struct {
 	AudioFormats                 []AudioFormat `json:"audio_formats"`
 }
 
-// AudioFormat is one audio adaptiveFormat selector; the (Itag, LMT, XTags) triple
-// must be carried together to select a coherent format from the SABR server. It
-// mirrors browser.AudioFormat over the wire (see PlayerContext); keep the tags in sync.
+// AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
+// used together when selecting the format from the SABR server. This type mirrors
+// browser.AudioFormat over the wire. Keep the JSON tags in sync.
 type AudioFormat struct {
 	Itag             int    `json:"itag"`
 	LMT              string `json:"lmt"`
@@ -80,14 +78,14 @@ type AudioFormat struct {
 // Option configures a Client.
 type Option func(*Client)
 
-// WithAPIKey sends X-API-Key on every request (for a multi-tenant WaxSeal).
+// WithAPIKey sends X-API-Key with every request.
 func WithAPIKey(key string) Option { return func(c *Client) { c.apiKey = key } }
 
 // WithHTTPClient overrides the default HTTP client.
 func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.hc = hc } }
 
-// New returns a client for the WaxSeal daemon at baseURL
-// (e.g. "http://127.0.0.1:4416").
+// New returns a client for the WaxSeal daemon at baseURL. A typical base URL is
+// "http://127.0.0.1:4416".
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{baseURL: strings.TrimRight(baseURL, "/"), hc: http.DefaultClient}
 	for _, o := range opts {
@@ -96,9 +94,9 @@ func New(baseURL string, opts ...Option) *Client {
 	return c
 }
 
-// POToken mints a token bound to contentBinding: a video_id for a player token, or
-// a visitor_data for a GVS token. scope is an optional discriminator ("player",
-// "gvs", ...); "" lets the daemon use a generic key.
+// POToken mints a token bound to contentBinding. Use a video_id for a player
+// token or visitor_data for a GVS token. Scope distinguishes cache entries. An
+// empty scope uses the daemon's generic cache key.
 func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Token, error) {
 	if contentBinding == "" {
 		return Token{}, errors.New("waxseal/client: content_binding is required")
@@ -135,7 +133,7 @@ func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Tok
 	return Token{Value: out.POToken, ExpiresAt: out.ExpiresAt}, nil
 }
 
-// Session fetches the coherent {visitor_data, cookies} handoff.
+// Session fetches the daemon's guest identity and cookies.
 func (c *Client) Session(ctx context.Context) (*Session, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/session", nil)
 	if err != nil {
@@ -176,9 +174,9 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies}, nil
 }
 
-// PlayerContext fetches videoID's status-1 streaming context (server_abr_streaming_url
-// + ustreamer config + visitor_data + client version + audio formats). The url's n is
-// scrambled; descramble it with the returned PlayerURL.
+// PlayerContext fetches the status-1 streaming context for videoID. The
+// ServerAbrStreamingURL contains a scrambled n parameter that the consumer must
+// descramble with PlayerURL.
 func (c *Client) PlayerContext(ctx context.Context, videoID string) (*PlayerContext, error) {
 	if videoID == "" {
 		return nil, errors.New("waxseal/client: video_id is required")

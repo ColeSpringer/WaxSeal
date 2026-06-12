@@ -1,6 +1,6 @@
-// Bundle bgutils-js + browser_entrypoint.js into a single ES2020 IIFE that go-rod
-// injects into a real Chromium page. The output is committed under internal/browser/
-// and go:embed-ed there, so `go build` needs no Node toolchain.
+// Bundle bgutils-js and browser_entrypoint.js into one ES2020 IIFE for Chromium.
+// The committed output is embedded from internal/browser, so `go build` does not
+// need Node.
 // Rebuild: make jsbundle-browser.
 import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
@@ -22,7 +22,7 @@ const result = await build({
   legalComments: 'none',
   minify: false, // keep the embedded bundle readable
   banner: {
-    js: `// GENERATED - do not edit. Source: build/js/browser_entrypoint.js + bgutils-js@${bgutilsVersion}.\n`
+    js: `// GENERATED - do not edit. Source: build/js/browser_entrypoint.js and bgutils-js@${bgutilsVersion}.\n`
       + `// Rebuild: make jsbundle-browser (esbuild@${esbuildVersion}).`
   },
   outfile: OUT

@@ -1,3 +1,5 @@
+// Package browser manages the Chromium sessions used for BotGuard attestation,
+// token minting, and player-context capture.
 package browser
 
 import (
@@ -23,18 +25,15 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// DefaultVideo is the landing video the browser parks on to capture the page
-// identity (visitor_data, client version, signatureTimestamp). It is Blender's
-// "Big Buck Bunny", a Creative Commons open movie. Keep every video id in this
-// codebase non-copyrighted.
+// DefaultVideo is the landing video used to capture the browser identity. It is
+// Blender's Creative Commons movie "Big Buck Bunny."
 const DefaultVideo = "aqz-KE-bpKQ"
 
-// playerContextTimeout bounds how long PlayerContext waits for the player to load a
-// video and expose its (status-1 graded) getPlayerResponse().
+// playerContextTimeout bounds how long PlayerContext waits for the player to load
+// a video and expose its status-1 getPlayerResponse result.
 const playerContextTimeout = 25 * time.Second
 
-// playerContextPollInterval paces the player-context poll loop (both the hydration
-// wait and the establish wait).
+// playerContextPollInterval paces the player-context polling loops.
 const playerContextPollInterval = 300 * time.Millisecond
 
 // ErrUnplayable marks a terminal playabilityStatus. The minter caches this error
@@ -58,19 +57,18 @@ func (e *UnplayableError) Error() string {
 
 func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 
-// Options configure a browser Session. The zero value is usable: it auto-detects
-// a system Chromium, runs headless=new, and discards logs.
+// Options configure a browser Session. The zero value auto-detects Chromium,
+// runs in the new headless mode, and discards logs.
 type Options struct {
 	ChromeBin   string        // explicit Chromium binary; "" auto-detects (WAXSEAL_CHROME_BIN, then well-known paths)
 	Headful     bool          // run headful (needs a display/Xvfb); default is headless=new
-	NormalizeUA bool          // headless only: rewrite navigator.userAgent HeadlessChrome->Chrome so the UA is not a headless tell (UA-CH already matches a real Chromium)
+	NormalizeUA bool          // remove the HeadlessChrome marker in headless mode; UA-CH already matches Chromium
 	Logger      *slog.Logger  // nil discards
 	NavTimeout  time.Duration // watch-page navigation budget (default 45s)
 }
 
-// Identity is the captured real-browser session: the page's visitor_data, client
-// version, user agent, and signatureTimestamp. A consumer adopts it so its
-// downloads share the browser's origin.
+// Identity contains the browser session values that a consumer needs to adopt
+// the same guest identity.
 type Identity struct {
 	WatchURL      string `json:"watch_url"`
 	VisitorData   string `json:"visitor_data"`
@@ -82,13 +80,13 @@ type Identity struct {
 	STS           int    `json:"signature_timestamp"` // from base.js; required or /player returns UNPLAYABLE
 }
 
-// Session is one launched Chromium plus a page parked on a youtube.com watch page,
-// with the bundle injected and a Go HTTP client seeded from the page's cookies, so
-// att/get and GenerateIT egress with the same cookies and IP as the browser.
+// Session owns a Chromium page with the browser bundle installed. Its Go HTTP
+// client uses the page's cookies so att/get and GenerateIT share the browser's
+// session and egress IP.
 type Session struct {
 	browser *rod.Browser
 	page    *rod.Page
-	dispose func() // tears down what this Session owns: the whole browser (Launch) or just its context (Pool)
+	dispose func() // closes the browser from Launch or the context from Pool
 	id      Identity
 	client  *httpx.Client // egresses with the browser's cookies
 	log     *slog.Logger
@@ -135,8 +133,8 @@ func withDefaults(opts Options) Options {
 	return opts
 }
 
-// launchChromium starts a Chromium and connects rod to it, returning the browser,
-// its launcher, and the temp profile dir. The caller owns teardown.
+// launchChromium starts Chromium and connects rod to it. The caller must close
+// the browser, stop the launcher, and remove the returned profile directory.
 func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, error) {
 	bin := opts.ChromeBin
 	if bin == "" {
@@ -162,8 +160,8 @@ func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, err
 		Set("disable-gpu").
 		Set("mute-audio").
 		// Without these, go-rod leaves navigator.webdriver === true, which no real
-		// browser sets. This removes the automation flag; it does not alter the
-		// genuine fingerprint.
+		// browser sets. This removes the automation flag without changing the
+		// remaining fingerprint.
 		Delete("enable-automation").
 		Set("disable-blink-features", "AutomationControlled")
 	if opts.Headful {
@@ -178,10 +176,8 @@ func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, err
 		_ = os.RemoveAll(profileDir)
 		return nil, nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
 	}
-	// NoDefaultDevice: otherwise go-rod overrides the UA with a hardcoded stale
-	// Chrome/114 Mac string that contradicts the real Linux navigator. Disabling it
-	// lets the genuine identity through. Headful reports a clean Chrome; headless
-	// leaks HeadlessChrome, which NormalizeUA rewrites.
+	// NoDefaultDevice prevents go-rod from replacing the browser's Linux user
+	// agent with its built-in Chrome 114 macOS value.
 	browser := rod.New().ControlURL(controlURL).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		l.Kill()
@@ -255,10 +251,9 @@ func setupSession(ctx context.Context, browser *rod.Browser, videoID string, opt
 	return s, nil
 }
 
-// Pool owns one Chromium and hands out isolated incognito-context Sessions: one
-// guest identity (visitor_data, cookies, storage) per tenant, all sharing one
-// browser and egress IP. Per-context egress is a future seam; residential
-// self-hosting uses the one host IP.
+// Pool owns one Chromium and creates isolated incognito-context Sessions. Each
+// session has its own guest identity, cookies, and storage. All sessions share
+// the browser's egress IP.
 type Pool struct {
 	browser  *rod.Browser
 	launcher *launcher.Launcher
@@ -277,7 +272,7 @@ func LaunchPool(opts Options) (*Pool, error) {
 }
 
 // NewSession creates a fresh isolated browser context and parks a Session in it.
-// Closing the Session disposes just that context, not the shared browser.
+// Closing the Session disposes its context without closing the shared browser.
 func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error) {
 	incog, err := p.browser.Incognito()
 	if err != nil {
@@ -310,9 +305,8 @@ func (p *Pool) Close() {
 	}
 }
 
-// captureIdentity polls ytcfg (it is populated after the SPA boots) for the real
-// visitor_data / client version / api key, and records navigator.userAgent and
-// navigator.webdriver.
+// captureIdentity polls ytcfg after the SPA boots and records visitor_data, the
+// client version, the API key, navigator.userAgent, and navigator.webdriver.
 func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 	const js = `() => {
 		const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : (window.ytcfg || null);
@@ -369,10 +363,8 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 	return nil
 }
 
-// normalizeUA rewrites navigator.userAgent HeadlessChrome->Chrome (keeping UA-CH
-// coherent) via a CDP override applied before navigation, so the BotGuard snapshot
-// sees a non-headless UA string. The browser is genuinely Chromium on Linux; only
-// the "Headless" marker is removed.
+// normalizeUA removes the HeadlessChrome marker from navigator.userAgent before
+// navigation and keeps UA-CH consistent. No other fingerprint values are changed.
 func (s *Session) normalizeUA(ctx context.Context) error {
 	obj, err := s.page.Context(ctx).Eval(`() => navigator.userAgent`)
 	if err != nil {
@@ -434,7 +426,7 @@ func (s *Session) captureSTS(ctx context.Context) error {
 }
 
 // buildCoherentClient seeds a Go cookie jar from the browser's youtube.com
-// cookies so the Go-side att/get + GenerateIT calls carry the same session as the
+// cookies so the Go-side att/get and GenerateIT calls carry the same session as the
 // page (the egress IP matches automatically, since it is the same host).
 func (s *Session) buildCoherentClient() error {
 	cookies, err := s.page.Cookies([]string{"https://www.youtube.com"})
@@ -458,15 +450,11 @@ func (s *Session) buildCoherentClient() error {
 // Identity returns the captured real session identity.
 func (s *Session) Identity() Identity { return s.id }
 
-// BrowserCookies returns the browser's youtube.com cookies so a consumer can seed
-// its own jar and adopt the same session. Loading youtube.com with these returns
-// the browser's visitor_data, so attestation, token binding, and the stream share
-// one session.
+// BrowserCookies returns the browser's youtube.com cookies so a consumer can
+// adopt the same guest session.
 //
-// It reads at the browser level (Storage.getCookies) rather than the page level
-// (Network.getCookies): a page-level read goes empty once the page leaves
-// youtube.com (e.g. a warm minter parked after attest), while the Storage store
-// returns the live cookies regardless of page state.
+// It reads the browser-level cookie store because page-level reads can be empty
+// after the page leaves youtube.com.
 func (s *Session) BrowserCookies() []*http.Cookie {
 	cs, err := s.browser.GetCookies()
 	if err != nil {
@@ -485,8 +473,7 @@ func (s *Session) BrowserCookies() []*http.Cookie {
 	return out
 }
 
-// Page exposes the underlying rod.Page (the minter's crash watcher attaches to
-// its target-crashed / detached events).
+// Page returns the underlying rod page used by the minter's crash watcher.
 func (s *Session) Page() *rod.Page { return s.page }
 
 // MintResult is one mint outcome: the token, whether it came from the integrity
@@ -500,10 +487,9 @@ type MintResult struct {
 	ExpiresAt  time.Time `json:"-"` // absolute expiry (attest time + lifetime); zero if unknown
 }
 
-// Attest runs the expensive once-per-session attestation: att/get challenge (Go)
-// -> runBotguard (browser) -> GenerateIT (Go). On success it installs a warm
-// per-identifier minter (integrity path) or records the single websafe fallback
-// token. Idempotent: later Mint calls reuse the one attestation.
+// Attest runs the once-per-session attestation. Go fetches the att/get challenge,
+// the browser runs BotGuard, and Go calls GenerateIT. Later Mint calls reuse the
+// resulting integrity minter or fallback token.
 func (s *Session) Attest(ctx context.Context) error {
 	if s.attestKind != "" {
 		return nil
@@ -562,10 +548,9 @@ func (s *Session) Attest(ctx context.Context) error {
 	return nil
 }
 
-// Mint produces a token bound to identifier (video_id for the player scope,
-// visitor_data for GVS) off the single attestation. The integrity path mints a
-// fresh per-identifier token in-browser; the fallback path returns Google's
-// single websafe token (identifier-independent). Both are field-6 validated.
+// Mint produces a token bound to identifier from the session's attestation. The
+// integrity path mints a new token in the browser. The fallback path returns the
+// single fallback token from Google. Both paths validate protobuf field 6.
 func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, error) {
 	if err := s.Attest(ctx); err != nil {
 		return MintResult{}, err
@@ -608,11 +593,11 @@ type PlayerContext struct {
 }
 
 // AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
-// used together; an inconsistent selector causes the SABR server to request a
+// used together. An inconsistent selector makes the SABR server request a
 // player-response reload instead of returning media.
 type AudioFormat struct {
 	Itag             int    `json:"itag"`
-	LMT              string `json:"lmt"` // lastModified; a large opaque integer, kept as a string url param
+	LMT              string `json:"lmt"` // lastModified, kept as a string because it is a large opaque URL parameter
 	XTags            string `json:"xtags"`
 	MimeType         string `json:"mime_type"`
 	Bitrate          int    `json:"bitrate"`
@@ -630,8 +615,8 @@ type AudioFormat struct {
 const playerReadyJS = `() => { const p = document.getElementById('movie_player'); return !!(p && p.loadVideoById && p.getPlayerResponse); }`
 
 // playerLoadJS resets the player, applies the visibility overrides needed for
-// headless playback, and loads videoID. Resetting first prevents a repeated request
-// for the same video from observing buffered state from the previous request.
+// headless playback, and loads videoID. The reset keeps a repeated request from
+// observing buffered state from the previous request.
 //
 // Each load gets a new generation and clears the previous error marker. The
 // onError marker records both the generation and the player's video ID so late
@@ -766,10 +751,8 @@ type playerContextRaw struct {
 }
 
 // confirmTerminal returns a terminal error only when the evidence belongs to
-// videoID. Requiring both generation and video ID for onError events prevents a
-// late error from a previous load from marking the current video unavailable. A
-// non-OK playability status is terminal only when its player response matches
-// videoID.
+// videoID. The generation and video ID checks reject late errors from a previous
+// load.
 func confirmTerminal(raw playerContextRaw, videoID string) (*UnplayableError, bool) {
 	if raw.ErrGenMatch && raw.ErrVideoID == videoID && isUnavailableCode(raw.ErrCode) {
 		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}, true
@@ -897,8 +880,8 @@ func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string,
 	}
 }
 
-// The full-length probe seeks beyond the ~70s status-2 preview cap and confirms
-// that playback advances through buffered media at the target.
+// The full-length probe seeks beyond the roughly 70-second status-2 preview cap
+// and confirms that playback advances through buffered media at the target.
 const (
 	fullLengthTargetSecs   = 100              // seek target beyond the preview cap
 	fullLengthMinVideoSecs = 120              // minimum duration that leaves enough media after the target
@@ -973,8 +956,8 @@ type FullLengthProbe struct {
 }
 
 // VerifyFullLength checks whether the attested browser can stream beyond the
-// ~70s status-2 preview cap. It establishes a player context, seeks beyond the
-// cap, and requires both playback progress and buffered media at the target.
+// roughly 70-second status-2 preview cap. It establishes a player context, seeks
+// beyond the cap, and requires playback progress and buffered media at the target.
 //
 // A negative result does not prove that status-2 caused the failure. Reason
 // records the observed establishment failure, player error, stall, or timeout.
@@ -1106,12 +1089,12 @@ func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLen
 	}
 }
 
-// AttestKind reports the attestation outcome ("integrity" or "fallback") after
-// Attest/Mint; "" before attestation.
+// AttestKind reports "integrity" or "fallback" after Attest or Mint. It returns
+// an empty string before attestation.
 func (s *Session) AttestKind() string { return s.attestKind }
 
-// Close tears down what this Session owns (the whole browser for Launch, or just
-// its incognito context for Pool.NewSession) via the dispose closure. Idempotent.
+// Close releases the browser created by Launch or the context created by
+// Pool.NewSession. It is idempotent.
 func (s *Session) Close() {
 	if s == nil || s.dispose == nil {
 		return
@@ -1121,8 +1104,8 @@ func (s *Session) Close() {
 	d()
 }
 
-// DetectChrome resolves a Chromium binary: WAXSEAL_CHROME_BIN, then well-known
-// system paths (the pinned snap Chromium 149 on this host).
+// DetectChrome resolves a Chromium binary from WAXSEAL_CHROME_BIN or common
+// system paths.
 func DetectChrome() (string, error) {
 	if b := os.Getenv("WAXSEAL_CHROME_BIN"); b != "" {
 		return b, nil

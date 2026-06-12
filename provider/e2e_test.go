@@ -34,9 +34,9 @@ const (
 )
 
 // startColdDaemon starts an isolated in-process daemon or uses WAXSEAL_URL when
-// set. The selected loopback port may be claimed between listener close and server
-// startup; waitDaemonReady reports that failure. Teardown is registered with
-// t.Cleanup, so a failure in Warm or readiness still shuts the browser down.
+// set. Another process may claim the selected loopback port before server startup.
+// waitDaemonReady reports that failure. Teardown is registered before startup so
+// failures still close the browser.
 func startColdDaemon(t *testing.T) string {
 	t.Helper()
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
@@ -357,21 +357,21 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	if elapsed > 9*time.Second {
 		t.Errorf("dead id took %v, want well under the 10s deadline", elapsed)
 	}
-	t.Logf("dead id -> 422 in %v", elapsed)
+	t.Logf("dead id returned 422 in %v", elapsed)
 
 	after := readEscalationMetrics(t, base)
 	if after.Generation != before.Generation {
-		t.Errorf("generation changed %d -> %d (a relaunch happened)", before.Generation, after.Generation)
+		t.Errorf("generation changed from %d to %d (a relaunch happened)", before.Generation, after.Generation)
 	}
 	if after.Attestations != before.Attestations {
-		t.Errorf("attestations changed %d -> %d (a re-attest happened)", before.Attestations, after.Attestations)
+		t.Errorf("attestations changed from %d to %d (a re-attest happened)", before.Attestations, after.Attestations)
 	}
 	if after.Escalations != before.Escalations {
-		t.Errorf("escalations changed %d -> %d", before.Escalations, after.Escalations)
+		t.Errorf("escalations changed from %d to %d", before.Escalations, after.Escalations)
 	}
 	// player_context_failures counts failed attempts and negative-cache hits.
 	if after.PlayerContextFailures <= before.PlayerContextFailures {
-		t.Errorf("player_context_failures did not increase: %d -> %d", before.PlayerContextFailures, after.PlayerContextFailures)
+		t.Errorf("player_context_failures did not increase from %d to %d", before.PlayerContextFailures, after.PlayerContextFailures)
 	}
 
 	// A repeat request should be served from the negative cache.

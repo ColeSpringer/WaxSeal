@@ -14,7 +14,7 @@ import (
 	"github.com/colespringer/waxseal/internal/httpx"
 )
 
-// Wire constants. The WebKit User-Agent is load-bearing: non-WebKit UAs yield
+// Wire constants. WAA requires a WebKit user agent. Other user agents produce
 // invalid tokens (rustypipe lib.rs:123).
 const (
 	RequestKey       = "O43z0dpjhgX20SCx4KAo"
@@ -32,10 +32,10 @@ const (
 	maxInterpreterRedirects = 3
 )
 
-// EndpointMode selects which WAA host serves Create/GenerateIT attestation
-// calls. The default youtube.com/api/jnn/v1 path needs no auth; googleapis
-// targets jnn-pa.googleapis.com for bgutil parity. Only WAA calls vary by mode;
-// InnerTube att/get is always on youtube.com.
+// EndpointMode selects the WAA host for Create and GenerateIT calls. The default
+// youtube.com/api/jnn/v1 path needs no authentication. The googleapis mode uses
+// jnn-pa.googleapis.com for bgutil compatibility. InnerTube att/get always uses
+// youtube.com.
 type EndpointMode string
 
 const (
@@ -52,8 +52,8 @@ type Endpoint struct {
 // DefaultEndpoint is the youtube.com/api/jnn/v1 mode.
 var DefaultEndpoint = Endpoint{CreateURL: CreateURL, GenerateITURL: GenerateITURL}
 
-// ResolveEndpoint maps a mode string (empty = default) to its Endpoint, erroring
-// on an unknown mode so a typo fails loudly at construction.
+// ResolveEndpoint maps a mode string to its Endpoint. An empty mode selects the
+// default, and an unknown mode returns an error.
 func ResolveEndpoint(mode string) (Endpoint, error) {
 	switch EndpointMode(NormalizeEndpointMode(mode)) {
 	case EndpointYouTube:
@@ -87,9 +87,8 @@ func (e Endpoint) orDefault() Endpoint {
 	return e
 }
 
-// Stage tags every error for drift telemetry, so an upstream change reports as
-// "descramble", "parse", "vm", "generateit", or "validate" rather than a
-// generic failure. Circuit breakers can also act on the category.
+// Stage identifies where a BotGuard operation failed. Telemetry and circuit
+// breakers can use it without parsing error messages.
 type Stage string
 
 const (
@@ -103,7 +102,7 @@ const (
 	StageValidate   Stage = "validate"
 )
 
-// StageError carries the stage; raw Google payloads/tokens are never embedded.
+// StageError carries the stage without embedding raw Google payloads or tokens.
 type StageError struct {
 	Stage Stage
 	Err   error
@@ -125,10 +124,9 @@ type Challenge struct {
 	InterpreterHash string // att/get's interpreterHash, when supplied (cache key)
 }
 
-// FetchCreateChallenge runs the WAA Create source: POST Create, parse or
-// descramble, then resolve the interpreter (inline, or a bounded host-allowlisted
-// fetch). All HTTP is done in Go through the shared httpx layer. userAgent is
-// the profile's attestation UA; WAA requires a WebKit-family UA.
+// FetchCreateChallenge posts to WAA Create, parses the response, and resolves the
+// interpreter. HTTP requests use the shared httpx layer. userAgent must belong to
+// the active browser profile and use the WebKit family.
 func FetchCreateChallenge(ctx context.Context, client *httpx.Client, userAgent string, ep Endpoint) (*Challenge, error) {
 	ep = ep.orDefault()
 	body, _ := json.Marshal([]string{RequestKey})
@@ -267,9 +265,9 @@ func parseStringChallenge(s string) (*Challenge, error) {
 	return nil, stageErr(StageParse, "unrecognized string challenge")
 }
 
-// parseChallengeData ports parse_challenge_data: interpreter is the first
-// non-empty string in cdata[1] (inline JS) or cdata[2] (URL); program is
-// cdata[4], and globalName is cdata[5].
+// parseChallengeData ports parse_challenge_data. The interpreter is the first
+// non-empty string in cdata[1] for inline JavaScript or cdata[2] for a URL. The
+// program and global name are in cdata[4] and cdata[5].
 func parseChallengeData(cdata []json.RawMessage) (*Challenge, error) {
 	if len(cdata) < 6 {
 		return nil, stageErr(StageParse, "challenge array len %d < 6", len(cdata))
@@ -318,9 +316,8 @@ func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge
 	if ch.InterpreterJS != "" {
 		return nil
 	}
-	// Reuse a previously-fetched interpreter for the same hash/URL: it is the same
-	// Google JS regardless of egress/profile, so this avoids refetching the ~62 KB
-	// blob on minter refreshes and across egresses. Memory-only, never persisted.
+	// Reuse an interpreter fetched for the same hash or URL. Interpreter code is
+	// independent of the browser profile and egress IP.
 	cacheKey := interpKey(ch)
 	if cacheKey != "" {
 		if js, ok := interpCache.get(cacheKey); ok {
@@ -334,7 +331,7 @@ func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return stageErr(StageInterp, "parse interpreter url: %w", err)
+		return stageErr(StageInterp, "parse interpreter URL: %w", err)
 	}
 	if u.Scheme != "https" || !hostAllowed(u.Hostname()) {
 		return stageErr(StageInterp, "interpreter host not allowlisted: %q", u.Hostname())
@@ -393,10 +390,8 @@ func interpKey(ch *Challenge) string {
 	return ""
 }
 
-// interpreterCache memoizes fetched interpreter JS by interpKey. It is
-// process-wide (the interpreter is the same for every egress/profile),
-// memory-only (live-from-Google is never persisted), and bounded so many
-// interpreter versions cannot grow it without limit.
+// interpreterCache stores fetched interpreter JavaScript in memory by interpKey.
+// It is process-wide and bounded.
 type interpreterCache struct {
 	mu  sync.Mutex
 	max int
@@ -424,8 +419,8 @@ func (c *interpreterCache) put(key, js string) {
 	c.m[key] = js
 }
 
-// ClearInterpreterCache drops all cached interpreters. It backs forced-refresh
-// paths (and keeps tests isolated from this process-wide cache).
+// ClearInterpreterCache drops all cached interpreters. Forced refreshes and
+// tests use it to clear process-wide state.
 func ClearInterpreterCache() {
 	interpCache.mu.Lock()
 	defer interpCache.mu.Unlock()

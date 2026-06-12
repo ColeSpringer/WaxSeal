@@ -28,7 +28,7 @@ func TestParseBGChallenge(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	if ch.InterpreterURL != "//www.google.com/js/th/bg.js" {
-		t.Errorf("interpreter url = %q", ch.InterpreterURL)
+		t.Errorf("interpreter URL = %q", ch.InterpreterURL)
 	}
 	if ch.Program != "PROGRAM" || ch.GlobalName != "GLOBAL" {
 		t.Errorf("parsed = %+v", ch)
@@ -57,7 +57,7 @@ func TestParseBGChallengeMissingFields(t *testing.T) {
 func TestGetChallengeWiresResolution(t *testing.T) {
 	// att/get returns a valid bgChallenge whose interpreter host is outside the
 	// allowlist, so resolution rejects it before any network call. This verifies
-	// fetch -> parse -> ResolveInterpreter without hitting that host.
+	// This covers fetch, parse, and ResolveInterpreter without contacting that host.
 	var gotBody map[string]json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)

@@ -16,18 +16,17 @@ type playerContextOpts struct {
 	verbose bool
 }
 
-// newPlayerContextCmd is the one-shot counterpart to the daemon's /player-context
-// endpoint (like generate/doctor: it launches its own browser). For a warm daemon,
-// POST /player-context or use client.PlayerContext.
+// newPlayerContextCmd is the one-shot counterpart to the daemon's
+// /player-context endpoint. It launches a new browser for each call.
 func newPlayerContextCmd() *cobra.Command {
 	var o playerContextOpts
 	c := &cobra.Command{
 		Use:   "player-context",
 		Short: "Launch a browser, attest, and print a video's status-1 streaming context",
-		Long: "Diagnostics/one-shot: launch a real Chromium, attest, point the player at\n" +
-			"--video, and print its status-1 streaming context (server_abr_streaming_url +\n" +
-			"player_url + visitor_data + audio formats) as JSON. For a warm daemon, POST\n" +
-			"/player-context instead; a fresh browser per call is slow.",
+		Long: "Launch a real Chromium, attest, point the player at --video, and print\n" +
+			"its status-1 streaming context as JSON. The response includes the SABR URL,\n" +
+			"player URL, visitor data, and audio formats. For a warm daemon, POST to\n" +
+			"/player-context instead.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runPlayerContext(cmd, &o) },
 	}

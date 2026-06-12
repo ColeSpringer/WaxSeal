@@ -1,4 +1,4 @@
-# Standalone WaxSeal PO-token service, hardened.  `docker compose up --build`
+# Standalone WaxSeal PO-token service. Run with `docker compose up --build`.
 #
 # Headless Chromium runs with --no-sandbox inside the container, so the container
 # boundary is the isolation: non-root user, all caps dropped, no new privileges,
@@ -8,14 +8,14 @@ services:
     build: .
     image: waxseal:latest
     container_name: waxseal
-    restart: unless-stopped # tini (image ENTRYPOINT) is PID 1 and reaps Chromium's children
+    restart: unless-stopped # tini is PID 1 and reaps Chromium child processes
     ports:
       - "127.0.0.1:4416:4416" # loopback only; use "0.0.0.0:4416:4416" or a LAN IP to expose
-    shm_size: "1gb" # headless Chromium
+    shm_size: "1gb" # working space for headless Chromium
     cap_drop:
       - ALL
     # A read-only rootfs is an option, but Chromium needs a writable HOME for its
-    # profile; mount a user-owned tmpfs there if you enable it, e.g.:
+    # profile. Mount a user-owned tmpfs there if you enable it:
     #   read_only: true
     #   volumes:
     #     - type: tmpfs

@@ -5,11 +5,11 @@ WaxSeal is **MIT**-licensed, implemented independently. The **GPL-3.0**
 reference for interoperable details (endpoints, JSON field names); no GPL code
 was copied. Algorithms ported from MIT sources are attributed below.
 
-## Bundled / embedded at runtime
+## Bundled at runtime
 
-- **bgutils-js** (MIT): the BotGuard client / WebPoMinter, bundled into the
-  shim-free browser bundle `internal/browser/bg_browser_bundle.js` and eval'd in
-  the real Chromium. <https://github.com/LuanRT/BgUtils>
+- **bgutils-js** (MIT): the BotGuard client and WebPoMinter. WaxSeal bundles it
+  into `internal/browser/bg_browser_bundle.js` and evaluates it in Chromium.
+  <https://github.com/LuanRT/BgUtils>
 
 ## Build-time only (not shipped)
 
@@ -19,9 +19,10 @@ was copied. Algorithms ported from MIT sources are attributed below.
 ## Go module dependencies
 
 - **github.com/go-rod/rod** (MIT): the Chrome DevTools Protocol driver used to run
-  BotGuard in a real headless Chromium (pulls `ysmood/{gson,goob,fetchup,leakless}`
-  and `google.golang.org/protobuf`). <https://github.com/go-rod/rod>
-- **github.com/spf13/cobra** / **spf13/pflag** (Apache-2.0): CLI framework.
+  BotGuard in a real headless Chromium. It pulls
+  `ysmood/{gson,goob,fetchup,leakless}` and `google.golang.org/protobuf`.
+  <https://github.com/go-rod/rod>
+- **github.com/spf13/cobra** and **spf13/pflag** (Apache-2.0): CLI framework.
 
 The product drives an external system **Chromium** at run time; Chromium is not
 bundled and carries its own (BSD-style) license.
@@ -31,5 +32,5 @@ bundled and carries its own (BSD-style) license.
 - **rustypipe-botguard** (MIT): `descramble` (`+97`/byte), `parse_challenge_data`,
   and `validate_potoken` (protobuf field-6 scan) were ported to Go in
   `internal/botguard`. <https://codeberg.org/ThetaDev/rustypipe-botguard>
-- **BgUtils** (MIT): the BotGuard client / WebPoMinter protocol informed the
+- **BgUtils** (MIT): the BotGuard client and WebPoMinter protocol informed the
   browser entrypoint and the validator. <https://github.com/LuanRT/BgUtils>

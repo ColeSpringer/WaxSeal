@@ -9,12 +9,10 @@ import (
 	"github.com/colespringer/waxseal/internal/httpx"
 )
 
-// GenerateITResult preserves the integrity and fallback tokens independently.
-// A response with no integrityToken but a valid field-6 fallbackToken is still a
-// successful attestation: the integrity token unlocks the warm per-identifier
-// minter, while the websafe fallback is a single field-6-valid token returned
-// directly by Google. LifetimeSecs and RefreshThreshold are authoritative for
-// validity; CacheMaxTTL can only cap them, never extend them.
+// GenerateITResult preserves integrity and fallback tokens separately. A valid
+// fallback token still makes the attestation successful when no integrity token
+// is present. CacheMaxTTL may shorten the validity reported by LifetimeSecs and
+// RefreshThreshold, but it never extends it.
 type GenerateITResult struct {
 	IntegrityToken   string // arr[0]
 	LifetimeSecs     int    // arr[1]
@@ -29,9 +27,8 @@ func (r *GenerateITResult) HasIntegrity() bool { return r != nil && r.IntegrityT
 func (r *GenerateITResult) HasFallback() bool { return r != nil && r.FallbackToken != "" }
 
 // GenerateIT posts the botguardResponse and parses the result tuple. All HTTP is
-// done in Go. A response carrying only the fallback token (arr[0] null) is
-// success; the caller decides how to use it. Only a response with neither token
-// is an error.
+// done in Go. A response carrying only the fallback token is successful. Only a
+// response with neither token is an error.
 func GenerateIT(ctx context.Context, client *httpx.Client, userAgent, botguardResponse string, ep Endpoint) (*GenerateITResult, error) {
 	ep = ep.orDefault()
 	body, _ := json.Marshal([]string{RequestKey, botguardResponse})

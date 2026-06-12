@@ -237,7 +237,7 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("retired session should be closed")
 	}
 
-	// The already-minted token is still valid → served from cache, no relaunch.
+	// The already minted token remains valid, so the cache serves it without a relaunch.
 	if _, cached, _ := m.Mint(ctx, "gvs", "vd"); !cached {
 		t.Errorf("cached token should survive a crash (no needless re-attest)")
 	}
@@ -245,7 +245,7 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("launches = %d, want 1 (a crash alone must not re-attest)", got)
 	}
 
-	// A new binding misses the cache → relaunch (gen 2).
+	// A new binding misses the cache and causes a generation-2 relaunch.
 	if _, cached, _ := m.Mint(ctx, "player", "vid2"); cached {
 		t.Errorf("new binding should not be cached")
 	}
@@ -253,15 +253,15 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("launches = %d, want 2 (cache miss after crash relaunches)", got)
 	}
 
-	// The gen-1 gvs/vd entry is now stale (generation advanced) → re-mints.
+	// The generation-1 gvs/vd entry is stale after the relaunch.
 	if _, cached, _ := m.Mint(ctx, "gvs", "vd"); cached {
 		t.Errorf("old-generation cache entry should be invalidated by the relaunch")
 	}
 }
 
 // TestMinterPlayerContextReusesWarmSession: PlayerContext serves off the warm
-// attested session without a fresh attestation (the genuine-browser provenance,
-// not a new mint, is what the url needs), and returns the session's context.
+// attested session without a fresh attestation. The URL depends on the browser's
+// provenance rather than a new mint.
 func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
 	var calls int64
 	m, launches, _, _ := newTestMinterFull(
@@ -317,7 +317,7 @@ func TestMinterPlayerContextEscalation(t *testing.T) {
 		t.Fatalf("player-context after escalation: %v", err)
 	}
 	if pc.ServerAbrStreamingURL != "https://r/ok" {
-		t.Fatalf("got url=%q, want https://r/ok", pc.ServerAbrStreamingURL)
+		t.Fatalf("got URL=%q, want https://r/ok", pc.ServerAbrStreamingURL)
 	}
 	if got := atomic.LoadInt64(launches); got != 2 {
 		t.Errorf("launches = %d, want 2 (initial + one relaunch)", got)
@@ -338,7 +338,7 @@ func TestMinterPlayerContextEscalation(t *testing.T) {
 	}
 }
 
-// TestMinterPlayerContextUnplayableNoEscalation: a terminal ErrUnplayable does NOT
+// TestMinterPlayerContextUnplayableNoEscalation: a terminal ErrUnplayable does not
 // walk the ladder (no relaunch, no re-attest, the warm session survives), since
 // relaunching cannot make an unplayable video playable.
 func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
@@ -357,7 +357,7 @@ func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
 		t.Fatalf("err = %v, want ErrUnplayable", err)
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
-		t.Errorf("launches = %d, want 1 (unplayable must NOT relaunch/re-attest)", got)
+		t.Errorf("launches = %d, want 1 (unplayable must not relaunch/re-attest)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 0 {
 		t.Errorf("escalations = %d, want 0", got)
@@ -368,7 +368,7 @@ func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
 	smu.Lock()
 	defer smu.Unlock()
 	if (*sessions)[0].closed.Load() {
-		t.Errorf("session should NOT be retired for an unplayable video")
+		t.Errorf("session should not be retired for an unplayable video")
 	}
 }
 
@@ -418,7 +418,7 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 		t.Fatal("want error on cancelled ctx")
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
-		t.Errorf("launches = %d, want 1 (a cancel must NOT relaunch)", got)
+		t.Errorf("launches = %d, want 1 (a cancel must not relaunch)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 0 {
 		t.Errorf("escalations = %d, want 0", got)

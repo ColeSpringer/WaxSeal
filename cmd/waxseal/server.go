@@ -28,11 +28,11 @@ func newServerCmd() *cobra.Command {
 	var o serverOpts
 	c := &cobra.Command{
 		Use:   "server",
-		Short: "Run the bgutil-compatible HTTP daemon (warm browser, fast mints)",
+		Short: "Run the bgutil-compatible HTTP daemon",
 		Long: "Run the HTTP daemon over a real headless Chromium. It defaults to loopback\n" +
-			"(127.0.0.1:4416); set --host 0.0.0.0 to expose it. With --tenant-keys it is\n" +
-			"multi-tenant (one isolated browser context per key); without, it is keyless.\n" +
-			"It drains in-flight requests on SIGTERM/SIGINT.",
+			"at 127.0.0.1:4416. Set --host 0.0.0.0 to expose it. With --tenant-keys,\n" +
+			"each key receives an isolated browser context. Without it, the server is\n" +
+			"keyless. It drains in-flight requests on SIGTERM or SIGINT.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
 	}
@@ -41,8 +41,8 @@ func newServerCmd() *cobra.Command {
 	f.IntVar(&o.port, "port", 4416, "listen port")
 	f.StringVar(&o.video, "video", browser.DefaultVideo, "landing video for each tenant session")
 	f.BoolVar(&o.headful, "headful", false, "run headful (needs a display/Xvfb)")
-	f.StringVar(&o.tenantKeys, "tenant-keys", "", `multi-tenant API keys: "label1=key1,label2=key2" (empty = keyless)`)
-	f.BoolVarP(&o.verbose, "verbose", "v", false, "verbose (debug) logging")
+	f.StringVar(&o.tenantKeys, "tenant-keys", "", `multi-tenant API keys in "label1=key1,label2=key2" form`)
+	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging")
 	return c
 }
 
@@ -66,8 +66,8 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		return err
 	}
 
-	// Warm one tenant so the first request is fast and startup fails loudly if the
-	// browser/IP can't attest. The rest (if multi-tenant) attest lazily.
+	// Warm one tenant so the first request is fast and startup catches attestation
+	// failures. Other tenants attest on first use.
 	warmKey := ""
 	for k := range keys {
 		warmKey = k

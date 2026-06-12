@@ -1,7 +1,6 @@
-// Package server is the WaxSeal HTTP PO-token service: a bgutil-wire /get_pot
-// daemon backed by the real-browser minter (internal/browser + internal/minter).
-// One Chromium hosts N isolated browser contexts (one guest identity per tenant),
-// selected by per-tenant API keys; with no keys it is keyless single-tenant.
+// Package server implements the WaxSeal HTTP service. It exposes the
+// bgutil-compatible /get_pot endpoint and the related player-context, session,
+// health, and metrics endpoints.
 package server
 
 import (
@@ -26,7 +25,7 @@ type Config struct {
 	Addr       string            // listen address (default 127.0.0.1:4416)
 	Video      string            // landing video for each tenant session (default a stable id)
 	Headful    bool              // run headful (needs a display/Xvfb)
-	TenantKeys map[string]string // api key -> tenant label; nil = keyless single tenant
+	TenantKeys map[string]string // API key to tenant label; nil selects keyless single-tenant mode
 	Logger     *slog.Logger      // nil discards
 }
 
@@ -57,7 +56,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	opts := browser.Options{
 		Headful:     cfg.Headful,
-		NormalizeUA: !cfg.Headful, // headless: rewrite HeadlessChrome -> Chrome
+		NormalizeUA: !cfg.Headful, // remove the HeadlessChrome marker in headless mode
 		Logger:      log,
 	}
 	pool, err := browser.LaunchPool(opts)
@@ -78,8 +77,7 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// Warm attests the tenant the API key selects (pass "" for keyless), so startup
-// fails loudly if the browser/IP can't attest.
+// Warm attests the tenant selected by apiKey. Pass an empty key in keyless mode.
 func (s *Server) Warm(ctx context.Context, apiKey string) error {
 	return s.tenants.WarmOne(ctx, apiKey)
 }
@@ -108,8 +106,8 @@ func apiKey(r *http.Request) string {
 	return r.URL.Query().Get("key")
 }
 
-// tenant resolves the request's Minter, writing 401 and returning ok=false on an
-// unknown key.
+// tenant resolves the request's Minter. It writes a 401 response and returns
+// false when the key is unknown.
 func (s *Server) tenant(w http.ResponseWriter, r *http.Request) (*minter.Minter, string, bool) {
 	m, label, err := s.tenants.Minter(apiKey(r))
 	if err != nil {
@@ -149,8 +147,8 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Use the token's real expiry (fixed at attest time, preserved through the
-	// cache) rather than now+lifetime; otherwise a cache hit overstates expiry by
-	// the token's age.
+	// cache) rather than the current time plus lifetime. Otherwise, a cache hit
+	// overstates expiry by the token's age.
 	expires := res.ExpiresAt
 	if expires.IsZero() {
 		expires = time.Now().Add(6 * time.Hour)
@@ -168,13 +166,10 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePlayerContext returns the attested browser's /player streaming context for
-// a video_id: the serverAbrStreamingUrl (status-1 graded by the browser's
-// provenance, carrying a SCRAMBLED throttling nonce the consumer descrambles), the
-// ustreamer config, the visitor_data to bind a GVS PO token to, the client version,
-// and the audio formats (each with the itag+lmt+xtags triple needed to select a
-// coherent format). This hands the consumer everything needed to stream WEB SABR
-// audio from its own Go client; WaxSeal does no SABR/streaming itself.
+// handlePlayerContext returns the attested browser's streaming context for a
+// video_id. The response contains the status-1 SABR URL, player URL, ustreamer
+// config, visitor data, client version, and audio formats. The consumer performs
+// the streaming request.
 func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
@@ -188,9 +183,8 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	pc, err := m.PlayerContext(ctx, videoID)
 	if err != nil {
-		// Give the terminal and timeout cases their own codes so a caller can skip
-		// retrying an unplayable video (422) and tell a slow browser (504) from a
-		// broken one (502).
+		// Separate terminal and timeout failures so callers can choose whether to
+		// retry.
 		switch {
 		case errors.Is(err, browser.ErrUnplayable):
 			// Preserve the playabilityStatus so clients do not need to parse the
@@ -212,16 +206,14 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, pc)
 }
 
-// videoIDPattern is a cheap sanity check on a video id: base64url characters,
-// bounded length. It rejects obvious junk (an overlong id, or path/quote/space
-// characters) with a 400 instead of burning the whole browser poll budget on it.
-// Real ids are 11 chars; the looser bound avoids hard-coding that.
+// videoIDPattern rejects malformed IDs before they consume the browser poll
+// budget. Current YouTube IDs are 11 characters, but the wider bound avoids
+// encoding that detail into the API contract.
 var videoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// playerContextVideoID reads the video_id from the JSON body or, for a bodyless
-// request, the query param. An empty body decodes to io.EOF (not a JSON error), so it
-// falls through to the query form rather than 422-ing. It writes the error response
-// and returns ok=false on a malformed body, or a missing or malformed id.
+// playerContextVideoID reads video_id from the JSON body or query string. An
+// empty body falls through to the query form. The function writes an error
+// response and returns false when the input is missing or malformed.
 func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var req struct {
 		VideoID string `json:"video_id"`
@@ -276,8 +268,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant": label, "attest": kind, "identity": id})
 }
 
-// sessionCookie is one youtube.com cookie in a shape a consumer can rebuild an
-// http.Cookie / cookie jar from.
+// sessionCookie is the wire representation of one youtube.com cookie.
 type sessionCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
@@ -287,12 +278,8 @@ type sessionCookie struct {
 	HTTPOnly bool   `json:"http_only"`
 }
 
-// handleSession hands out the tenant context's coherent {visitor_data, cookies}
-// pair so a consumer can present the same anonymous identity the GVS PO token is
-// bound to. Adopting it keeps the token, session, and egress IP coherent, which
-// is necessary but does not by itself drive STREAM_PROTECTION status: a fully
-// coherent GVS session (matching token + session + IP) still streams under
-// status 2. The session is anonymous (no Google login).
+// handleSession exports the tenant's anonymous visitor_data and cookies. A
+// consumer can adopt them so its GVS token and requests use the same identity.
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
@@ -327,8 +314,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleMetrics is unauthenticated ops data: per-tenant counters + state, no
-// tokens/cookies/keys.
+// handleMetrics returns unauthenticated operational data. It includes per-tenant
+// counters and state, but no tokens, cookies, or keys.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.tenants.MetricsSnapshot())
 }
@@ -371,8 +358,8 @@ func writeErrDetails(w http.ResponseWriter, status int, code, msg, details strin
 	writeJSON(w, status, errEnvelope{Error: msg, Code: code, Details: details})
 }
 
-// ParseTenantKeys parses "label1=key1,label2=key2" (or bare "key") into a
-// key->label map. Empty input is keyless single-tenant mode.
+// ParseTenantKeys parses "label1=key1,label2=key2" or a bare key into a map from
+// API key to tenant label. Empty input selects keyless single-tenant mode.
 func ParseTenantKeys(s string) map[string]string {
 	s = strings.TrimSpace(s)
 	if s == "" {

@@ -135,7 +135,7 @@ func TestParseProvidedChallengeBad(t *testing.T) {
 	cases := map[string]string{
 		"empty":             ``,
 		"object no program": `{"interpreterUrl":{"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue":"//www.google.com/x.js"}}`,
-		"object no url":     `{"program":"P","globalName":"g"}`,
+		"object no URL":     `{"program":"P","globalName":"g"}`,
 		"garbage string":    `"not a challenge"`,
 		"number":            `42`,
 	}

@@ -10,9 +10,8 @@ import (
 	"strings"
 )
 
-// ErrInvalidToken is the category for a token that fails validation. Errors wrap
-// it so callers can branch on validity while keeping a stage-tagged message for
-// API-drift telemetry; raw token bytes are never embedded (redacted).
+// ErrInvalidToken identifies a token that fails validation. Validation errors
+// wrap it without including raw token bytes.
 var ErrInvalidToken = errors.New("invalid po token")
 
 // ValidatePOToken decodes a websafe-base64 PO token and requires protobuf
@@ -20,8 +19,8 @@ var ErrInvalidToken = errors.New("invalid po token")
 // both padded and unpadded base64url: the BgUtils u8ToBase64 helper emits
 // websafe chars but keeps '=' padding, while other producers strip it.
 //
-// On success it returns the field-6 bytes (useful for diagnostics); callers
-// that only need validity can ignore them.
+// On success it returns the field-6 bytes for diagnostics. Callers that only need
+// validity can ignore them.
 func ValidatePOToken(token string) ([]byte, error) {
 	raw, err := decodeBase64URL(token)
 	if err != nil {
@@ -44,7 +43,7 @@ func decodeBase64URL(s string) ([]byte, error) {
 
 // bytesFromProtobuf scans a protobuf message for the given field number and, if
 // it is a length-delimited (wire type 2) field, returns its bytes. Varint,
-// fixed64, and fixed32 fields are skipped; an unknown wire type aborts the scan.
+// fixed64, and fixed32 fields are skipped. An unknown wire type aborts the scan.
 // Port of rustypipe protobuf.rs bytes_from_pb (MIT).
 func bytesFromProtobuf(pb []byte, field uint32) ([]byte, bool) {
 	i := 0

@@ -1,9 +1,6 @@
-// Package httpx is WaxSeal's Google-facing HTTP layer. WaxSeal can share a
-// caller's *http.Client (transport, cookies, IP) without taking on WaxTap's retry
-// and limiter behavior, so it wraps the shared transport with bounded retries
-// (exponential backoff + jitter), Retry-After/429 handling, and a hard response
-// body cap that errors instead of truncating. Every Google-facing call (Create,
-// att-get, GenerateIT, interpreter fetch) goes through here.
+// Package httpx provides WaxSeal's Google-facing HTTP behavior. It wraps a
+// caller's HTTP client with bounded retries, jittered backoff, Retry-After
+// handling, and response size limits.
 package httpx
 
 import (
@@ -18,19 +15,17 @@ import (
 	"time"
 )
 
-// Doer is the minimal HTTP surface the botguard flow depends on; both
-// *http.Client and *Client satisfy it, so tests can substitute a fake.
+// Doer is the HTTP surface required by the BotGuard flow. Both *http.Client and
+// *Client implement it.
 type Doer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// ErrBodyTooLarge is returned when a response body exceeds the cap. Unlike a
-// silent io.LimitReader truncation, an over-size body is a hard error: a
-// truncated challenge/token is worse than a clean failure.
+// ErrBodyTooLarge is returned when a response body exceeds the configured limit.
 var ErrBodyTooLarge = errors.New("httpx: response body exceeds cap")
 
 // Client wraps an *http.Client with bounded, jittered retries and Retry-After
-// handling. The zero value is not usable; construct with New.
+// handling. Construct one with New.
 type Client struct {
 	HTTP       *http.Client
 	MaxRetries int           // retries AFTER the first attempt (default 2)
@@ -39,8 +34,8 @@ type Client struct {
 	Logger     *slog.Logger
 }
 
-// New wraps hc with default retry/backoff tuning. A nil hc yields a Client over
-// http.DefaultClient (tests/standalone); production passes the shared client.
+// New wraps hc with default retry and backoff settings. A nil hc uses
+// http.DefaultClient.
 func New(hc *http.Client) *Client {
 	if hc == nil {
 		hc = http.DefaultClient
@@ -90,15 +85,11 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return nil, lastErr
 }
 
-// DoJSON runs req, enforces a 2xx status, and returns the body bounded by
-// maxBody (erroring on over-size). It is the standard helper for the JSON+proto
-// attestation endpoints.
+// DoJSON runs req, requires a 2xx status, and returns a body no larger than
+// maxBody.
 //
-// Unlike calling Do then reading, the body read happens inside the retry loop:
-// a request is not "done" once headers arrive, so a connection dropped mid-body
-// (io.ErrUnexpectedEOF / reset) is retried like any transport error rather than
-// surfacing a truncated/failed read. ErrBodyTooLarge (a hard cap breach) is
-// never retried; it will not shrink on another attempt.
+// DoJSON reads the body inside the retry loop, so it retries connections that
+// fail after headers arrive. ErrBodyTooLarge is never retried.
 func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 	attempts := max(c.MaxRetries+1, 1)
 	var (
@@ -223,9 +214,9 @@ func (c *Client) logRetry(req *http.Request, attempt, status int, delay time.Dur
 		"status", status, "delay", delay, "err", err)
 }
 
-// preAttempt prepares retry attempt N (no-op for the first): it rewinds the
-// request body and waits out the backoff, returning the context error if the
-// caller cancels during the wait. Shared by Do and DoJSON.
+// preAttempt prepares a retry by rewinding the request body and waiting for the
+// backoff period. The first attempt needs no preparation. Do and DoJSON share
+// this helper.
 func (c *Client) preAttempt(req *http.Request, attempt int, delay time.Duration) error {
 	if attempt == 0 {
 		return nil

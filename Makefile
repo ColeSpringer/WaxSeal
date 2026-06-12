@@ -1,10 +1,9 @@
 # WaxSeal build orchestration.
 #
-# WaxSeal mints YouTube PO tokens from a real headless Chromium (go-rod). The
-# only build artifact is the bgutils + BotGuard bundle embedded in
-# internal/browser (built with Node/esbuild from build/js). It is committed, so
-# `go build`/`go test` need no Node toolchain. The CLI/daemon requires a system
-# Chromium at runtime (not bundled).
+# WaxSeal mints YouTube PO tokens from a real headless Chromium through go-rod.
+# Node and esbuild produce the browser bundle embedded in internal/browser. The
+# bundle is committed, so `go build` and `go test` do not need Node. The CLI and
+# daemon still require Chromium at runtime.
 
 VERSION           ?= dev
 DIST              := dist
@@ -16,9 +15,9 @@ REGISTRY    ?= ghcr.io
 IMAGE_OWNER ?= colespringer
 IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 
-# PUSH_LATEST gates whether docker-push moves the :latest tag. Default 0 (publish
-# only the VERSION tag); set PUSH_LATEST=1 for a real release that should move latest,
-# so an out-of-band hotfix can't repoint :latest by accident.
+# PUSH_LATEST controls whether docker-push moves the :latest tag. The default
+# publishes only VERSION. Set PUSH_LATEST=1 for a release that should also become
+# :latest.
 PUSH_LATEST ?= 0
 
 .PHONY: all test jsbundle-browser verify-assets release deps clean \
@@ -26,13 +25,13 @@ PUSH_LATEST ?= 0
 
 all: jsbundle-browser
 
-# test runs the offline suite. The committed bundle means no Node toolchain is
-# needed; this is what CI and `go test ./...` both exercise.
+# test runs the offline suite. The committed bundle means CI and `go test ./...`
+# do not need Node.
 test:
 	go test ./...
 
-# jsbundle-browser builds the bgutils-js + BotGuard entrypoint as an
-# ES2020 IIFE that is eval'd into the real Chromium. Committed + go:embed-ed in
+# jsbundle-browser builds the bgutils-js and BotGuard entrypoint as an ES2020
+# IIFE. Chromium evaluates the committed bundle, which Go embeds from
 # internal/browser.
 jsbundle-browser: $(BROWSER_BUNDLE_OUT)
 
@@ -62,9 +61,9 @@ release:
 	done
 	@echo "release binaries in $(DIST)/ (each requires a system Chromium at runtime)"
 
-# Publish the runtime image to GitHub Container Registry. Auth reuses your gh
-# login: the token is piped to docker on stdin, so it never lands in args, env,
-# or shell history. Publish 1.0.0 and move :latest with:
+# Publish the runtime image to GitHub Container Registry. Authentication reuses
+# the gh login and pipes the token to docker on stdin. Publish 1.0.0 and move
+# :latest with:
 #   PUSH_LATEST=1 make docker-push VERSION=1.0.0
 
 # docker-build builds the runtime image, tagged VERSION and latest.
@@ -77,9 +76,8 @@ release-guard:
 	@if [ -z "$(VERSION)" ] || [ "$(VERSION)" = "dev" ]; then \
 	  echo "ERROR: docker-push needs VERSION=x.y.z (not empty or 'dev')"; exit 1; fi
 
-# docker-login signs in to GHCR with the gh token (never printed). It distinguishes
-# "not logged in" from "logged in but missing the write:packages scope" and prints
-# the one-time fix for each.
+# docker-login signs in to GHCR with the gh token. It reports whether gh is not
+# logged in or is missing the write:packages scope.
 docker-login:
 	@gh auth status >/dev/null 2>&1 || { \
 	  echo "not logged in to gh. Run once, then retry:"; \
@@ -91,8 +89,8 @@ docker-login:
 	  exit 1; }
 	@gh auth token | docker login $(REGISTRY) -u $(IMAGE_OWNER) --password-stdin
 
-# docker-push validates VERSION + auth (release-guard, docker-login) BEFORE the build,
-# then pushes the VERSION tag, plus :latest only when PUSH_LATEST=1.
+# docker-push validates VERSION and authentication before building. It pushes the
+# VERSION tag and pushes :latest only when PUSH_LATEST=1.
 docker-push: release-guard docker-login docker-build
 	docker push $(IMAGE):$(VERSION)
 	@if [ "$(PUSH_LATEST)" = "1" ]; then \

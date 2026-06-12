@@ -1,12 +1,6 @@
-// Package provider adapts a WaxSeal client (waxseal/client) to WaxTap's
-// potoken.Provider, so an application embedding the WaxTap library mints PO
-// tokens from a WaxSeal daemon.
-//
-// This is the only WaxTap-coupled piece, kept in a separate Go module so the
-// WaxSeal core/server/CLI stay WaxTap-free. The HTTP work is generic and lives in
-// waxseal/client; any application can use that client directly, or write its own
-// adapter for a different PO-token contract. This package is just the scope
-// mapping for WaxTap's interface.
+// Package provider adapts a WaxSeal HTTP client to WaxTap's potoken.Provider
+// interface. It lives in a separate Go module so the rest of WaxSeal does not
+// depend on WaxTap.
 package provider
 
 import (
@@ -19,8 +13,8 @@ import (
 	"github.com/colespringer/waxtap/potoken"
 )
 
-// ErrUnsupportedScope is returned for scopes WaxSeal does not serve (currently
-// only ScopeSubtitles). Typed so callers can branch on it.
+// ErrUnsupportedScope is returned for scopes WaxSeal does not serve. At present,
+// only ScopeSubtitles is unsupported.
 var ErrUnsupportedScope = errors.New("waxseal/provider: unsupported PO-token scope")
 
 // Provider adapts a *client.Client to potoken.Provider.
@@ -33,13 +27,13 @@ var (
 	_ potoken.PlayerContextProvider = (*Provider)(nil)
 )
 
-// New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure auth/HTTP on
-// the client (client.WithAPIKey, client.WithHTTPClient).
+// New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure
+// authentication and HTTP behavior on the client before calling New.
 func New(c *client.Client) *Provider { return &Provider{c: c} }
 
-// ProvidePOToken maps the WaxTap scope to a content_binding and mints via the
-// client. ScopeGVS binds visitor_data, ScopePlayer binds video_id; ScopeNone is a
-// no-op; ScopeSubtitles returns ErrUnsupportedScope.
+// ProvidePOToken maps a WaxTap scope to a WaxSeal content_binding and mints the
+// token. ScopeGVS binds visitor_data, ScopePlayer binds video_id, ScopeNone does
+// nothing, and ScopeSubtitles returns ErrUnsupportedScope.
 func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (potoken.Response, error) {
 	var binding, scope string
 	switch req.Scope {
@@ -69,10 +63,9 @@ func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
 	return &potoken.Session{VisitorData: s.VisitorData, Cookies: s.Cookies}, nil
 }
 
-// ProvidePlayerContext fetches videoID's attested WEB /player streaming context
-// and maps it to the context used by WaxTap's optional WEB SABR audio path. It
-// rejects incomplete contexts before SABR setup so WaxTap can use its normal
-// fallback path.
+// ProvidePlayerContext fetches the attested WEB player context for videoID and
+// maps it to WaxTap's SABR audio context. It rejects incomplete responses before
+// WaxTap begins SABR setup.
 func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (potoken.PlayerContext, error) {
 	pc, err := p.c.PlayerContext(ctx, videoID)
 	if err != nil {

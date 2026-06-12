@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  # Offline build + vet + race tests. No Node toolchain: the browser bundle is
-  # committed (go:embed). Live YouTube/BotGuard tests are run manually, not in CI
-  # (they need a real Chromium + network and are inherently flaky).
+  # Build, vet, and run race tests without network access. The committed browser
+  # bundle removes the Node dependency. Live YouTube and BotGuard tests run
+  # manually because they require Chromium and network access.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -24,8 +24,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-  # The WaxTap adapter is a separate nested module; build and vet it separately
-  # so WaxTap-specific changes do not block the core package checks.
+  # Build and vet the nested WaxTap adapter module separately.
   provider:
     runs-on: ubuntu-latest
     steps:
@@ -37,8 +36,8 @@ jobs:
       - working-directory: provider
         run: go build ./... && go vet ./...
 
-  # Cross-compile the CLI/daemon for the full GOOS/GOARCH matrix. The binary is
-  # pure Go and cross-compiles cleanly; it drives an external Chromium at runtime.
+  # Cross-compile the pure Go CLI and daemon. Each binary drives an external
+  # Chromium at runtime.
   cross:
     runs-on: ubuntu-latest
     strategy:
@@ -59,8 +58,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: go build ./cmd/waxseal
 
-  # Reproducibility gate: rebuild the committed browser bundle from source and
-  # fail if a single byte differs from what is committed.
+  # Rebuild the committed browser bundle and require a byte-for-byte match.
   reproduce-bundle:
     runs-on: ubuntu-latest
     steps:
@@ -71,8 +69,7 @@ jobs:
       - name: rebuild and diff against the committed bundle
         run: make verify-assets
 
-  # The container build gate: builds the hardened image. It is not run here
-  # (running needs a real Chromium + network).
+  # Build the container image. Running it requires Chromium and network access.
   docker:
     runs-on: ubuntu-latest
     steps:

@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# WaxSeal: a real-browser PO-token service. The image bundles a pinned Chromium,
-# which it drives via go-rod. It runs as a non-root user; harden the container at
-# run time (compose.yaml: cap_drop, no-new-privileges). That container boundary is
-# the isolation, since headless Chromium runs with --no-sandbox inside it.
+# WaxSeal is a real-browser PO-token service. The image includes Chromium and
+# drives it through go-rod. Chromium runs with --no-sandbox inside the container,
+# so the container boundary provides the isolation. The image uses a non-root
+# user, and compose.yaml drops capabilities and disables privilege escalation.
 
 # build
 FROM golang:1.26-bookworm AS build
@@ -14,8 +14,8 @@ COPY . .
 # Version stamping: pass `--build-arg VERSION=1.2.3`. ARG must be declared in this
 # stage for the RUN to see it.
 ARG VERSION=docker
-# CGO off: the binary is pure Go (the JS bundle is go:embed-ed). It still needs a
-# system Chromium at run time.
+# Disable CGO for a pure Go binary. The embedded JavaScript bundle does not remove
+# the runtime dependency on Chromium.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/waxseal ./cmd/waxseal
 
@@ -30,8 +30,7 @@ RUN apt-get update \
 RUN useradd --create-home --uid 10001 waxseal
 COPY --from=build /out/waxseal /usr/local/bin/waxseal
 
-# org.opencontainers.image.source links the GHCR package to the repo (so it shows
-# under the repo's Packages and inherits its context).
+# Link the GHCR package to the source repository.
 LABEL org.opencontainers.image.source="https://github.com/ColeSpringer/WaxSeal" \
       org.opencontainers.image.description="YouTube PO-token service running BotGuard in a real headless Chromium" \
       org.opencontainers.image.licenses="MIT"
@@ -45,7 +44,8 @@ EXPOSE 4416
 ENTRYPOINT ["/usr/bin/tini", "--", "waxseal"]
 CMD ["server", "--host", "0.0.0.0"]
 
-# Health: the binary's own curl-free probe. start-period covers the browser warm-up;
-# timeout covers a lazy attestation. (Multi-tenant deployments: add `--key <key>`.)
+# Use the built-in health probe instead of curl. The start period covers browser
+# warm-up, and the timeout covers a lazy attestation. Multi-tenant deployments
+# must add `--key <key>`.
 HEALTHCHECK --interval=30s --timeout=110s --start-period=120s --retries=3 \
   CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416"]

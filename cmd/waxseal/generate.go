@@ -43,7 +43,8 @@ func newGetPotCmd() *cobra.Command {
 // runGenerate launches a browser, attests, mints one token, and prints JSON on
 // the last stdout line. On failure it prints "{}" to satisfy the bgutil
 // script-provider contract, then returns the error for centralized reporting.
-// (One-shot launches a fresh browser each call; for yt-dlp use `waxseal server`.)
+// One-shot mode launches a fresh browser for every call. Use `waxseal server`
+// for yt-dlp.
 func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	if g.contentBinding == "" {

@@ -45,20 +45,19 @@ func TestTenantsKeylessSharesOneTenant(t *testing.T) {
 	}
 }
 
-// TestTenantsMultiTenantIsolation: distinct keys get distinct Minters that mint
-// under distinct identities; an unknown key is rejected; a repeat is cached (no
-// re-attest).
+// TestTenantsMultiTenantIsolation verifies that keys select distinct identities,
+// unknown keys are rejected, and repeated requests use the cache.
 func TestTenantsMultiTenantIsolation(t *testing.T) {
 	tn, calls := newTestTenants(map[string]string{"KEYA": "alice", "KEYB": "bob"})
 	ctx := context.Background()
 
 	ma, la, err := tn.Minter("KEYA")
 	if err != nil || la != "alice" {
-		t.Fatalf("KEYA -> %q err=%v, want alice", la, err)
+		t.Fatalf("KEYA resolved to %q with err=%v, want alice", la, err)
 	}
 	mb, lb, err := tn.Minter("KEYB")
 	if err != nil || lb != "bob" {
-		t.Fatalf("KEYB -> %q err=%v, want bob", lb, err)
+		t.Fatalf("KEYB resolved to %q with err=%v, want bob", lb, err)
 	}
 	if ma == mb {
 		t.Fatal("distinct tenants must get distinct Minters")
@@ -82,7 +81,7 @@ func TestTenantsMultiTenantIsolation(t *testing.T) {
 		t.Errorf("session creations = %d, want 2 (one attestation per tenant)", got)
 	}
 
-	// A repeat for alice is cached; no new attestation.
+	// Alice's repeated request uses the cache without another attestation.
 	if _, cached, _ := ma.Mint(ctx, "gvs", "x"); !cached {
 		t.Errorf("alice repeat should be cached")
 	}

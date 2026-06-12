@@ -1,7 +1,6 @@
-// Command waxseal is the WaxSeal CLI. It mints YouTube PO tokens from a real
-// headless Chromium (BotGuard in the actual browser). With no subcommand it runs
-// generate mode, compatible with bgutil's script provider (JSON on the last
-// stdout line). For yt-dlp, prefer `waxseal server`; a warm browser mints fast.
+// Command waxseal mints YouTube PO tokens from a real headless Chromium. With no
+// subcommand, it runs the bgutil-compatible one-shot generation mode. Use
+// `waxseal server` when callers need a warm browser.
 package main
 
 import (
@@ -46,10 +45,10 @@ func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "waxseal",
 		Short: "Real-browser YouTube PO Token (POT) provider",
-		Long: "WaxSeal mints YouTube PO tokens from a real headless Chromium (BotGuard in the\n" +
-			"actual browser). With no subcommand it runs generate mode, compatible with\n" +
-			"bgutil's script provider: it prints the token as JSON on the last stdout line,\n" +
-			"or {} and a nonzero exit on failure. For yt-dlp, prefer `waxseal server`.",
+		Long: "WaxSeal mints YouTube PO tokens from a real headless Chromium.\n" +
+			"With no subcommand, it runs the bgutil-compatible one-shot mode and prints\n" +
+			"the token as JSON on the last stdout line. Failures print {} and exit\n" +
+			"nonzero. For yt-dlp, prefer `waxseal server`.",
 		Version: version,
 		Args:    cobra.NoArgs,
 		RunE:    func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },

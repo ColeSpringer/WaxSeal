@@ -21,13 +21,13 @@ func newDoctorCmd() *cobra.Command {
 	var o doctorOpts
 	c := &cobra.Command{
 		Use:   "doctor",
-		Short: "Launch a browser, attest, and report the identity + token grade",
-		Long: "Diagnostics: launch a real Chromium, run the BotGuard attestation, and report\n" +
-			"the captured identity and whether an INTEGRITY token was granted. Exit nonzero\n" +
-			"if the browser/IP can't attest, or only a fallback grade is available.\n\n" +
-			"With --full, also verify that the browser can stream beyond the ~70s status-2\n" +
-			"preview cap. The report includes full_length_probe, and the command exits\n" +
-			"nonzero unless the probe verifies full-length streaming.",
+		Short: "Launch a browser, attest, and report the identity and token grade",
+		Long: "Launch a real Chromium, run the BotGuard attestation, and report the\n" +
+			"captured identity and token grade. The command exits nonzero if the browser\n" +
+			"or egress IP cannot attest, or if only a fallback token is available.\n\n" +
+			"With --full, it also checks whether the browser can stream beyond the\n" +
+			"roughly 70-second status-2 preview cap. The command exits nonzero unless\n" +
+			"the probe verifies full-length streaming.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runDoctor(cmd, &o) },
 	}
@@ -35,7 +35,7 @@ func newDoctorCmd() *cobra.Command {
 	f.StringVar(&o.video, "video", browser.DefaultVideo, "landing video for the browser session")
 	f.BoolVar(&o.headful, "headful", false, "run headful (needs a display/Xvfb)")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "verbose logging to stderr")
-	f.BoolVar(&o.full, "full", false, "verify full-length streaming past the ~70s preview cap (use on demand; the probe seeks and drives playback)")
+	f.BoolVar(&o.full, "full", false, "verify streaming past the roughly 70-second preview cap")
 	return c
 }
 

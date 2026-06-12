@@ -65,7 +65,7 @@ func TestExecuteUsageErrors(t *testing.T) {
 		// A stray subcommand reaches the root NoArgs validator because the root has RunE.
 		{"unknown subcommand", []string{"bogussubcmd"}, 2, "waxseal: "},
 		{"missing --video", []string{"player-context"}, 2, "--video"},
-		{"url where id expected", []string{"player-context", "--video", "https://youtu.be/x"}, 2, "not a URL"},
+		{"URL where id expected", []string{"player-context", "--video", "https://youtu.be/x"}, 2, "not a URL"},
 		// newRootCmd initializes Cobra's completion commands before wrapping validators.
 		{"too many args to completion", []string{"completion", "bash", "extra"}, 2, "waxseal: "},
 	}

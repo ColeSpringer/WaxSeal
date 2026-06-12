@@ -8,11 +8,11 @@ import (
 )
 
 // TestErrorCodeContract pins the error-code wire values and guards the two
-// declarations against drift: the server emits these codes and client re-declares
-// them so consumers can branch on Code without importing the rod/Chromium-heavy
-// server. A rename in one place (or away from the documented string) must update
-// the other and the README table, so this test fails loudly instead of silently
-// breaking a consumer's `apiErr.Code == client.Code*` comparison.
+// declarations against drift. The server emits these codes, and client declares
+// matching values so consumers do not need to import the server package and its
+// Chromium dependencies. A rename must update both declarations and the README
+// table. This test catches a mismatch before it breaks a consumer's
+// `apiErr.Code == client.Code*` comparison.
 func TestErrorCodeContract(t *testing.T) {
 	codes := []struct {
 		name           string

@@ -10,14 +10,11 @@ import (
 
 // ErrUnknownTenant is returned when a request presents an API key that is not
 // registered (multi-tenant mode only).
-var ErrUnknownTenant = errors.New("waxseal: unknown tenant api key")
+var ErrUnknownTenant = errors.New("waxseal: unknown tenant API key")
 
-// Tenants routes per-tenant API keys to isolated Minters. Each tenant gets its own
-// Minter (single-flight attestation, cache, escalation, crash recovery) backed by
-// its own browser context from a shared browser.Pool, so N tenants are N distinct
-// guest identities (visitor_data + cookies) on one Chromium and one egress IP.
-// Tenant Minters are created lazily on first use; different tenants' mints run
-// concurrently on separate context pages.
+// Tenants routes API keys to isolated Minters. Each tenant has its own browser
+// context, guest identity, cookies, and token cache. Tenant Minters are created
+// on first use and run concurrently on separate pages in a shared browser.
 //
 // Keyless mode (no keys registered) keeps the bgutil wire unauthenticated for
 // generic yt-dlp use: every request maps to one shared "default" tenant.
@@ -27,19 +24,19 @@ type Tenants struct {
 	opts  browser.Options
 	log   *slog.Logger
 
-	// newSession makes one attested session for a tenant; the default is the
-	// browser.Pool's incognito-context path. Injectable so routing is testable sans browser.
+	// newSession creates an attested tenant session. Tests replace it to avoid
+	// launching a browser.
 	newSession func(ctx context.Context, videoID string) (minterSession, error)
 
 	mu      sync.Mutex
-	keys    map[string]string  // api key -> tenant label (labels, never keys, appear in logs/metrics)
-	minters map[string]*Minter // tenant label -> lazily-created Minter
+	keys    map[string]string  // API key to tenant label; only labels appear in logs and metrics
+	minters map[string]*Minter // tenant label to lazily created Minter
 }
 
 const defaultTenant = "default"
 
-// NewTenants builds a registry over pool. keys maps api key -> tenant label; an
-// empty map is keyless single-tenant mode (the key is ignored, one shared tenant).
+// NewTenants builds a registry over pool. Keys maps API keys to tenant labels. An
+// empty map selects keyless single-tenant mode.
 func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options) *Tenants {
 	log := opts.Logger
 	if log == nil {
@@ -104,8 +101,7 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 	return m, label, nil
 }
 
-// WarmOne attests the tenant the API key selects, for startup fail-fast. The rest
-// stay lazy (attested on first request).
+// WarmOne attests the tenant selected by apiKey. Other tenants remain lazy.
 func (t *Tenants) WarmOne(ctx context.Context, apiKey string) error {
 	m, _, err := t.Minter(apiKey)
 	if err != nil {

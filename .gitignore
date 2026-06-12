@@ -8,5 +8,5 @@ build/js/node_modules/
 *.tmp
 *.patch
 
-# NOTE: internal/browser/bg_browser_bundle.js IS committed (a build output treated
-# like a vendored dep); do not ignore it.
+# internal/browser/bg_browser_bundle.js is a committed build output. Do not
+# ignore it.

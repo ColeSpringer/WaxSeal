@@ -1,14 +1,15 @@
-# WaxSeal + a consumer sharing one egress IP.  `docker compose -f compose.full.yaml up`
+# WaxSeal and a consumer sharing one egress IP.
+# Run with `docker compose -f compose.full.yaml up`.
 #
-# WaxSeal is the PO-token daemon (this repo). WaxTap is a *library*, not a
-# container; it is embedded in a consumer application. The intended consumer is
-# WaxBin (a music organizer that embeds WaxTap); WaxBin is not built yet, so the
-# `waxbin` service below is a template: drop in your own image and command.
+# WaxSeal is the PO-token daemon in this repository. WaxTap is a library embedded
+# in a consumer application, not a container. WaxBin is the intended consumer but
+# is not built yet, so the `waxbin` service below is a template. Replace its image
+# and command.
 #
 # The PO token is bound to the minting host's egress IP, so the consumer must
 # egress the same IP as WaxSeal. Sharing WaxSeal's network namespace
-# (network_mode: service:waxseal) gives that for free and lets the consumer reach
-# the daemon at 127.0.0.1:4416.
+# (`network_mode: service:waxseal`) enforces this and lets the consumer reach the
+# daemon at 127.0.0.1:4416.
 services:
   waxseal:
     extends:
@@ -17,17 +18,17 @@ services:
     container_name: waxseal
     ports: [] # not published; the consumer reaches it over the shared network namespace
 
-  # WaxBin (or any app embedding the WaxTap library): not built yet; template only.
+  # Template for WaxBin or another application that embeds WaxTap.
   waxbin:
     image: ${WAXBIN_IMAGE:-waxbin:latest}
-    network_mode: "service:waxseal" # same netns -> same egress IP + WaxSeal at localhost:4416
+    network_mode: "service:waxseal" # same network namespace, egress IP, and localhost
     depends_on:
       waxseal:
         condition: service_healthy
     restart: "no"
     # Point the embedded WaxTap at the daemon: /get_pot for tokens, /player-context
-    # for the status-1 streaming context, /session for the coherent visitor_data +
-    # cookies handoff. e.g.:
+    # for the status-1 streaming context, and /session for the visitor_data and
+    # cookies handoff. For example:
     #   environment:
     #     - WAXSEAL_POTOKEN_URL=http://127.0.0.1:4416
     #     - WAXSEAL_PLAYER_CONTEXT_URL=http://127.0.0.1:4416/player-context
