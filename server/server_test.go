@@ -121,6 +121,85 @@ func TestNormalizeScope(t *testing.T) {
 	}
 }
 
+func TestMethodNotAllowedHandler(t *testing.T) {
+	h := methodNotAllowed(http.MethodGet, http.MethodPost)
+	r := httptest.NewRequest(http.MethodPut, "/player-context", nil)
+	w := httptest.NewRecorder()
+	h(w, r)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+	if got := w.Header().Get("Allow"); got != "GET, POST" {
+		t.Errorf("Allow = %q, want %q", got, "GET, POST")
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeMethodNotAllowed {
+		t.Errorf("code = %q, want %q", env.Code, CodeMethodNotAllowed)
+	}
+	if env.Error == "" {
+		t.Error("error message is empty")
+	}
+}
+
+func TestRoutesMethodMatching(t *testing.T) {
+	mux := (&Server{}).routes()
+	tests := []struct {
+		method, path, wantPattern string
+	}{
+		{http.MethodPost, "/get_pot", "POST /get_pot"},
+		{http.MethodGet, "/get_pot", "/get_pot"},
+		{http.MethodGet, "/player-context", "GET /player-context"},
+		{http.MethodPost, "/player-context", "POST /player-context"},
+		{http.MethodPut, "/player-context", "/player-context"},
+		{http.MethodOptions, "/player-context", "/player-context"},
+		{http.MethodGet, "/ping", "GET /ping"},
+		{http.MethodDelete, "/ping", "/ping"},
+		{http.MethodGet, "/session", "GET /session"},
+		{http.MethodPost, "/session", "/session"},
+		{http.MethodGet, "/metrics", "GET /metrics"},
+		{http.MethodPost, "/metrics", "/metrics"},
+	}
+	for _, tt := range tests {
+		r := httptest.NewRequest(tt.method, tt.path, nil)
+		if _, pattern := mux.Handler(r); pattern != tt.wantPattern {
+			t.Errorf("%s %s matched %q, want %q", tt.method, tt.path, pattern, tt.wantPattern)
+		}
+	}
+}
+
+func TestMethodNotAllowedBeforeAuth(t *testing.T) {
+	s := &Server{
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}),
+		log:     slog.New(slog.DiscardHandler),
+	}
+	r := httptest.NewRequest(http.MethodGet, "/get_pot", nil) // no API key
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d (405 must precede auth)", w.Code, http.StatusMethodNotAllowed)
+	}
+	if got := w.Header().Get("Allow"); got != http.MethodPost {
+		t.Errorf("Allow = %q, want %q", got, http.MethodPost)
+	}
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeMethodNotAllowed {
+		t.Errorf("code = %q, want %q (got 401 unauthorized instead?)", env.Code, CodeMethodNotAllowed)
+	}
+}
+
 func TestTenantUnauthorizedCode(t *testing.T) {
 	s := &Server{
 		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}),

@@ -215,6 +215,9 @@ func (c *Client) auth(req *http.Request) {
 const (
 	// CodeUnauthorized indicates a missing or invalid API key.
 	CodeUnauthorized = "unauthorized"
+	// CodeMethodNotAllowed indicates that the endpoint does not support the
+	// request method.
+	CodeMethodNotAllowed = "method-not-allowed"
 	// CodeInvalidRequest indicates malformed input or a missing required field.
 	CodeInvalidRequest = "invalid-request"
 	// CodeMintFailed indicates that the daemon could not mint a token.

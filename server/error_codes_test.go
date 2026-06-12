@@ -7,12 +7,8 @@ import (
 	"github.com/colespringer/waxseal/server"
 )
 
-// TestErrorCodeContract pins the error-code wire values and guards the two
-// declarations against drift. The server emits these codes, and client declares
-// matching values so consumers do not need to import the server package and its
-// Chromium dependencies. A rename must update both declarations and the README
-// table. This test catches a mismatch before it breaks a consumer's
-// `apiErr.Code == client.Code*` comparison.
+// TestErrorCodeContract keeps the server and client constants aligned with the
+// documented wire values.
 func TestErrorCodeContract(t *testing.T) {
 	codes := []struct {
 		name           string
@@ -20,6 +16,7 @@ func TestErrorCodeContract(t *testing.T) {
 		want           string
 	}{
 		{"unauthorized", server.CodeUnauthorized, client.CodeUnauthorized, "unauthorized"},
+		{"method-not-allowed", server.CodeMethodNotAllowed, client.CodeMethodNotAllowed, "method-not-allowed"},
 		{"invalid-request", server.CodeInvalidRequest, client.CodeInvalidRequest, "invalid-request"},
 		{"mint-failed", server.CodeMintFailed, client.CodeMintFailed, "mint-failed"},
 		{"video-unavailable", server.CodeVideoUnavailable, client.CodeVideoUnavailable, "video-unavailable"},

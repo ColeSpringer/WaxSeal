@@ -2,9 +2,30 @@ package browser
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestLaunchWithin(t *testing.T) {
+	u, err := launchWithin(func() (string, error) { return "ws://ok", nil }, time.Second)
+	if err != nil || u != "ws://ok" {
+		t.Errorf("success path = (%q, %v), want (ws://ok, nil)", u, err)
+	}
+	_, err = launchWithin(func() (string, error) { return "", errors.New("boom") }, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error path = %v, want it to carry \"boom\"", err)
+	}
+	start := time.Now()
+	_, err = launchWithin(func() (string, error) { select {} }, 50*time.Millisecond)
+	if !errors.Is(err, errLaunchTimeout) {
+		t.Errorf("timeout path = %v, want errLaunchTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("timeout took %s, want ~50ms", elapsed)
+	}
+}
 
 func TestDetectChromeEnvOverride(t *testing.T) {
 	t.Setenv("WAXSEAL_CHROME_BIN", "/custom/chromium")

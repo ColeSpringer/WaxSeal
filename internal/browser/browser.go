@@ -12,7 +12,9 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/leakless/pkg/shared"
 )
 
 // DefaultVideo is the landing video used to capture the browser identity. It is
@@ -146,14 +149,24 @@ func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, err
 	}
 	opts.Logger.Info("waxseal: launching chromium", "bin", bin, "headful", opts.Headful)
 
+	// Leakless executes a helper from a predictable temporary path. Validate that
+	// path before the launcher can execute an existing file.
+	if err := secureLeaklessDir(); err != nil {
+		return nil, nil, "", err
+	}
+
 	// Snap-confined Chromium can only write a user-data-dir under $HOME, not /tmp.
-	profileDir, err := os.MkdirTemp(homeTmpBase(), ".waxseal-")
+	profileDir, err := os.MkdirTemp(homeTmpBase(), profilePrefix)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("waxseal: temp profile: %w", err)
 	}
+	// The startup reaper only removes marked profiles whose ownership lock is free.
+	markProfileDir(profileDir)
+
+	// Keep go-rod's default leakless guard enabled so Chromium is terminated when
+	// WaxSeal cannot run normal teardown.
 	l := launcher.New().
 		Bin(bin).
-		Leakless(false). // avoid go-rod's leakless helper download; Close() kills the browser
 		Set("user-data-dir", profileDir).
 		Set("no-sandbox").            // snap confinement provides isolation; experiment-only
 		Set("disable-dev-shm-usage"). // WSL2 /dev/shm is small
@@ -170,8 +183,16 @@ func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, err
 		l = l.Headless(false).Set("headless", "new")
 	}
 
-	controlURL, err := l.Launch()
+	// Leakless waits indefinitely for its fixed lock port. Bound the launch so an
+	// occupied port cannot block startup forever.
+	controlURL, err := launchWithin(l.Launch, launchTimeout)
 	if err != nil {
+		if errors.Is(err, errLaunchTimeout) {
+			// Launcher has no cancellation API. Killing it here would race with the
+			// launch still running in the background, so leave cleanup to leakless and
+			// the next startup sweep.
+			return nil, nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
+		}
 		l.Kill()
 		_ = os.RemoveAll(profileDir)
 		return nil, nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
@@ -185,6 +206,67 @@ func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, err
 		return nil, nil, "", fmt.Errorf("waxseal: connect cdp: %w", err)
 	}
 	return browser, l, profileDir, nil
+}
+
+// launchTimeout limits how long startup waits for Chromium.
+const launchTimeout = 60 * time.Second
+
+// errLaunchTimeout distinguishes a timed-out launch from a completed launch
+// failure.
+var errLaunchTimeout = errors.New("launch timed out")
+
+// launchWithin waits up to timeout for launch. It cannot cancel launch after the
+// timeout because launcher.Launch has no cancellation API.
+func launchWithin(launch func() (string, error), timeout time.Duration) (string, error) {
+	type result struct {
+		url string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		url, err := launch()
+		ch <- result{url, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.url, r.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf(
+			"%w after %s; leakless port 2978 may be in use, or TMPDIR may be unwritable or mounted noexec",
+			errLaunchTimeout,
+			timeout,
+		)
+	}
+}
+
+// leaklessGuardDir returns the temporary directory used by the pinned leakless
+// version.
+func leaklessGuardDir() string {
+	return filepath.Join(os.TempDir(), "leakless-"+runtime.GOARCH+"-"+shared.Version)
+}
+
+// secureLeaklessDir validates the predictable path from which leakless executes
+// its helper. It creates the directory with mode 0700 when absent and rejects
+// symlinks, foreign ownership, and paths writable by a group or other users.
+func secureLeaklessDir() error {
+	dir := leaklessGuardDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("waxseal: prepare leakless guard directory: %w", err)
+	}
+	paths := []string{
+		dir,
+		filepath.Join(dir, "leakless"),
+		filepath.Join(dir, "leakless.exe"),
+	}
+	for _, p := range paths {
+		if unsafe, why := guardPathUnsafe(p); unsafe {
+			return fmt.Errorf(
+				"waxseal: refusing to launch: leakless guard path is unsafe: %s; set TMPDIR to a writable private directory on a filesystem that permits execution, such as TMPDIR=$HOME/tmp",
+				why,
+			)
+		}
+	}
+	return nil
 }
 
 // setupSession parks a page in browser (the main browser, or an incognito context

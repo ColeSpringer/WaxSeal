@@ -67,14 +67,37 @@ func New(cfg Config) (*Server, error) {
 		tenants: minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts),
 		log:     log,
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/get_pot", s.handleGetPot)
-	mux.HandleFunc("/player-context", s.handlePlayerContext)
-	mux.HandleFunc("/ping", s.handlePing)
-	mux.HandleFunc("/session", s.handleSession)
-	mux.HandleFunc("/metrics", s.handleMetrics)
-	s.srv = &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	s.srv = &http.Server{Addr: cfg.Addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
+}
+
+// routes registers method-specific handlers and path-only 405 fallbacks.
+// ServeMux routes HEAD requests to GET handlers. Because authentication runs in
+// endpoint handlers, unsupported methods are rejected before tenant lookup.
+func (s *Server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /get_pot", s.handleGetPot)
+	mux.HandleFunc("/get_pot", methodNotAllowed(http.MethodPost))
+	mux.HandleFunc("GET /player-context", s.handlePlayerContext)
+	mux.HandleFunc("POST /player-context", s.handlePlayerContext) // body or ?video_id=
+	mux.HandleFunc("/player-context", methodNotAllowed(http.MethodGet, http.MethodPost))
+	mux.HandleFunc("GET /ping", s.handlePing)
+	mux.HandleFunc("/ping", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("GET /session", s.handleSession)
+	mux.HandleFunc("/session", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet))
+	return mux
+}
+
+// methodNotAllowed returns a structured 405 response and lists the supported
+// methods in the Allow header.
+func methodNotAllowed(allowed ...string) http.HandlerFunc {
+	allow := strings.Join(allowed, ", ")
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", allow)
+		writeErr(w, http.StatusMethodNotAllowed, CodeMethodNotAllowed, "method not allowed")
+	}
 }
 
 // Warm attests the tenant selected by apiKey. Pass an empty key in keyless mode.
@@ -329,6 +352,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 const (
 	// CodeUnauthorized indicates a missing or invalid API key.
 	CodeUnauthorized = "unauthorized"
+	// CodeMethodNotAllowed indicates that the endpoint does not support the
+	// request method.
+	CodeMethodNotAllowed = "method-not-allowed"
 	// CodeInvalidRequest indicates malformed input or a missing required field.
 	CodeInvalidRequest = "invalid-request"
 	// CodeMintFailed indicates that the daemon could not mint a token.

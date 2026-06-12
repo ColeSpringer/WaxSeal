@@ -52,6 +52,8 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		level = "debug"
 	}
 	logger := buildLogger(level, os.Stdout) // daemon logs to stdout
+	// Remove profiles left by prior daemon instances that could not run normal cleanup.
+	browser.ReapStaleProfiles(logger)
 	keys := server.ParseTenantKeys(o.tenantKeys)
 
 	srv, err := server.New(server.Config{

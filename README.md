@@ -63,6 +63,24 @@ go run ./cmd/waxseal doctor
 go run ./cmd/waxseal ping
 ```
 
+The daemon runs Chromium under go-rod's embedded *leakless* process guard. If
+WaxSeal terminates without running normal cleanup, such as after `SIGKILL`, a
+crash, or an OOM kill, leakless terminates Chromium's process group. On the next
+startup, WaxSeal removes abandoned profile directories that it can identify
+safely. A directory must match `~/.waxseal-<digits>`, contain WaxSeal's marker,
+and have an unlocked marker file. Locked, unmarked, and unrelated paths are left
+in place. This startup cleanup is disabled on Windows because it relies on
+advisory file locks. Normal `SIGTERM`, `SIGINT`, and `docker stop` shutdowns
+remove profile directories during shutdown.
+
+Leakless stores its guard in `os.TempDir()/leakless-<arch>-<version>/` and
+executes it from there. On Unix, WaxSeal creates the directory with mode `0700`
+when it does not exist, then rejects symlinks, paths owned by another user, and
+paths writable by a group or other users. On a **shared multi-user host**, set
+`TMPDIR` to a private directory. If `/tmp` is mounted `noexec`, use a writable
+location on a filesystem that permits execution:
+`TMPDIR=$HOME/tmp waxseal server`.
+
 `content_binding` identifies what the token is bound to. Use a **video_id** for a
 player token or **visitor_data** for a GVS token. The token is also bound to the
 minting host's egress IP. The consumer must use the **same IP** for the SABR media
@@ -112,9 +130,10 @@ needs a status-1 context. Exported sessions do not contain a Google login.
 
 ## Error responses
 
-Every 4xx or 5xx response from `/get_pot`, `/player-context`, and `/session` uses a
-JSON envelope with a stable machine-readable `code` and a human-readable `error`.
-Consumers can branch on the code without parsing the message:
+Every error response from a recognized endpoint uses a JSON envelope with a
+stable machine-readable `code` and a human-readable `error`, so consumers can
+branch on the code without parsing the message. This includes the `405` returned
+when an endpoint is called with an unsupported HTTP method:
 
 ```json
 {
@@ -130,6 +149,7 @@ Consumers can branch on the code without parsing the message:
 | `code` | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | 401 | Missing or invalid API key |
+| `method-not-allowed` | 405 | Unsupported HTTP method for the endpoint |
 | `invalid-request` | 400 | Malformed JSON or a missing or invalid field |
 | `mint-failed` | 502 | Token mint failed |
 | `video-unavailable` | 422 | Terminal `playabilityStatus`; `details` contains the status |
@@ -137,8 +157,10 @@ Consumers can branch on the code without parsing the message:
 | `player-context-failed` | 502 | Other player-context failure |
 | `no-session` | 503 | No attested session or cookies available |
 
-`/ping` is outside this contract. It always returns 200 and reports failures as
-`{ok:false,error}`. Unknown paths use net/http's plain-text 404 response.
+`GET /ping` is the exception to this contract. It always returns 200 and reports
+failures as `{ok:false,error}`. Unsupported methods on `/ping` or `/metrics`
+still return the `405` envelope. Unknown paths use net/http's plain-text 404
+response.
 
 The `waxseal/client` package parses these envelopes into `*client.APIError` and
 provides matching `Code*` constants. It also accepts the older `{error}` format
