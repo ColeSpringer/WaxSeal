@@ -6,6 +6,7 @@ import (
 	"github.com/colespringer/waxseal/internal/browser"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // ErrUnknownTenant is returned when a request presents an API key that is not
@@ -19,10 +20,12 @@ var ErrUnknownTenant = errors.New("waxseal: unknown tenant API key")
 // Keyless mode (no keys registered) keeps the bgutil wire unauthenticated for
 // generic yt-dlp use: every request maps to one shared "default" tenant.
 type Tenants struct {
-	pool  *browser.Pool
-	video string
-	opts  browser.Options
-	log   *slog.Logger
+	pool            *browser.Pool
+	video           string
+	opts            browser.Options
+	log             *slog.Logger
+	streamingMaxAge time.Duration // forwarded to each tenant Minter; 0 disables
+	reportDebounce  time.Duration // forwarded to each tenant Minter; <=0 uses the default
 
 	// newSession creates an attested tenant session. Tests replace it to avoid
 	// launching a browser.
@@ -36,19 +39,22 @@ type Tenants struct {
 const defaultTenant = "default"
 
 // NewTenants builds a registry over pool. Keys maps API keys to tenant labels. An
-// empty map selects keyless single-tenant mode.
-func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options) *Tenants {
+// empty map selects keyless single-tenant mode. streamingMaxAge and reportDebounce
+// configure each tenant's Minter.
+func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options, streamingMaxAge, reportDebounce time.Duration) *Tenants {
 	log := opts.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	t := &Tenants{
-		pool:    pool,
-		video:   video,
-		opts:    opts,
-		log:     log,
-		keys:    keys,
-		minters: make(map[string]*Minter),
+		pool:            pool,
+		video:           video,
+		opts:            opts,
+		log:             log,
+		streamingMaxAge: streamingMaxAge,
+		reportDebounce:  reportDebounce,
+		keys:            keys,
+		minters:         make(map[string]*Minter),
 	}
 	t.newSession = t.poolSession
 	return t
@@ -91,7 +97,7 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 	defer t.mu.Unlock()
 	m, ok := t.minters[label]
 	if !ok {
-		m = NewMinter(t.video, t.opts)
+		m = NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce)
 		m.launch = func(ctx context.Context) (minterSession, error) {
 			return t.newSession(ctx, t.video)
 		}

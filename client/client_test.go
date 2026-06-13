@@ -59,9 +59,10 @@ func TestPOTokenEmptyBindingAndHTTPError(t *testing.T) {
 func TestSession(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"visitor_data":   "VD",
-			"user_agent":     "UA",
-			"client_version": "CV",
+			"visitor_data":       "VD",
+			"user_agent":         "UA",
+			"client_version":     "CV",
+			"session_generation": 7,
 			"cookies": []map[string]any{
 				{"name": "YSC", "value": "abc", "domain": ".youtube.com", "path": "/", "secure": true, "http_only": true},
 			},
@@ -75,6 +76,9 @@ func TestSession(t *testing.T) {
 	}
 	if s.VisitorData != "VD" || s.UserAgent != "UA" || s.ClientVersion != "CV" || len(s.Cookies) != 1 {
 		t.Fatalf("session = %+v", s)
+	}
+	if s.SessionGeneration != 7 {
+		t.Errorf("session_generation = %d, want 7", s.SessionGeneration)
 	}
 	if ck := s.Cookies[0]; ck.Name != "YSC" || ck.Value != "abc" || !ck.Secure || !ck.HttpOnly {
 		t.Errorf("cookie = %+v", ck)
@@ -100,6 +104,7 @@ func TestPlayerContext(t *testing.T) {
 			"server_abr_streaming_url": "https://r1.googlevideo.com/videoplayback?n=scram",
 			"visitor_data":             "VD",
 			"client_version":           "2.0",
+			"session_generation":       3,
 			"audio_formats": []map[string]any{
 				{"itag": 251, "lmt": "1719185012384481", "mime_type": "audio/webm", "bitrate": 130000, "content_length": 1234, "audio_quality": "AUDIO_QUALITY_MEDIUM"},
 			},
@@ -117,6 +122,9 @@ func TestPlayerContext(t *testing.T) {
 	}
 	if pc.ServerAbrStreamingURL != "https://r1.googlevideo.com/videoplayback?n=scram" || pc.PlayerURL == "" {
 		t.Errorf("context = %+v", pc)
+	}
+	if pc.SessionGeneration != 3 {
+		t.Errorf("session_generation = %d, want 3", pc.SessionGeneration)
 	}
 	if len(pc.AudioFormats) != 1 || pc.AudioFormats[0].Itag != 251 || pc.AudioFormats[0].MimeType != "audio/webm" {
 		t.Errorf("audio formats = %+v", pc.AudioFormats)
@@ -207,5 +215,69 @@ func TestAudioFormatTagDrift(t *testing.T) {
 	}
 	if f.AudioTrackID != "en.4" {
 		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
+	}
+}
+
+func TestReport(t *testing.T) {
+	var gotBody map[string]any
+	var gotKey, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/report" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		gotKey, gotMethod = r.Header.Get("X-API-Key"), r.Method
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accepted": true, "retired": true, "retirement_pending": false, "generation": 5,
+		})
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, client.WithAPIKey("K"))
+	res, err := c.Report(context.Background(), 5, "VID", "incomplete-stream")
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if !res.Accepted || !res.Retired || res.Generation != 5 {
+		t.Errorf("res = %+v, want accepted+retired, gen 5", res)
+	}
+	if gotKey != "K" || gotMethod != http.MethodPost {
+		t.Errorf("key=%q method=%q", gotKey, gotMethod)
+	}
+	if gotBody["session_generation"] != float64(5) || gotBody["video_id"] != "VID" || gotBody["reason"] != "incomplete-stream" {
+		t.Errorf("request body = %v", gotBody)
+	}
+
+	// A zero generation is rejected before any HTTP call.
+	if _, err := c.Report(context.Background(), 0, "VID", "x"); err == nil {
+		t.Error("Report with generation 0 should error before any HTTP call")
+	}
+}
+
+func TestReportRateLimitedResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accepted": false, "retry_after_seconds": 42, "generation": 2,
+		})
+	}))
+	defer srv.Close()
+
+	res, err := client.New(srv.URL).Report(context.Background(), 2, "", "")
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if res.Accepted || res.RetryAfterSeconds != 42 || res.Generation != 2 {
+		t.Errorf("res = %+v, want !Accepted, RetryAfterSeconds 42, gen 2", res)
+	}
+}
+
+func TestReportHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	if _, err := client.New(srv.URL).Report(context.Background(), 1, "VID", "x"); err == nil {
+		t.Error("a non-200 from /report should error")
 	}
 }

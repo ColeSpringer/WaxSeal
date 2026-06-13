@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,14 @@ type Config struct {
 	Headful    bool              // run headful (needs a display/Xvfb)
 	TenantKeys map[string]string // API key to tenant label; nil selects keyless single-tenant mode
 	Logger     *slog.Logger      // nil discards
+
+	// StreamingMaxAge recycles a session at the next streaming handoff after it
+	// reaches this age. A zero value disables time-based recycling.
+	StreamingMaxAge time.Duration
+
+	// ReportDebounce is the minimum interval between session recycles caused by
+	// consumer reports. A non-positive value uses minter.DefaultReportDebounce.
+	ReportDebounce time.Duration
 }
 
 // Server is the running HTTP service over a real-browser minter.
@@ -63,7 +72,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		tenants: minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts),
+		tenants: minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce),
 		log:     log,
 	}
 	s.srv = &http.Server{Addr: cfg.Addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
@@ -84,6 +93,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/ping", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("GET /session", s.handleSession)
 	mux.HandleFunc("/session", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("POST /report", s.handleReport)
+	mux.HandleFunc("/report", methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet))
 	return mux
@@ -212,7 +223,7 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
 	defer cancel()
-	pc, err := m.PlayerContext(ctx, videoID)
+	pc, gen, err := m.PlayerContext(ctx, videoID)
 	if err != nil {
 		// Separate terminal and timeout failures so callers can choose whether to
 		// retry.
@@ -232,9 +243,13 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.log.Info("player-context handed out", "tenant", label, "video_id_len", len(videoID),
+	s.log.Info("player-context handed out", "tenant", label, "video_id_len", len(videoID), "generation", gen,
 		"status", pc.Status, "abr_url_len", len(pc.ServerAbrStreamingURL), "audio_formats", len(pc.AudioFormats))
-	writeJSON(w, http.StatusOK, pc)
+	// Keep the embedded context fields at the top level for wire compatibility.
+	writeJSON(w, http.StatusOK, struct {
+		browser.PlayerContext
+		SessionGeneration uint64 `json:"session_generation"`
+	}{pc, gen})
 }
 
 // playerContextVideoID reads video_id from the JSON body or query string. An
@@ -287,12 +302,23 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, kind, err := m.Healthy(r.Context())
+	snap, live, err := m.Health(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "tenant": label, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant": label, "attest": kind, "identity": id})
+	// Browser proof describes playback in the daemon. A consumer report can still
+	// mark the session suspect after a successful proof.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                         live,
+		"tenant":                     label,
+		"attest":                     snap.AttestKind,
+		"identity":                   snap.Identity,
+		"generation":                 snap.Generation,
+		"browser_proof_established":  snap.BrowserProofEstablished,
+		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
+		"streaming_suspect":          snap.StreamingSuspect,
+	})
 }
 
 // sessionCookie is the wire representation of one youtube.com cookie.
@@ -316,7 +342,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	// used by the other browser-backed endpoints.
 	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
 	defer cancel()
-	id, raw, err := m.SessionSnapshot(ctx)
+	id, raw, gen, err := m.SessionSnapshot(ctx)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
 		return
@@ -330,14 +356,66 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		})
 		pairs = append(pairs, c.Name+"="+c.Value)
 	}
-	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies))
+	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies), "generation", gen)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"visitor_data":   id.VisitorData,
-		"user_agent":     id.UserAgent,
-		"client_version": id.ClientVersion,
-		"cookies":        cookies,
-		"cookie_header":  strings.Join(pairs, "; "),
+		"visitor_data":       id.VisitorData,
+		"user_agent":         id.UserAgent,
+		"client_version":     id.ClientVersion,
+		"cookies":            cookies,
+		"cookie_header":      strings.Join(pairs, "; "),
+		"session_generation": gen,
 	})
+}
+
+// reportReasonRe bounds the optional reason field and excludes log control
+// characters.
+var reportReasonRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// handleReport accepts a consumer's report that a prior session produced a
+// degraded stream. The body names the session_generation returned by
+// /player-context or /session. Reports are scoped and rate-limited per tenant.
+// Consumers must inspect the accepted response field to learn whether the report
+// applied to the current session.
+func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
+	m, label, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		SessionGeneration uint64 `json:"session_generation"`
+		VideoID           string `json:"video_id"`
+		Reason            string `json:"reason"`
+	}
+	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	if req.SessionGeneration == 0 {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "session_generation is required (returned by /player-context and /session)")
+		return
+	}
+	if req.VideoID != "" && !browser.ValidVideoID(req.VideoID) {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "video_id must contain 1 to 64 letters, digits, underscores, or hyphens")
+		return
+	}
+	// Reject invalid reasons instead of silently changing their contents.
+	if req.Reason != "" && !reportReasonRe.MatchString(req.Reason) {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "reason must contain 1 to 64 letters, digits, underscores, or hyphens")
+		return
+	}
+	res := m.ReportDegraded(req.SessionGeneration, req.VideoID, req.Reason)
+	s.log.Info("degradation reported", "tenant", label, "video_id_len", len(req.VideoID), "reason", req.Reason,
+		"generation", req.SessionGeneration, "accepted", res.Accepted, "retired", res.Retired, "retirement_pending", res.RetirementPending)
+	body := map[string]any{
+		"accepted":           res.Accepted,
+		"retired":            res.Retired,
+		"retirement_pending": res.RetirementPending,
+		"generation":         res.Generation,
+	}
+	if res.RetryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(res.RetryAfterSeconds))
+		body["retry_after_seconds"] = res.RetryAfterSeconds
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleMetrics returns unauthenticated operational data. It includes per-tenant
@@ -390,8 +468,17 @@ func decodeErrMsg(err error) string {
 	if errors.As(err, &maxErr) {
 		return "request body too large (max 1 MiB)"
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return "request body is empty or truncated"
+	if errors.Is(err, io.EOF) {
+		return "request body is empty"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "request body is truncated (incomplete JSON)"
+	}
+	// json.Decoder reports some syntax errors, including unterminated strings, as
+	// io.ErrUnexpectedEOF. Other syntax errors reach this branch.
+	var se *json.SyntaxError
+	if errors.As(err, &se) {
+		return "request body contains malformed JSON"
 	}
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) {

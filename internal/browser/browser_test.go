@@ -133,8 +133,9 @@ func TestFullLengthProbeModel(t *testing.T) {
 		OutcomeTargetNotBuffered: true,
 		OutcomeNotEstablished:    true,
 		OutcomeVideoTooShort:     true,
+		OutcomeCanceled:          true,
 	}
-	if len(outcomes) != 4 {
+	if len(outcomes) != 5 {
 		t.Fatalf("outcome constants are not all distinct: %v", outcomes)
 	}
 	if OutcomeFullLength != "full-length" {

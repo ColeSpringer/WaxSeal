@@ -15,7 +15,7 @@ import (
 // identity isolation is observable.
 func newTestTenants(keys map[string]string) (*Tenants, *int64) {
 	var calls int64
-	tn := NewTenants(nil, "v", keys, browser.Options{})
+	tn := NewTenants(nil, "v", keys, browser.Options{}, 0, 0)
 	tn.newSession = func(context.Context, string) (minterSession, error) {
 		n := atomic.AddInt64(&calls, 1)
 		return &fakeSession{

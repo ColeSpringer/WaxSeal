@@ -1,15 +1,19 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/colespringer/waxseal/internal/browser"
 	"github.com/colespringer/waxseal/internal/minter"
@@ -177,6 +181,8 @@ func TestRoutesMethodMatching(t *testing.T) {
 		{http.MethodDelete, "/ping", "/ping"},
 		{http.MethodGet, "/session", "GET /session"},
 		{http.MethodPost, "/session", "/session"},
+		{http.MethodPost, "/report", "POST /report"},
+		{http.MethodGet, "/report", "/report"},
 		{http.MethodGet, "/metrics", "GET /metrics"},
 		{http.MethodPost, "/metrics", "/metrics"},
 	}
@@ -190,7 +196,7 @@ func TestRoutesMethodMatching(t *testing.T) {
 
 func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodGet, "/get_pot", nil) // no API key
@@ -216,7 +222,7 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 
 func TestTenantUnauthorizedCode(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, "/get_pot", nil)
@@ -251,12 +257,12 @@ func TestDecodeErrMsg(t *testing.T) {
 		want string
 	}{
 		{"too large", &http.MaxBytesError{Limit: 1 << 20}, "request body too large (max 1 MiB)"},
-		{"eof", io.EOF, "request body is empty or truncated"},
-		{"unexpected eof", io.ErrUnexpectedEOF, "request body is empty or truncated"},
+		{"eof", io.EOF, "request body is empty"},
+		{"unexpected eof", io.ErrUnexpectedEOF, "request body is truncated (incomplete JSON)"},
 		{"type mismatch top-level", &json.UnmarshalTypeError{Value: "array"}, "request body must be a JSON object"},
 		{"type mismatch field", &json.UnmarshalTypeError{Field: "content_binding", Value: "number"}, `field "content_binding" has the wrong type`},
 		{"type mismatch nested", &json.UnmarshalTypeError{Field: "a.b", Value: "number"}, "request body contains a field with the wrong type"},
-		{"syntax error", &json.SyntaxError{}, "request body contains invalid JSON"},
+		{"syntax error", &json.SyntaxError{}, "request body contains malformed JSON"},
 		{"plain error", errors.New("boom"), "request body contains invalid JSON"},
 	}
 	for _, tt := range tests {
@@ -274,7 +280,7 @@ func TestDecodeErrMsg(t *testing.T) {
 // postGetPot sends a request with a valid API key through the full server mux.
 func postGetPot(body string) *httptest.ResponseRecorder {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}),
+		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(body))
@@ -332,5 +338,320 @@ func TestGetPotTrailingDataRejected(t *testing.T) {
 		if env.Error != "request body must be a single JSON object" {
 			t.Errorf("body %q: message = %q, want the single-object message", body, env.Error)
 		}
+	}
+}
+
+// fakePlayerSession exercises live-session handlers without a browser.
+type fakePlayerSession struct {
+	abrURL      string
+	vd          string
+	established bool
+	closed      atomic.Bool
+}
+
+func (f *fakePlayerSession) Mint(context.Context, string) (browser.MintResult, error) {
+	return browser.MintResult{Kind: "integrity", Lifetime: 3600}, nil
+}
+func (f *fakePlayerSession) PlayerContext(context.Context, string) (browser.PlayerContext, error) {
+	return browser.PlayerContext{Status: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
+}
+func (f *fakePlayerSession) EnsureEstablished(context.Context) error { return nil }
+func (f *fakePlayerSession) Ping(context.Context) error              { return nil }
+func (f *fakePlayerSession) AttestKind() string                      { return "integrity" }
+func (f *fakePlayerSession) Identity() browser.Identity {
+	return browser.Identity{VisitorData: f.vd, UserAgent: "UA", ClientVersion: "2.x"}
+}
+func (f *fakePlayerSession) BrowserCookies() ([]*http.Cookie, error) {
+	return []*http.Cookie{{Name: "VISITOR_INFO1_LIVE", Value: "abc"}}, nil
+}
+func (f *fakePlayerSession) Established() bool { return f.established }
+func (f *fakePlayerSession) LastProof() (browser.FullLengthProbe, time.Time) {
+	return browser.FullLengthProbe{}, time.Time{}
+}
+func (f *fakePlayerSession) Close() { f.closed.Store(true) }
+
+// liveServer builds a Server whose listed tenants have an injected fake session
+// (generation 1), so live-session handlers run without a browser.
+func liveServer(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) *Server {
+	t.Helper()
+	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0)
+	for key, sess := range sessions {
+		if _, err := tn.InjectSessionForTest(context.Background(), key, sess); err != nil {
+			t.Fatalf("inject session for %q: %v", key, err)
+		}
+	}
+	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+}
+
+func TestPlayerContextEchoesGeneration(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["server_abr_streaming_url"] != "https://r/ok" {
+		t.Errorf("server_abr_streaming_url = %v, want the context URL (embedded fields must stay top-level)", resp["server_abr_streaming_url"])
+	}
+	if resp["session_generation"] != float64(1) {
+		t.Errorf("session_generation = %v, want 1", resp["session_generation"])
+	}
+}
+
+func TestSessionEchoesGeneration(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd-x"}})
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["visitor_data"] != "vd-x" {
+		t.Errorf("visitor_data = %v", resp["visitor_data"])
+	}
+	if resp["session_generation"] != float64(1) {
+		t.Errorf("session_generation = %v, want 1", resp["session_generation"])
+	}
+}
+
+func TestPingHealthFields(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	r := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["ok"] != true {
+		t.Errorf("ok = %v, want true", resp["ok"])
+	}
+	if resp["attest"] != "integrity" {
+		t.Errorf("attest = %v, want integrity", resp["attest"])
+	}
+	if resp["generation"] != float64(1) {
+		t.Errorf("generation = %v, want 1", resp["generation"])
+	}
+	if resp["browser_proof_established"] != false {
+		t.Errorf("browser_proof_established = %v, want false", resp["browser_proof_established"])
+	}
+	for _, k := range []string{"browser_proof_established", "last_browser_proof_outcome", "streaming_suspect"} {
+		if _, ok := resp[k]; !ok {
+			t.Errorf("/ping missing field %q", k)
+		}
+	}
+}
+
+func TestHandleReportLive(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"video_id":"aqz-KE-bpKQ","reason":"incomplete-stream"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["accepted"] != true {
+		t.Errorf("accepted = %v, want true", resp["accepted"])
+	}
+	if resp["retired"] != true && resp["retirement_pending"] != true {
+		t.Errorf("want retired or retirement_pending, got %v", resp)
+	}
+	if resp["generation"] != float64(1) {
+		t.Errorf("generation = %v, want 1", resp["generation"])
+	}
+	if !sess.closed.Load() {
+		t.Error("an idle reported session should be retired")
+	}
+}
+
+func TestHandleReportValidation(t *testing.T) {
+	newSrv := func() *Server {
+		return &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	}
+	t.Run("no auth is 401", func(t *testing.T) {
+		s := newSrv()
+		r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1}`))
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", w.Code)
+		}
+	})
+	t.Run("non-POST is 405", func(t *testing.T) {
+		s := newSrv()
+		r := httptest.NewRequest(http.MethodGet, "/report", nil)
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want 405", w.Code)
+		}
+	})
+	bad := []struct{ name, body, wantContains string }{
+		{"missing generation", `{"reason":"x"}`, "session_generation is required"},
+		{"zero generation", `{"session_generation":0}`, "session_generation is required"},
+		{"bad video_id", `{"session_generation":1,"video_id":"bad/../x"}`, "video_id"},
+		{"reason bad charset", `{"session_generation":1,"reason":"has space"}`, "reason must contain"},
+		{"reason too long", `{"session_generation":1,"reason":"` + strings.Repeat("a", 65) + `"}`, "reason must contain"},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newSrv()
+			r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(tt.body))
+			r.Header.Set("X-API-Key", "K")
+			w := httptest.NewRecorder()
+			s.routes().ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body)
+			}
+			var env struct{ Error, Code string }
+			json.Unmarshal(w.Body.Bytes(), &env)
+			if env.Code != CodeInvalidRequest {
+				t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+			}
+			if !strings.Contains(env.Error, tt.wantContains) {
+				t.Errorf("message = %q, want it to contain %q", env.Error, tt.wantContains)
+			}
+		})
+	}
+}
+
+func TestHandleReportNoSessionReflectsResult(t *testing.T) {
+	// A report for an unwarmed tenant is returned as not accepted.
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"cap"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["accepted"] != false {
+		t.Errorf("accepted = %v, want false (no live session)", resp["accepted"])
+	}
+	if resp["generation"] != float64(0) {
+		t.Errorf("generation = %v, want 0", resp["generation"])
+	}
+}
+
+func TestHandleReportRateLimited(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	post := func(path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		return w
+	}
+	if w := post("/report", `{"session_generation":1,"reason":"cap"}`); w.Code != http.StatusOK {
+		t.Fatalf("first report status = %d", w.Code)
+	}
+	// Relaunch to a live generation 2.
+	pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
+	var pc map[string]any
+	json.Unmarshal(pcW.Body.Bytes(), &pc)
+	gen2, _ := pc["session_generation"].(float64)
+	if gen2 != 2 {
+		t.Fatalf("relaunch generation = %v, want 2", pc["session_generation"])
+	}
+	w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, int(gen2)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("rate-limited report status = %d", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("a rate-limited report must carry a Retry-After header")
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["accepted"] != false {
+		t.Errorf("accepted = %v, want false", resp["accepted"])
+	}
+	if ra, _ := resp["retry_after_seconds"].(float64); ra <= 0 {
+		t.Errorf("retry_after_seconds = %v, want > 0", resp["retry_after_seconds"])
+	}
+}
+
+func TestHandleReportCrossTenant(t *testing.T) {
+	alice := &fakePlayerSession{abrURL: "https://r/a", vd: "vd-a"}
+	bob := &fakePlayerSession{abrURL: "https://r/b", vd: "vd-b"}
+	s := liveServer(t, map[string]string{"KA": "alice", "KB": "bob"}, map[string]*fakePlayerSession{"KA": alice, "KB": bob})
+
+	r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"cap"}`))
+	r.Header.Set("X-API-Key", "KA")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("alice report status = %d", w.Code)
+	}
+	if !alice.closed.Load() {
+		t.Error("alice's session should be retired by her own report")
+	}
+	if bob.closed.Load() {
+		t.Error("bob's session must not be touched by alice's report")
+	}
+	// Bob's session is still live.
+	pr := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	pr.Header.Set("X-API-Key", "KB")
+	pw := httptest.NewRecorder()
+	s.routes().ServeHTTP(pw, pr)
+	var resp map[string]any
+	json.Unmarshal(pw.Body.Bytes(), &resp)
+	if resp["ok"] != true {
+		t.Errorf("bob /ping ok = %v, want true (bob unaffected)", resp["ok"])
+	}
+}
+
+func TestGetPotDecodeMessages(t *testing.T) {
+	cases := []struct{ name, body, want string }{
+		{"empty", "", "request body is empty"},
+		{"truncated object", `{"content_binding":`, "request body is truncated (incomplete JSON)"},
+		{"malformed no eof", `{"content_binding": }`, "request body contains malformed JSON"},
+		{"trailing comma", `{"content_binding":"x",}`, "request body contains malformed JSON"},
+		{"unterminated string", `{"content_binding": "hi`, "request body is truncated (incomplete JSON)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := postGetPot(c.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body)
+			}
+			var env struct{ Error, Code string }
+			json.Unmarshal(w.Body.Bytes(), &env)
+			if env.Error != c.want {
+				t.Errorf("message = %q, want %q", env.Error, c.want)
+			}
+		})
+	}
+}
+
+func TestPlayerContextEmptyBodyReportsMissingVideoID(t *testing.T) {
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader("")) // empty body, no query
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	var env struct{ Error, Code string }
+	json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Error != "video_id is required" {
+		t.Errorf("message = %q, want 'video_id is required'", env.Error)
 	}
 }

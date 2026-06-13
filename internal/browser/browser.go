@@ -110,8 +110,12 @@ type Session struct {
 	// landingVideo is the watch video used to initialize the session. Establishment
 	// falls back to DefaultVideo when this video is too short for the proof.
 	landingVideo string
-	// establishedStreaming is written only while the minter holds its page lock.
+
+	// probeMu guards proof state shared by playback, health, and metrics paths.
+	probeMu              sync.Mutex
 	establishedStreaming bool
+	lastProbe            FullLengthProbe // most recent proveFullLength result
+	lastProbeAt          time.Time       // when lastProbe completed; zero means never probed
 
 	// One attestation installs a warm minter that mints many identifiers: a player
 	// token bound to a video_id, or a GVS token bound to a visitor_data.
@@ -1202,6 +1206,8 @@ const (
 	OutcomeNotEstablished = "not-established"
 	// OutcomeVideoTooShort means the video has no suitable target beyond the cap.
 	OutcomeVideoTooShort = "video-too-short"
+	// OutcomeCanceled means polling stopped before the probe reached a verdict.
+	OutcomeCanceled = "canceled"
 )
 
 // playerSeekJS seeks past the preview cap and allows the player to request media at
@@ -1266,7 +1272,7 @@ type FullLengthProbe struct {
 //
 // proveFullLength restores the shared page before returning.
 func (s *Session) EnsureEstablished(ctx context.Context) error {
-	if s.establishedStreaming {
+	if s.Established() {
 		return nil
 	}
 	probe, err := s.proveFullLength(ctx, s.landingVideo)
@@ -1283,8 +1289,27 @@ func (s *Session) EnsureEstablished(ctx context.Context) error {
 	if probe.Outcome != OutcomeFullLength {
 		return fmt.Errorf("waxseal: session not established: full-length proof outcome %q: %s", probe.Outcome, probe.Reason)
 	}
+	s.probeMu.Lock()
 	s.establishedStreaming = true
+	s.probeMu.Unlock()
 	return nil
+}
+
+// Established reports whether the once-per-session full-length proof has passed.
+// It reflects the browser's own proof of playback, not the health of a URL handed
+// to and fetched by a consumer.
+func (s *Session) Established() bool {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	return s.establishedStreaming
+}
+
+// LastProof returns the most recent full-length probe and its completion time. A
+// zero time means the session has never been probed.
+func (s *Session) LastProof() (FullLengthProbe, time.Time) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	return s.lastProbe, s.lastProbeAt
 }
 
 // VerifyFullLength checks whether the attested browser can stream beyond the
@@ -1311,7 +1336,13 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 
 	start := time.Now()
 	probe := FullLengthProbe{VideoID: videoID, TargetSeconds: fullLengthTargetSecs}
-	finish := func() { probe.ElapsedMs = int(time.Since(start).Milliseconds()) }
+	finish := func() {
+		probe.ElapsedMs = int(time.Since(start).Milliseconds())
+		s.probeMu.Lock()
+		s.lastProbe = probe
+		s.lastProbeAt = time.Now()
+		s.probeMu.Unlock()
+	}
 
 	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
 	if err != nil {
@@ -1352,6 +1383,9 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 	for {
 		select {
 		case <-ctx.Done():
+			// Distinguish a canceled probe from a session that was never probed.
+			probe.Outcome = OutcomeCanceled
+			probe.Reason = "probe canceled before reaching the target: " + ctx.Err().Error()
 			finish()
 			return probe, ctx.Err()
 		case <-time.After(playerContextPollInterval):

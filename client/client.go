@@ -36,6 +36,9 @@ type Session struct {
 	UserAgent     string
 	ClientVersion string
 	Cookies       []*http.Cookie
+	// SessionGeneration identifies the daemon session that produced this snapshot.
+	// Use it to report a degraded stream.
+	SessionGeneration uint64
 }
 
 // PlayerContext contains the status-1 streaming context for one video. The SABR
@@ -55,6 +58,9 @@ type PlayerContext struct {
 	Author                       string        `json:"author"`
 	LengthSeconds                int           `json:"length_seconds"`
 	AudioFormats                 []AudioFormat `json:"audio_formats"`
+	// SessionGeneration identifies the daemon session that produced this context.
+	// Use it to report a degraded stream.
+	SessionGeneration uint64 `json:"session_generation"`
 }
 
 // AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
@@ -160,6 +166,7 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 			Secure   bool   `json:"secure"`
 			HTTPOnly bool   `json:"http_only"`
 		} `json:"cookies"`
+		SessionGeneration uint64 `json:"session_generation"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("waxseal/client: decode /session: %w", err)
@@ -171,7 +178,7 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 			Secure: ck.Secure, HttpOnly: ck.HTTPOnly,
 		})
 	}
-	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies}, nil
+	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies, SessionGeneration: out.SessionGeneration}, nil
 }
 
 // PlayerContext fetches the status-1 streaming context for videoID. The
@@ -204,6 +211,71 @@ func (c *Client) PlayerContext(ctx context.Context, videoID string) (*PlayerCont
 		return nil, errors.New("waxseal/client: /player-context returned no server_abr_streaming_url")
 	}
 	return &out, nil
+}
+
+// ReportResult describes how the daemon handled a degradation report. Accepted
+// indicates that the report applies to the current session. Retired indicates
+// that the session was closed immediately. RetirementPending indicates that it
+// will be closed at the next streaming handoff. RetryAfterSeconds is set when the
+// report was rate-limited.
+type ReportResult struct {
+	Accepted          bool
+	Retired           bool
+	RetirementPending bool
+	Generation        uint64
+	RetryAfterSeconds int
+}
+
+// Report tells the daemon that session generation gen produced a degraded stream.
+// Pass the SessionGeneration from a prior PlayerContext or Session. videoID and
+// reason are optional; reason may contain 1 to 64 letters, digits, underscores,
+// or hyphens.
+//
+// A nil error means that the HTTP request succeeded. Callers must inspect
+// ReportResult.Accepted and honor ReportResult.RetryAfterSeconds when set.
+func (c *Client) Report(ctx context.Context, gen uint64, videoID, reason string) (ReportResult, error) {
+	if gen == 0 {
+		return ReportResult{}, errors.New("waxseal/client: session generation is required")
+	}
+	payload := map[string]any{"session_generation": gen}
+	if videoID != "" {
+		payload["video_id"] = videoID
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/report", bytes.NewReader(body))
+	if err != nil {
+		return ReportResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.auth(req)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return ReportResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ReportResult{}, c.statusErr("/report", resp)
+	}
+	var out struct {
+		Accepted          bool   `json:"accepted"`
+		Retired           bool   `json:"retired"`
+		RetirementPending bool   `json:"retirement_pending"`
+		Generation        uint64 `json:"generation"`
+		RetryAfterSeconds int    `json:"retry_after_seconds"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ReportResult{}, fmt.Errorf("waxseal/client: decode /report: %w", err)
+	}
+	return ReportResult{
+		Accepted:          out.Accepted,
+		Retired:           out.Retired,
+		RetirementPending: out.RetirementPending,
+		Generation:        out.Generation,
+		RetryAfterSeconds: out.RetryAfterSeconds,
+	}, nil
 }
 
 func (c *Client) auth(req *http.Request) {

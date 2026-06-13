@@ -5,10 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/colespringer/waxseal/internal/minter"
+	"github.com/spf13/cobra"
 )
 
 func TestCommandTree(t *testing.T) {
@@ -151,5 +156,131 @@ func TestLooksLikeURL(t *testing.T) {
 		if looksLikeURL(s) {
 			t.Errorf("looksLikeURL(%q) = true, want false", s)
 		}
+	}
+}
+
+// resolveSMA binds the flag before resolving it so Changed reflects command-line
+// input.
+func resolveSMA(t *testing.T, flagArgs ...string) (time.Duration, error) {
+	t.Helper()
+	var o serverOpts
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().StringVar(&o.streamingMaxAge, "streaming-max-age", "", "")
+	if err := cmd.ParseFlags(flagArgs); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	return resolveStreamingMaxAge(cmd, &o, slog.New(slog.DiscardHandler))
+}
+
+func TestResolveStreamingMaxAge(t *testing.T) {
+	t.Run("default when unset", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+		d, err := resolveSMA(t)
+		if err != nil || d != streamingMaxAgeDefault {
+			t.Fatalf("default = (%v, %v), want %v", d, err, streamingMaxAgeDefault)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "10m")
+		d, err := resolveSMA(t)
+		if err != nil || d != 10*time.Minute {
+			t.Fatalf("env = (%v, %v), want 10m", d, err)
+		}
+	})
+	t.Run("flag overrides env", func(t *testing.T) {
+		t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "10m")
+		d, err := resolveSMA(t, "--streaming-max-age", "2m")
+		if err != nil || d != 2*time.Minute {
+			t.Fatalf("flag>env = (%v, %v), want 2m", d, err)
+		}
+	})
+	t.Run("zero disables", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+		if d, err := resolveSMA(t, "--streaming-max-age", "0"); err != nil || d != 0 {
+			t.Fatalf("0 = (%v, %v), want (0, nil)", d, err)
+		}
+	})
+	t.Run("empty flag disables", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+		if d, err := resolveSMA(t, "--streaming-max-age", ""); err != nil || d != 0 {
+			t.Fatalf("empty = (%v, %v), want (0, nil)", d, err)
+		}
+	})
+	t.Run("floor is accepted", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+		if d, err := resolveSMA(t, "--streaming-max-age", "1m"); err != nil || d != time.Minute {
+			t.Fatalf("1m = (%v, %v), want (1m, nil)", d, err)
+		}
+	})
+	t.Run("large value warns but is accepted", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+		if d, err := resolveSMA(t, "--streaming-max-age", "5h"); err != nil || d != 5*time.Hour {
+			t.Fatalf("5h = (%v, %v), want (5h, nil)", d, err)
+		}
+	})
+	for _, bad := range []string{"abc", "-5m", "30s", "59s"} {
+		t.Run("reject "+bad, func(t *testing.T) {
+			os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
+			if d, err := resolveSMA(t, "--streaming-max-age", bad); err == nil {
+				t.Fatalf("%q = (%v, nil), want an error", bad, d)
+			}
+		})
+	}
+}
+
+// resolveRD binds the flag before resolving it.
+func resolveRD(t *testing.T, flagArgs ...string) (time.Duration, error) {
+	t.Helper()
+	var o serverOpts
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().StringVar(&o.reportDebounce, "report-debounce", "", "")
+	if err := cmd.ParseFlags(flagArgs); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	return resolveReportDebounce(cmd, &o, slog.New(slog.DiscardHandler))
+}
+
+func TestResolveReportDebounce(t *testing.T) {
+	t.Run("default when unset", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_REPORT_DEBOUNCE")
+		d, err := resolveRD(t)
+		if err != nil || d != minter.DefaultReportDebounce {
+			t.Fatalf("default = (%v, %v), want %v", d, err, minter.DefaultReportDebounce)
+		}
+	})
+	t.Run("empty resolves to default (not disabled)", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_REPORT_DEBOUNCE")
+		d, err := resolveRD(t, "--report-debounce", "")
+		if err != nil || d != minter.DefaultReportDebounce {
+			t.Fatalf("empty = (%v, %v), want default", d, err)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "30s")
+		d, err := resolveRD(t)
+		if err != nil || d != 30*time.Second {
+			t.Fatalf("env = (%v, %v), want 30s", d, err)
+		}
+	})
+	t.Run("flag overrides env", func(t *testing.T) {
+		t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "30s")
+		d, err := resolveRD(t, "--report-debounce", "10s")
+		if err != nil || d != 10*time.Second {
+			t.Fatalf("flag>env = (%v, %v), want 10s", d, err)
+		}
+	})
+	t.Run("floor is accepted", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_REPORT_DEBOUNCE")
+		if d, err := resolveRD(t, "--report-debounce", reportDebounceFloor.String()); err != nil || d != reportDebounceFloor {
+			t.Fatalf("floor = (%v, %v), want (%v, nil)", d, err, reportDebounceFloor)
+		}
+	})
+	for _, bad := range []string{"abc", "0", "-5s", "1s", "4s"} {
+		t.Run("reject "+bad, func(t *testing.T) {
+			os.Unsetenv("WAXSEAL_REPORT_DEBOUNCE")
+			if d, err := resolveRD(t, "--report-debounce", bad); err == nil {
+				t.Fatalf("%q = (%v, nil), want an error below the minimum debounce", bad, d)
+			}
+		})
 	}
 }
