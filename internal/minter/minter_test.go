@@ -64,7 +64,7 @@ func (f *fakeSession) Identity() browser.Identity {
 func (f *fakeSession) BrowserCookies(context.Context) ([]*http.Cookie, error) {
 	return f.cookies, f.cookiesErr
 }
-func (f *fakeSession) Established() bool                       { return f.established }
+func (f *fakeSession) Established() bool { return f.established }
 func (f *fakeSession) LastProof() (browser.FullLengthProbe, time.Time) {
 	return f.lastProbe, f.lastProbeAt
 }
@@ -192,6 +192,66 @@ func TestMinterMaxAgeRecycle(t *testing.T) {
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
 		t.Errorf("recycled session should be closed")
+	}
+}
+
+// TestMinterStreamingRecycleOnHandoff checks that a stale streaming session is
+// recycled on the next PlayerContext handoff. The call returns a fresh
+// generation, closes the old session, and bumps StreamingRecycles. The deadline
+// is forced into the past so the test does not sleep.
+func TestMinterStreamingRecycleOnHandoff(t *testing.T) {
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		nil, // default fake PlayerContext
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	gen1 := m.Generation()
+	m.ExpireStreamingDeadlineForTest() // the next streaming handoff must recycle
+
+	_, gen2, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if gen2 <= gen1 {
+		t.Errorf("generation = %d, want > %d (stale streaming session recycled on handoff)", gen2, gen1)
+	}
+	if got := m.metrics.StreamingRecycles.Load(); got != 1 {
+		t.Errorf("streaming_recycles = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (recycle relaunched on the handoff)", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if !(*sessions)[0].closed.Load() {
+		t.Error("recycled session should be closed")
+	}
+}
+
+// TestMinterStreamingRecycleNotOnTokenOnly keeps token-only Mint from using the
+// streaming handoff recycle. A stale streaming deadline must not relaunch an
+// otherwise usable session for a bare token request.
+func TestMinterStreamingRecycleNotOnTokenOnly(t *testing.T) {
+	m, launches, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
+		return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
+	})
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	m.ExpireStreamingDeadlineForTest()
+
+	if _, _, err := m.Mint(ctx, "gvs", "vd"); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a token-only mint must not recycle)", got)
+	}
+	if got := m.metrics.StreamingRecycles.Load(); got != 0 {
+		t.Errorf("streaming_recycles = %d, want 0 (no streaming handoff occurred)", got)
 	}
 }
 
@@ -464,6 +524,84 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 	defer smu.Unlock()
 	if (*sessions)[0].closed.Load() {
 		t.Errorf("warm session should survive a client cancel")
+	}
+}
+
+// TestMinterPlayerContextStatus2OneRetryNoRelaunch checks that status-2
+// confirmation failures get one in-place retry and then a refusal, with no
+// relaunch. The warm session remains live and the request-level rejection counter
+// advances once.
+func TestMinterPlayerContextStatus2OneRetryNoRelaunch(t *testing.T) {
+	var calls int64
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			atomic.AddInt64(&calls, 1)
+			return browser.PlayerContext{}, fmt.Errorf("%w: budget expired", browser.ErrStatus2Unconfirmed)
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	_, _, err := m.PlayerContext(ctx, "vid")
+	if err == nil || !errors.Is(err, browser.ErrStatus2Unconfirmed) {
+		t.Fatalf("err = %v, want ErrStatus2Unconfirmed", err)
+	}
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Errorf("session PlayerContext calls = %d, want 2 (initial + one in-place retry)", got)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (status-2 must not relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (no relaunch on status-2)", got)
+	}
+	if got := m.metrics.Status2Rejections.Load(); got != 1 {
+		t.Errorf("status2_rejections = %d, want 1 (one refused request)", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 2 {
+		t.Errorf("player_context_failures = %d, want 2 (both attempts counted)", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Errorf("warm session should survive a status-2 rejection (no relaunch)")
+	}
+}
+
+// TestMinterPlayerContextStatus2TransientClears covers the recovery case: the
+// single in-place retry succeeds, with no relaunch and no rejection counted.
+func TestMinterPlayerContextStatus2TransientClears(t *testing.T) {
+	var calls int64
+	m, launches, _, _ := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			if n := atomic.AddInt64(&calls, 1); n == 1 {
+				return browser.PlayerContext{}, fmt.Errorf("%w: budget expired", browser.ErrStatus2Unconfirmed)
+			}
+			return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	pc, _, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("player-context after transient cleared: %v", err)
+	}
+	if pc.ServerAbrStreamingURL != "https://r/ok" {
+		t.Fatalf("got URL=%q, want https://r/ok", pc.ServerAbrStreamingURL)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (in-place retry, no relaunch)", got)
+	}
+	if got := m.metrics.Status2Rejections.Load(); got != 0 {
+		t.Errorf("status2_rejections = %d, want 0 (retry succeeded)", got)
+	}
+	if got := m.metrics.PlayerContexts.Load(); got != 1 {
+		t.Errorf("player_contexts = %d, want 1", got)
 	}
 }
 

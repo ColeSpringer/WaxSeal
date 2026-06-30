@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -146,17 +147,156 @@ func TestIsUnavailableCode(t *testing.T) {
 
 func TestFullLengthProbeModel(t *testing.T) {
 	outcomes := map[string]bool{
-		OutcomeFullLength:        true,
-		OutcomeTargetNotBuffered: true,
-		OutcomeNotEstablished:    true,
-		OutcomeVideoTooShort:     true,
-		OutcomeCanceled:          true,
+		OutcomeFullLength:         true,
+		OutcomeTargetNotBuffered:  true,
+		OutcomeNotEstablished:     true,
+		OutcomeVideoTooShort:      true,
+		OutcomeCanceled:           true,
+		OutcomeConfirmUnavailable: true,
 	}
-	if len(outcomes) != 5 {
+	if len(outcomes) != 6 {
 		t.Fatalf("outcome constants are not all distinct: %v", outcomes)
 	}
 	if OutcomeFullLength != "full-length" {
 		t.Errorf("OutcomeFullLength = %q, want full-length", OutcomeFullLength)
+	}
+}
+
+// TestConfirmBudgets keeps the re-read budget separate and smaller than the
+// confirm budget. That guards against zero-time re-reads without letting one
+// request run too long.
+func TestConfirmBudgets(t *testing.T) {
+	if playerContextReReadBudget <= 0 {
+		t.Errorf("playerContextReReadBudget = %v, want > 0", playerContextReReadBudget)
+	}
+	if playerContextReReadBudget >= playerContextConfirmBudget {
+		t.Errorf("re-read budget %v should be smaller than confirm budget %v", playerContextReReadBudget, playerContextConfirmBudget)
+	}
+}
+
+// TestSeekTarget covers the length-aware confirmation target. Unknown or invalid
+// lengths use the full-length target; known lengths clamp the target so the
+// tolerance window stays within the video.
+func TestSeekTarget(t *testing.T) {
+	for _, tt := range []struct {
+		length int
+		want   int
+	}{
+		{0, fullLengthTargetSecs},   // unknown length uses the full-length target
+		{-5, fullLengthTargetSecs},  // guard: a bogus negative length is treated as unknown
+		{1, 1 - verifyEndTol},       // tiny videos fall well below the cap (caller treats as cap-safe)
+		{70, 70 - verifyEndTol},     // at the cap
+		{73, 73 - verifyEndTol},     // top of the residual band is 70
+		{74, 74 - verifyEndTol},     // first verifiable length is 71, past the cap
+		{102, 99},                   // just under: clamped down by verifyEndTol
+		{103, fullLengthTargetSecs}, // length-verifyEndTol == target, clamps to target
+		{200, fullLengthTargetSecs}, // long videos use the full-length target
+	} {
+		if got := seekTarget(tt.length); got != tt.want {
+			t.Errorf("seekTarget(%d) = %d, want %d", tt.length, got, tt.want)
+		}
+	}
+	// The unknown-length target must never produce a negative seek.
+	if got := seekTarget(0); got <= 0 {
+		t.Errorf("seekTarget(0) = %d, want a positive target", got)
+	}
+}
+
+// TestClassifyBand pins the confirmation-band boundaries: cap-safe at or below the
+// cap, residual just above it, verify beyond the residual band, and verify for an
+// unknown length.
+func TestClassifyBand(t *testing.T) {
+	for _, tt := range []struct {
+		length int
+		want   confirmBand
+	}{
+		{0, bandVerify},  // unknown length verifies at the full-length target
+		{1, bandCapSafe}, // tiny
+		{previewCapSecs - 1, bandCapSafe},
+		{previewCapSecs, bandCapSafe},                   // at the cap is still cap-safe
+		{previewCapSecs + 1, bandResidual},              // 71: first over-cap length
+		{previewCapSecs + verifyEndTol, bandResidual},   // 73: top of the residual band
+		{previewCapSecs + verifyEndTol + 1, bandVerify}, // 74: first verifiable length
+		{120, bandVerify},
+	} {
+		if got := classifyBand(tt.length); got != tt.want {
+			t.Errorf("classifyBand(%d) = %d, want %d", tt.length, got, tt.want)
+		}
+	}
+}
+
+// TestBufferedReachesEnd pins the residual-band acceptance boundary. A buffer
+// that stops at the preview cap must be refused for every residual length; only a
+// buffer near the real end passes.
+func TestBufferedReachesEnd(t *testing.T) {
+	const cap2 = float64(previewCapSecs) // status-2 streams commonly stop here
+	for _, tt := range []struct {
+		length      int
+		bufferedEnd float64
+		want        bool
+	}{
+		{71, cap2, false}, // status-2 cap: refused for a 71s video
+		{71, 70.4, false}, // still short of the 70.5 threshold
+		{71, 71.0, true},  // status-1 reaches the true end
+		{72, cap2, false}, // status-2 cap: refused
+		{72, 71.4, false}, // just short of the 71.5 threshold
+		{72, 72.0, true},  // status-1
+		{73, cap2, false}, // status-2 cap: refused
+		{73, 72.5, true},  // exactly at the 72.5 threshold
+		{73, 73.0, true},  // status-1
+	} {
+		if got := bufferedReachesEnd(tt.length, tt.bufferedEnd); got != tt.want {
+			t.Errorf("bufferedReachesEnd(%d, %.1f) = %v, want %v", tt.length, tt.bufferedEnd, got, tt.want)
+		}
+	}
+}
+
+// TestConfirmError pins the recovery class for each confirm result: success is
+// nil, a confirm that could not start is relaunchable session trouble, and a
+// confirm that ran but did not clear the cap is ErrStatus2Unconfirmed.
+func TestConfirmError(t *testing.T) {
+	if err := confirmError(FullLengthProbe{FullLength: true, Outcome: OutcomeFullLength}); err != nil {
+		t.Errorf("full-length confirm error = %v, want nil", err)
+	}
+	wedged := confirmError(FullLengthProbe{Outcome: OutcomeConfirmUnavailable, Reason: "movie_player.seekTo unavailable"})
+	if wedged == nil {
+		t.Fatal("wedged-page confirm error = nil, want a relaunch-eligible error")
+	}
+	if errors.Is(wedged, ErrStatus2Unconfirmed) {
+		t.Errorf("wedged-page error must not be ErrStatus2Unconfirmed (it would never relaunch): %v", wedged)
+	}
+	if errors.Is(wedged, ErrUnplayable) {
+		t.Errorf("wedged-page error must not be ErrUnplayable: %v", wedged)
+	}
+	capped := confirmError(FullLengthProbe{Outcome: OutcomeTargetNotBuffered, Reason: "budget expired"})
+	if !errors.Is(capped, ErrStatus2Unconfirmed) {
+		t.Errorf("status-2 confirm error = %v, want ErrStatus2Unconfirmed", capped)
+	}
+}
+
+// TestErrStatus2Unconfirmed verifies that the status-2 sentinel wraps cleanly and
+// stays separate from ErrUnplayable. The minter retries the former in place and
+// negative-caches the latter.
+func TestErrStatus2Unconfirmed(t *testing.T) {
+	wrapped := fmt.Errorf("%w: budget expired", ErrStatus2Unconfirmed)
+	if !errors.Is(wrapped, ErrStatus2Unconfirmed) {
+		t.Error("wrapped status-2 error does not match ErrStatus2Unconfirmed")
+	}
+	if errors.Is(ErrStatus2Unconfirmed, ErrUnplayable) || errors.Is(wrapped, ErrUnplayable) {
+		t.Error("status-2 error must not be classified as ErrUnplayable")
+	}
+}
+
+// TestBufferedSampleDecode guards against drift between playerBufferedJS's output
+// keys and the bufferedSample struct confirmPastCap decodes them into.
+func TestBufferedSampleDecode(t *testing.T) {
+	const payload = `{"current":72.5,"buffered_end":101.2,"covers_target":true,"state":1,"player_error":0,"abr_url":"https://r/x"}`
+	var b bufferedSample
+	if err := json.Unmarshal([]byte(payload), &b); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if b.Current != 72.5 || b.BufferedEnd != 101.2 || !b.CoversTarget || b.State != 1 || b.ABRURL != "https://r/x" {
+		t.Errorf("decoded sample = %+v, want the payload values", b)
 	}
 }
 

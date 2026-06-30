@@ -554,6 +554,80 @@ func TestPlayerContextEchoesGeneration(t *testing.T) {
 	}
 }
 
+// aggregateCounter reads one lifetime counter from the redacted /metrics aggregate
+// (no operator key presented).
+func aggregateCounter(t *testing.T, s *Server, name string) float64 {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d", w.Code)
+	}
+	var resp struct {
+		Aggregate map[string]any `json:"aggregate"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /metrics: %v", err)
+	}
+	v, ok := resp.Aggregate[name].(float64)
+	if !ok {
+		t.Fatalf("/metrics aggregate has no numeric %q (body=%s)", name, w.Body.String())
+	}
+	return v
+}
+
+// TestPlayerContextRecyclesStaleStreamingSession exercises the HTTP boundary
+// after the streaming deadline has passed. The handler recycles the stale
+// session, echoes the new generation, and surfaces the recycle through /metrics.
+// The deadline is forced into the past to keep the test deterministic.
+func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
+	ctx := context.Background()
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
+	if err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	m.ExpireStreamingDeadlineForTest()
+	s := &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["session_generation"] != float64(2) {
+		t.Errorf("session_generation = %v, want 2 (stale streaming session recycled on handoff)", resp["session_generation"])
+	}
+	if got := aggregateCounter(t, s, "streaming_recycles"); got != 1 {
+		t.Errorf("streaming_recycles = %v, want 1", got)
+	}
+}
+
+// TestMetricsSurfacesCacheEvictions confirms that cache_evictions reaches
+// /metrics after a capacity eviction. It ties the minter's unit-covered cache
+// behavior to the operator-visible metrics contract.
+func TestMetricsSurfacesCacheEvictions(t *testing.T) {
+	ctx := context.Background()
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
+	if err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	m.FillCachePastBoundForTest()
+	s := &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+
+	if got := aggregateCounter(t, s, "cache_evictions"); got < 1 {
+		t.Errorf("cache_evictions = %v, want >= 1 (eviction surfaces through /metrics)", got)
+	}
+}
+
 func TestSessionEchoesGeneration(t *testing.T) {
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd-x"}})
 	r := httptest.NewRequest(http.MethodGet, "/session", nil)

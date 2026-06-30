@@ -67,6 +67,13 @@ func (e *UnplayableError) Error() string {
 
 func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 
+// ErrStatus2Unconfirmed reports that WaxSeal could not confirm the requested
+// streaming context past the status-2 preview cap before its deadline. The cap is
+// currently about 70 seconds. These failures are session-local and usually timing
+// related under load, so the minter retries in place and never negative-caches
+// the video.
+var ErrStatus2Unconfirmed = errors.New("waxseal: status-1 streaming not confirmed before deadline")
+
 // Options configure a browser Session. The zero value auto-detects Chromium,
 // runs in the new headless mode, and discards logs.
 type Options struct {
@@ -1013,7 +1020,9 @@ func isUnavailableCode(code int) bool {
 // The returned SABR URL still contains a throttling nonce for the consumer to
 // descramble with PlayerURL.
 //
-// A terminal playabilityStatus returns ErrUnplayable. Playback and visibility
+// A terminal playabilityStatus returns ErrUnplayable. If confirmation cannot
+// clear the status-2 preview cap before the deadline, PlayerContext returns
+// ErrStatus2Unconfirmed instead of a possibly capped URL. Playback and visibility
 // changes are reverted before the shared page is reused.
 func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
 	// A cold status-2 stream can buffer within the preview window. Seek past the
@@ -1025,7 +1034,9 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 	page := s.page.Context(ctx)
 	defer s.revertPlayerContext(ctx)
 
-	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
+	// Establish the requested video and prove its stream crosses the status-2
+	// preview cap before returning the context.
+	raw, err := s.establishStatus1(ctx, page, videoID, playerContextTimeout, playerContextConfirmBudget)
 	if err != nil {
 		return PlayerContext{}, err
 	}
@@ -1136,6 +1147,28 @@ const (
 	fullLengthHardTimeout = 60 * time.Second
 )
 
+// Per-request status-1 confirmation uses a tighter budget than the session proof
+// because it runs before returning the requested video's context.
+const (
+	// previewCapSecs is the documented status-2 "attestation pending" preview
+	// cap. A video no longer than this is fully covered by the preview window.
+	previewCapSecs = 70
+	// verifyEndTol leaves room for fullLengthTolSecs when seeking near the end.
+	// It is fullLengthTolSecs + 1, rounded to a whole second.
+	verifyEndTol = 3
+	// residualEndTol is the end tolerance for short over-cap videos. It is tight
+	// enough that a stream stopped near previewCapSecs cannot pass as full-length.
+	residualEndTol = 0.5
+	// playerContextConfirmBudget bounds the per-request seek-and-confirm. It is
+	// shorter than the session-proof budget because status-2 usually clears within
+	// a few seconds; the remaining room covers CPU contention.
+	playerContextConfirmBudget = 12 * time.Second
+	// playerContextReReadBudget is a separate post-confirm window, so a slow
+	// confirm cannot leave the re-read with no time. Healthy re-reads are
+	// immediate; the budget covers occasional CDP delays.
+	playerContextReReadBudget = 4 * time.Second
+)
+
 const (
 	// OutcomeFullLength means playback reached buffered media beyond the cap.
 	OutcomeFullLength = "full-length"
@@ -1148,6 +1181,10 @@ const (
 	OutcomeVideoTooShort = "video-too-short"
 	// OutcomeCanceled means polling stopped before the probe reached a verdict.
 	OutcomeCanceled = "canceled"
+	// OutcomeConfirmUnavailable means the confirm could not start, for example
+	// because seekTo was unavailable. That points to a wedged page rather than a
+	// status-2 timing condition.
+	OutcomeConfirmUnavailable = "confirm-unavailable"
 )
 
 // playerSeekJS seeks past the preview cap and allows the player to request media at
@@ -1358,57 +1395,103 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 		return probe, nil
 	}
 
-	if seeked, serr := page.Eval(playerSeekJS, fullLengthTargetSecs); serr != nil || !seeked.Bool() {
-		probe.Outcome = OutcomeTargetNotBuffered
+	// The session proof still requires playback progress beyond the target and a
+	// buffer range that covers it.
+	cp, cerr := s.confirmPastCap(ctx, page, fullLengthTargetSecs, fullLengthTolSecs, establishedURL, time.Now().Add(fullLengthProbeBudget),
+		func(b bufferedSample) bool {
+			return b.Current > float64(fullLengthTargetSecs)+fullLengthTolSecs && b.CoversTarget
+		})
+	cp.VideoID = videoID
+	cp.LengthSeconds = raw.LengthSeconds
+	probe = cp
+	finish()
+	return probe, cerr
+}
+
+// bufferedSample is one observation of playback and buffering at the seek target,
+// decoded from playerBufferedJS.
+type bufferedSample struct {
+	Current      float64 `json:"current"`
+	BufferedEnd  float64 `json:"buffered_end"`
+	CoversTarget bool    `json:"covers_target"`
+	State        int     `json:"state"`
+	PlayerError  int     `json:"player_error"`
+	ABRURL       string  `json:"abr_url"`
+	Error        string  `json:"error"`
+}
+
+// confirmPastCap seeks to target and drives muted playback until confirmed accepts
+// a buffered sample, the player reaches a terminal error or stall, or deadline
+// expires. It is shared by the session proof and the per-request gate and does not
+// update LastProof on its own. establishedURL is used only to record whether the
+// player switched SABR URLs during the probe.
+//
+// A failed seek returns OutcomeConfirmUnavailable because the confirm never ran.
+// Only request cancellation is returned as an error; other negative outcomes are
+// encoded in the probe.
+func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int, tol float64, establishedURL string, deadline time.Time, confirmed func(bufferedSample) bool) (FullLengthProbe, error) {
+	// Scope CDP evals to the confirm deadline. The outer ctx still drives
+	// cancellation reporting, keeping caller cancellation distinct from timeout.
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	page = page.Context(dctx)
+
+	probe := FullLengthProbe{TargetSeconds: target}
+	if seeked, serr := page.Eval(playerSeekJS, target); serr != nil || !seeked.Bool() {
+		if ctx.Err() != nil {
+			probe.Outcome = OutcomeCanceled
+			probe.Reason = "confirm canceled during seek: " + ctx.Err().Error()
+			return probe, ctx.Err()
+		}
+		// A failed seek means the page could not run the confirm. Let the caller
+		// relaunch this session instead of classifying it as a capped stream.
+		probe.Outcome = OutcomeConfirmUnavailable
 		if serr != nil {
 			probe.Reason = "seek past the cap failed: " + serr.Error()
 		} else {
 			probe.Reason = "movie_player.seekTo unavailable"
 		}
-		finish()
 		return probe, nil
 	}
 
-	budgetDeadline := time.Now().Add(fullLengthProbeBudget)
 	lastProgressAt := time.Now()
-	var lastCurrent float64
+	var lastCurrent, lastBuffered float64
 	for {
 		select {
 		case <-ctx.Done():
 			// Distinguish a canceled probe from a session that was never probed.
 			probe.Outcome = OutcomeCanceled
 			probe.Reason = "probe canceled before reaching the target: " + ctx.Err().Error()
-			finish()
 			return probe, ctx.Err()
 		case <-time.After(playerContextPollInterval):
 		}
+		// Check the deadline before the next eval so a budget timeout reports the
+		// last observed buffer position instead of a deadline-canceled CDP error.
+		if time.Now().After(deadline) {
+			probe.Outcome = OutcomeTargetNotBuffered
+			probe.Reason = fmt.Sprintf("budget expired at %.1fs/%ds target (state %d, buffered end %.1f)", probe.CurrentSeconds, target, probe.PlayerState, probe.BufferedEnd)
+			return probe, nil
+		}
 		_, _ = page.Eval(playerDriveJS)
-		obj, evalErr := page.Eval(playerBufferedJS, fullLengthTargetSecs, fullLengthTolSecs)
+		obj, evalErr := page.Eval(playerBufferedJS, target, tol)
 		if evalErr != nil {
-			if time.Now().After(budgetDeadline) {
+			if time.Now().After(deadline) {
 				probe.Outcome = OutcomeTargetNotBuffered
 				probe.Reason = "buffered probe eval error: " + evalErr.Error()
-				finish()
 				return probe, nil
 			}
+			// Retry transient CDP failures until the deadline. The debug log keeps
+			// slow confirms visible under load.
+			s.log.Debug("waxseal: confirm-past-cap transient eval error; retrying", "err", evalErr)
 			continue
 		}
-		var b struct {
-			Current      float64 `json:"current"`
-			BufferedEnd  float64 `json:"buffered_end"`
-			CoversTarget bool    `json:"covers_target"`
-			State        int     `json:"state"`
-			PlayerError  int     `json:"player_error"`
-			ABRURL       string  `json:"abr_url"`
-			Error        string  `json:"error"`
-		}
+		var b bufferedSample
 		if jerr := json.Unmarshal([]byte(obj.Str()), &b); jerr != nil {
-			// A malformed payload may be transient, but it must not extend the
-			// configured probe budget.
-			if time.Now().After(budgetDeadline) {
+			// A malformed payload may be transient, but it must not extend past the
+			// deadline.
+			if time.Now().After(deadline) {
 				probe.Outcome = OutcomeTargetNotBuffered
 				probe.Reason = "buffered probe decode error: " + jerr.Error()
-				finish()
 				return probe, nil
 			}
 			continue
@@ -1420,37 +1503,196 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 			probe.ContextURLChanged = true
 		}
 
-		// Require both playback progress and buffered media at the target.
-		if b.Current > float64(fullLengthTargetSecs)+fullLengthTolSecs && b.CoversTarget {
+		if confirmed(b) {
 			probe.Outcome = OutcomeFullLength
 			probe.FullLength = true
-			probe.Reason = fmt.Sprintf("advanced to %.1fs and buffered past the %ds cap", b.Current, fullLengthTargetSecs)
-			finish()
+			probe.Reason = fmt.Sprintf("advanced to %.1fs and buffered to %.1fs past the %ds cap", b.Current, b.BufferedEnd, previewCapSecs)
 			return probe, nil
 		}
 		// A terminal player error will not recover within the probe budget.
 		if b.PlayerError != 0 {
 			probe.Outcome = OutcomeTargetNotBuffered
 			probe.Reason = fmt.Sprintf("player error %d (state %d) at %.1fs before reaching the target", b.PlayerError, b.State, b.Current)
-			finish()
 			return probe, nil
 		}
-		// Use playback progress rather than player state to identify a stall because
-		// transient buffering is normal.
-		if b.Current > lastCurrent+0.25 {
+		// Buffer growth counts as liveness for the per-request gate; a successful
+		// confirm can fill the buffer before currentTime advances.
+		if b.Current > lastCurrent+0.25 || b.BufferedEnd > lastBuffered+0.25 {
 			lastCurrent = b.Current
+			lastBuffered = b.BufferedEnd
 			lastProgressAt = time.Now()
 		} else if time.Since(lastProgressAt) > fullLengthStallWindow {
 			probe.Outcome = OutcomeTargetNotBuffered
-			probe.Reason = fmt.Sprintf("playback stalled at %.1fs (state %d, buffered end %.1f); never reached the %ds target", b.Current, b.State, b.BufferedEnd, fullLengthTargetSecs)
-			finish()
+			probe.Reason = fmt.Sprintf("playback and buffering stalled at %.1fs (state %d, buffered end %.1f); never reached the %ds target", b.Current, b.State, b.BufferedEnd, target)
 			return probe, nil
 		}
-		if time.Now().After(budgetDeadline) {
-			probe.Outcome = OutcomeTargetNotBuffered
-			probe.Reason = fmt.Sprintf("budget expired at %.1fs/%ds target (state %d, buffered end %.1f)", b.Current, fullLengthTargetSecs, b.State, b.BufferedEnd)
-			finish()
-			return probe, nil
+	}
+}
+
+// seekTarget chooses the per-request confirm target for a known video length.
+// Unknown or invalid lengths use the normal full-length target. Known lengths are
+// clamped so target+fullLengthTolSecs stays within the video; targets at or below
+// previewCapSecs are handled by the cap-safe and residual bands.
+func seekTarget(length int) int {
+	if length <= 0 {
+		return fullLengthTargetSecs
+	}
+	if target := length - verifyEndTol; target < fullLengthTargetSecs {
+		return target
+	}
+	return fullLengthTargetSecs
+}
+
+// confirmBand selects how establishStatus1 confirms a video's context.
+type confirmBand int
+
+const (
+	// bandCapSafe means the whole video fits within the preview cap.
+	bandCapSafe confirmBand = iota
+	// bandVerify means a seek target can clear the cap with tolerance room.
+	bandVerify
+	// bandResidual means the video is just over the cap, so confirmation must
+	// reach the true end.
+	bandResidual
+)
+
+// classifyBand chooses the confirm path from LengthSeconds. Unknown length
+// verifies at the full-length target. Known lengths at or below previewCapSecs are
+// cap-safe; the narrow interval above the cap is residual.
+func classifyBand(length int) confirmBand {
+	if length > 0 && length <= previewCapSecs {
+		return bandCapSafe
+	}
+	if seekTarget(length) > previewCapSecs {
+		return bandVerify
+	}
+	return bandResidual
+}
+
+// bufferedReachesEnd accepts a residual-band sample only when buffering reaches
+// the true end within residualEndTol. That keeps a stream stopped near
+// previewCapSecs from passing for any video longer than the cap.
+func bufferedReachesEnd(length int, bufferedEnd float64) bool {
+	return bufferedEnd >= float64(length)-residualEndTol
+}
+
+// establishStatus1 establishes the requested video and returns its context only
+// after the stream is safe from the status-2 preview cap. It returns
+// ErrStatus2Unconfirmed when the confirm runs but does not clear the cap before
+// confirmBudget expires.
+//
+// LengthSeconds controls the confirm path:
+//   - length <= previewCapSecs: the whole video fits in the preview window.
+//   - seekTarget(length) > previewCapSecs: seek past the cap, require buffered
+//     media beyond the target, then re-read the transitioned context.
+//   - previewCapSecs < length <= previewCapSecs+verifyEndTol: no seek target can
+//     clear the cap with tolerance room, so require buffering to reach the true
+//     end.
+//
+// Unknown length verifies at the full-length target. This fails closed for live,
+// premiere, or otherwise unreadable durations: long content can still confirm,
+// while short unknown-length content is refused and left to the consumer fallback.
+func (s *Session) establishStatus1(ctx context.Context, page *cdp.Page, videoID string, establishBudget, confirmBudget time.Duration) (playerContextRaw, error) {
+	raw, err := s.establish(ctx, page, videoID, time.Now().Add(establishBudget))
+	if err != nil {
+		return playerContextRaw{}, err
+	}
+	length := raw.LengthSeconds
+	establishedURL := raw.ServerAbrStreamingURL
+
+	switch classifyBand(length) {
+	case bandCapSafe:
+		// A preview covers the full video, so the URL cannot truncate.
+		return raw, nil
+	case bandVerify:
+		// Buffering past the target is the status-2 discriminator. Do not require
+		// strict playback advance here; under load, the buffer can prove the
+		// transition before currentTime moves.
+		return s.confirmAndReRead(ctx, page, videoID, seekTarget(length), establishedURL, confirmBudget,
+			func(b bufferedSample) bool { return b.CoversTarget })
+	default: // bandResidual
+		// For the narrow over-cap band, seek at the cap and require the buffer to
+		// reach the true end.
+		return s.confirmAndReRead(ctx, page, videoID, previewCapSecs, establishedURL, confirmBudget,
+			func(b bufferedSample) bool { return bufferedReachesEnd(length, b.BufferedEnd) })
+	}
+}
+
+// confirmAndReRead runs the per-request confirmation, maps the result to the
+// minter recovery class, then returns a fresh context after the player
+// transitions. OutcomeConfirmUnavailable becomes a generic error so the minter
+// can use its normal relaunch path. A probe that ran but did not clear the cap
+// becomes ErrStatus2Unconfirmed, which is retried in place and not relaunched.
+//
+// The re-read has its own small budget so a slow confirm does not starve a
+// healthy post-transition extraction.
+func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID string, target int, establishedURL string, confirmBudget time.Duration, confirmed func(bufferedSample) bool) (playerContextRaw, error) {
+	cp, cerr := s.confirmPastCap(ctx, page, target, fullLengthTolSecs, establishedURL, time.Now().Add(confirmBudget), confirmed)
+	if cerr != nil {
+		return playerContextRaw{}, cerr // canceled
+	}
+	if err := confirmError(cp); err != nil {
+		return playerContextRaw{}, err
+	}
+	return s.reReadContext(ctx, page, videoID, time.Now().Add(playerContextReReadBudget))
+}
+
+// confirmError maps a completed confirm probe to the minter recovery class. A
+// confirm that could not start is relaunchable session trouble. A confirm that
+// ran and failed to clear the cap is ErrStatus2Unconfirmed.
+func confirmError(cp FullLengthProbe) error {
+	switch {
+	case cp.FullLength:
+		return nil
+	case cp.Outcome == OutcomeConfirmUnavailable:
+		return fmt.Errorf("waxseal: player-context: confirm could not run: %s", cp.Reason)
+	default:
+		return fmt.Errorf("%w: %s", ErrStatus2Unconfirmed, cp.Reason)
+	}
+}
+
+// reReadContext extracts a fresh player context after status-1 confirmation so
+// callers receive the post-transition serverAbrStreamingUrl and format list. The
+// video is already loaded and buffered, so a short retry budget is enough for
+// transient CDP errors. A terminal playability transition during this window
+// returns ErrUnplayable for normal negative caching.
+func (s *Session) reReadContext(ctx context.Context, page *cdp.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	page = page.Context(dctx)
+
+	evalErrs := 0
+	for {
+		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
+		if evalErr != nil {
+			evalErrs++
+			if evalErrs >= 3 || time.Now().After(deadline) {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context re-read: %w", evalErr)
+			}
+			// A transient CDP error is retried; surface it at debug so a slow re-read is
+			// diagnosable under load.
+			s.log.Debug("waxseal: player-context re-read transient eval error; retrying", "err", evalErr, "attempt", evalErrs)
+		} else {
+			var raw playerContextRaw
+			if err := json.Unmarshal([]byte(obj.Str()), &raw); err != nil {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context re-read parse: %w", err)
+			}
+			// A video that went terminal between confirm and re-read must surface as
+			// ErrUnplayable, not a generic re-read failure, so it is negative-cached.
+			if ue, ok := confirmTerminal(raw, videoID); ok {
+				return playerContextRaw{}, ue
+			}
+			if raw.Error == "" {
+				return raw, nil
+			}
+			if time.Now().After(deadline) {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context re-read: %s", raw.Error)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return playerContextRaw{}, ctx.Err()
+		case <-time.After(playerContextPollInterval):
 		}
 	}
 }

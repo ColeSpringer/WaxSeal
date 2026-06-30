@@ -95,6 +95,10 @@ type minterMetrics struct {
 	Crashes               atomic.Int64
 	PlayerContexts        atomic.Int64
 	PlayerContextFailures atomic.Int64 // failed attempts and negative-cache hits
+	// Status2Rejections counts refused requests where a player context could not
+	// be confirmed beyond the status-2 cap. Attempts are counted by
+	// PlayerContextFailures; this counter is once per request.
+	Status2Rejections atomic.Int64
 
 	// Session recycles are separated by cause.
 	StreamingRecycles    atomic.Int64 // time-based recycle on a streaming handoff
@@ -517,6 +521,15 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, gen, err
 	}
 
+	// Status-2 confirmation failures are timing related, not evidence of a dead
+	// session. After the single in-place retry, refuse the request without
+	// relaunching; a relaunch under load tends to worsen this condition.
+	// playerContextStop has already counted both failed attempts.
+	if errors.Is(err, browser.ErrStatus2Unconfirmed) {
+		m.metrics.Status2Rejections.Add(1)
+		return browser.PlayerContext{}, gen, err
+	}
+
 	// level 2: escalate to a relaunch and re-attest on a fresh session.
 	m.metrics.Escalations.Add(1)
 	m.retire(gen, "player-context failed twice; relaunching", false)
@@ -797,6 +810,7 @@ var lifetimeCounterKeys = []string{
 	"escalations",
 	"player_contexts",
 	"player_context_failures",
+	"status2_rejections",
 	"crashes",
 	"cache_hits",
 	"cache_misses",
@@ -819,6 +833,7 @@ func (m *Minter) counterValues() map[string]int64 {
 		"escalations":                        m.metrics.Escalations.Load(),
 		"player_contexts":                    m.metrics.PlayerContexts.Load(),
 		"player_context_failures":            m.metrics.PlayerContextFailures.Load(),
+		"status2_rejections":                 m.metrics.Status2Rejections.Load(),
 		"crashes":                            m.metrics.Crashes.Load(),
 		"cache_hits":                         m.metrics.CacheHits.Load(),
 		"cache_misses":                       m.metrics.CacheMisses.Load(),

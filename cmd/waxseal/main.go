@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -59,9 +60,39 @@ func newRootCmd() *cobra.Command {
 	// wrapping validators so their usage errors also exit with code 2.
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
+	hardenHelpCompletionExitCodes(root)
 	// Apply shared error handling after building the complete command tree.
 	wrapUsageErrors(root)
 	return root
+}
+
+// hardenHelpCompletionExitCodes brings Cobra's generated help and completion
+// commands under the same usage-error policy as the rest of the CLI. Cobra builds
+// them outside our command constructors, so we locate them by name after the
+// default commands are initialized and before wrapUsageErrors runs.
+func hardenHelpCompletionExitCodes(root *cobra.Command) {
+	for _, c := range root.Commands() {
+		switch c.Name() {
+		case "help":
+			// `help` is runnable, so Cobra validates Args. Bare help and real command
+			// topics pass; unknown topics or extra words become usage errors.
+			c.Args = func(cmd *cobra.Command, args []string) error {
+				if len(args) == 0 {
+					return nil
+				}
+				_, remaining, _ := cmd.Root().Find(args)
+				if len(remaining) > 0 {
+					return fmt.Errorf("unknown help topic %q", strings.Join(args, " "))
+				}
+				return nil
+			}
+		case "completion":
+			// The completion parent owns Cobra's NoArgs validator, but without Run it
+			// prints help and exits 0 before validation. Making it runnable routes stray
+			// words through NoArgs.
+			c.Run = func(cmd *cobra.Command, _ []string) { _ = cmd.Help() }
+		}
+	}
 }
 
 // buildLogger builds a slog logger at the given level, writing to w (stderr for

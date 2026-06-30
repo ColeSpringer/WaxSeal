@@ -75,6 +75,10 @@ func TestExecuteUsageErrors(t *testing.T) {
 		{"URL positional", []string{"player-context", "https://youtu.be/x"}, 2, "not a URL"},
 		// newRootCmd initializes Cobra's completion commands before wrapping validators.
 		{"too many args to completion", []string{"completion", "bash", "extra"}, 2, "waxseal: "},
+		// Help and completion reject bad input with exit 2 like the other commands.
+		{"unknown help topic", []string{"help", "frobnicate"}, 2, "waxseal: "},
+		{"help with a trailing word", []string{"help", "server", "extra"}, 2, "waxseal: "},
+		{"unknown completion shell", []string{"completion", "not-a-shell"}, 2, "waxseal: "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -84,6 +88,24 @@ func TestExecuteUsageErrors(t *testing.T) {
 			}
 			if !strings.Contains(stderr, tt.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr, tt.wantStderr)
+			}
+		})
+	}
+}
+
+// TestHelpCompletionExitZero keeps valid help and completion invocations on
+// exit 0 while invalid inputs use the normal usage-error path.
+func TestHelpCompletionExitZero(t *testing.T) {
+	for _, args := range [][]string{
+		{"help"},               // root help
+		{"help", "server"},     // help for a real subcommand
+		{"completion"},         // runnable parent prints instructions
+		{"completion", "bash"}, // a valid shell generates a script
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			code, _, stderr := runCLI(args...)
+			if code != 0 {
+				t.Errorf("exit = %d, want 0 (stderr=%q)", code, stderr)
 			}
 		})
 	}
