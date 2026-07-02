@@ -22,7 +22,7 @@ docker compose up -d  # pulls ghcr.io/colespringer/waxseal and starts on 127.0.0
 ```
 
 That pulls the `:latest` tag; pin a release with `WAXSEAL_VERSION`, for example
-`WAXSEAL_VERSION=1.0.0 docker compose up`. To build the image from source instead
+`WAXSEAL_VERSION=1.0.0 docker compose up -d`. To build the image from source instead
 of pulling, run `make docker-build` first; it tags the same name locally.
 
 The container is ready when its healthcheck passes. The daemon binds its socket

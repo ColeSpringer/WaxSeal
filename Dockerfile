@@ -27,9 +27,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # runtime
 FROM debian:bookworm-slim
+# Chromium renders WebGL with its own bundled SwiftShader because --disable-gpu is
+# set, so the system Mesa/LLVM software-GL stack is never loaded at runtime.
+# chromium-common declares those packages as a dependency, so force-purge them after
+# the install to drop ~158 MB. The daemon never runs apt again, so the unmet-
+# dependency note this leaves in the dpkg database has no runtime effect.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
+ && dpkg --purge --force-depends libgl1-mesa-dri libllvm15 libz3-4 \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with a writable HOME (the browser profile lives under $HOME).
