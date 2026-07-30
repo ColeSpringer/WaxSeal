@@ -8,9 +8,9 @@
     "build": "node build-browser.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.28.0"
   },
   "dependencies": {
-    "bgutils-js": "^3.2.0"
+    "bgutils-js": "^4.0.2"
   }
 }

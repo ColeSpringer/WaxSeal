@@ -7,7 +7,10 @@
  * Exposes runBotguard, newMinter, and mint on globalThis for calls from Go via
  * page.Eval. All HTTP requests remain in Go.
  */
-import { BG } from 'bgutils-js';
+// bgutils-js is subpath-exported and has no root entry, so the BotGuard client
+// and the minter are imported from their own paths.
+import { BotGuardClient } from 'bgutils-js/botguard';
+import { WebPoMinter } from 'bgutils-js/webpo';
 
 const G = globalThis;
 
@@ -32,10 +35,10 @@ defHidden('runBotguard', async (interpreterJavascript, program, globalName) => {
   // Requires script-src 'unsafe-eval'; Go sets Page.setBypassCSP(true) before this.
   new Function(interpreterJavascript)();
 
-  const botguard = await BG.BotGuardClient.create({
+  const botguard = await BotGuardClient.create({
     program,
     globalName,
-    globalObj: G,
+    globalObject: G,
   });
 
   webPoSignalOutput = [];
@@ -52,7 +55,7 @@ defHidden('runBotguard', async (interpreterJavascript, program, globalName) => {
  * @returns {Promise<boolean>}
  */
 defHidden('newMinter', async (integrityToken) => {
-  minter = await BG.WebPoMinter.create({ integrityToken }, webPoSignalOutput);
+  minter = await WebPoMinter.create({ integrityToken }, webPoSignalOutput);
   return true;
 });
 

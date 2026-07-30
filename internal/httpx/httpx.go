@@ -1,6 +1,12 @@
 // Package httpx provides WaxSeal's Google-facing HTTP behavior. It wraps a
 // caller's HTTP client with bounded retries, jittered backoff, Retry-After
 // handling, and response size limits.
+//
+// No pause outlasts the caller's deadline. A backoff that would consume the
+// remaining budget is skipped and the failure that provoked it is returned
+// instead, so the cause reaches the caller rather than a bare context timeout
+// that names nothing. MaxDelay is the absolute cap on a pause; this is the
+// per-request one.
 package httpx
 
 import (
@@ -56,6 +62,11 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 			// or a rewind (GetBody) failure. A cancellation must pass through so the
 			// caller's errors.Is(err, context.Canceled) still holds; a rewind failure
 			// should not mask the original transport error that triggered the retry.
+			//
+			// The wait is not where a deadline strands the cause: pauseBlocked has
+			// already refused any pause the deadline cannot outlast, so the wait ends
+			// early only on cancellation. Deadline handling is kept here for the
+			// degenerate case of a wait that overruns its own budget.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err
 			}
@@ -72,6 +83,10 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 				return nil, err
 			}
 			delay = c.backoff(attempt)
+			// The deadline would swallow the retry: report the transport error.
+			if berr := pauseBlocked(req.Context(), delay, err); berr != nil {
+				return nil, berr
+			}
 			c.logRetry(req, attempt, 0, delay, err)
 			continue
 		}
@@ -81,6 +96,11 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 			lastErr, lastCode = fmt.Errorf("status %d", resp.StatusCode), resp.StatusCode
 			delay = c.retryDelay(resp, attempt)
 			resp.Body.Close()
+			// A Retry-After the deadline cannot accommodate is reported as the status
+			// it came with, rather than slept into a timeout that hides the throttling.
+			if berr := pauseBlocked(req.Context(), delay, lastErr); berr != nil {
+				return nil, berr
+			}
 			c.logRetry(req, attempt, resp.StatusCode, delay, nil)
 			continue
 		}
@@ -97,6 +117,10 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 				return nil, readErr
 			}
 			delay = c.backoff(attempt)
+			// The deadline would swallow the retry: report the read failure.
+			if berr := pauseBlocked(req.Context(), delay, readErr); berr != nil {
+				return nil, berr
+			}
 			c.logRetry(req, attempt, code, delay, readErr)
 			continue
 		}
@@ -122,6 +146,43 @@ func ReadBodyCapped(r io.Reader, maxBody int64) ([]byte, error) {
 		return nil, ErrBodyTooLarge
 	}
 	return data, nil
+}
+
+// retryHeadroom is the slack a pause must leave for the attempt it exists to
+// enable. Sleeping down to the wire buys a request that cannot finish, and the
+// deadline then masks the real cause all over again.
+//
+// A second is sized for what this package talks to. Every caller is Google-facing
+// over TLS, so a retry that gets less than that essentially cannot complete, and
+// shrinking the headroom would only trade a typed error for the bare timeout this
+// exists to prevent. It costs those callers nothing, because the budgets it is
+// measured against are whole minutes: the server's 3-minute request timeout, the
+// 120s warm path, the 100s ping path. A local, millisecond-scale endpoint would
+// want a smaller value, but this package serves none.
+//
+// Only a deadline on the request's context counts. The 60s on the browser
+// session's http.Client is a Timeout, which bounds each attempt separately and
+// never reaches req.Context().Deadline(), so nothing here can observe it. Resize
+// against the caller contexts above, not against that.
+const retryHeadroom = time.Second
+
+// pauseBlocked returns the error to report instead of pausing for d, or nil when
+// the pause may proceed. pending is the failure the caller is already holding,
+// the one that provoked this retry.
+//
+// Cancellation outranks pending. A context canceled while a request was failing
+// is a caller giving up, which the CLI maps to exit 130; reporting it as a 502
+// would both misclassify it and lose the interrupt. An expired or too-short
+// deadline is the opposite case, and the one this exists for: pending is exactly
+// what explains that timeout, so it is returned in place of a bare context error.
+func pauseBlocked(ctx context.Context, d time.Duration, pending error) error {
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= d+retryHeadroom {
+		return pending
+	}
+	return nil
 }
 
 func (c *Client) backoff(attempt int) time.Duration {

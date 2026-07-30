@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -128,6 +129,7 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 			"title":                           "Big Buck Bunny",
 			"author":                          "Blender",
 			"length_seconds":                  634,
+			"session_generation":              7,
 			"audio_formats": []map[string]any{{
 				"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
 				"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
@@ -151,6 +153,11 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 	}
 	if pc.Title != "Big Buck Bunny" || pc.Author != "Blender" || pc.LengthSeconds != 634 {
 		t.Errorf("metadata: title=%q author=%q len=%d", pc.Title, pc.Author, pc.LengthSeconds)
+	}
+	// Without the generation WaxTap cannot name this context's session in a report,
+	// so a capped stream would have no escape.
+	if pc.Generation != 7 {
+		t.Errorf("generation = %d, want 7", pc.Generation)
 	}
 	if len(pc.AudioFormats) != 1 {
 		t.Fatalf("audio formats = %d, want 1", len(pc.AudioFormats))
@@ -210,8 +217,9 @@ func TestProvidePlayerContextRejects(t *testing.T) {
 func TestSessionAdapts(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"visitor_data": "VD",
-			"cookies":      []map[string]any{{"name": "YSC", "value": "a", "secure": true, "http_only": true}},
+			"visitor_data":       "VD",
+			"cookies":            []map[string]any{{"name": "YSC", "value": "a", "secure": true, "http_only": true}},
+			"session_generation": 4,
 		})
 	})
 	defer done()
@@ -222,5 +230,278 @@ func TestSessionAdapts(t *testing.T) {
 	}
 	if s.VisitorData != "VD" || len(s.Cookies) != 1 || s.Cookies[0].Name != "YSC" {
 		t.Fatalf("session = %+v", s)
+	}
+	// The generation is what a later InvalidateSession names, so an adopted session
+	// googlevideo caps can be retired instead of stranding the download.
+	if s.Generation != 4 {
+		t.Errorf("generation = %d, want 4", s.Generation)
+	}
+}
+
+// reportRequest is the /report body the daemon receives.
+type reportRequest struct {
+	SessionGeneration uint64 `json:"session_generation"`
+	VideoID           string `json:"video_id"`
+	Reason            string `json:"reason"`
+}
+
+// TestInvalidateSessionOutcomes pins the mapping from the daemon's /report reply
+// to what WaxTap concludes. A nil error tells WaxTap the session is gone and it
+// may re-resolve; an error tells it to keep the one it has.
+func TestInvalidateSessionOutcomes(t *testing.T) {
+	tests := []struct {
+		name    string
+		reply   map[string]any
+		wantErr bool
+	}{
+		// The daemon closed the session immediately.
+		{"retired", map[string]any{"accepted": true, "retired": true, "generation": 9}, false},
+		// Queued for the next streaming handoff, which is the next /session or
+		// /player-context call, so the replacement still arrives before WaxTap uses it.
+		{"retirement pending", map[string]any{"accepted": true, "retirement_pending": true, "generation": 9}, false},
+		// Rejected as stale: the session named is already gone, which is the outcome
+		// the caller asked for.
+		{"stale generation", map[string]any{"accepted": false, "generation": 12}, false},
+		// The daemon is asking for backoff and the current session survives, so
+		// reporting success would hand WaxTap the same capped session back.
+		{"rate limited", map[string]any{"accepted": false, "generation": 9, "retry_after_seconds": 20}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got reportRequest
+			p, done := newProvider(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&got)
+				_ = json.NewEncoder(w).Encode(tt.reply)
+			})
+			defer done()
+
+			err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{
+				Generation: 9, VideoID: "VID", Reason: "delivery-cap",
+			})
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if got.SessionGeneration != 9 || got.VideoID != "VID" || got.Reason != "delivery-cap" {
+				t.Errorf("report body = %+v, want generation 9, video VID, reason delivery-cap", got)
+			}
+		})
+	}
+}
+
+// A daemon that cannot be reached leaves the session in place rather than
+// reporting a retirement that never happened.
+func TestInvalidateSessionDaemonError(t *testing.T) {
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer done()
+
+	if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{Generation: 9}); err == nil {
+		t.Fatal("want an error when the daemon rejects the report")
+	}
+}
+
+// An unversioned session cannot be named in a report, so the call fails locally
+// rather than posting a request the daemon would reject.
+func TestInvalidateSessionWithoutGeneration(t *testing.T) {
+	called := false
+	p, done := newProvider(func(http.ResponseWriter, *http.Request) { called = true })
+	defer done()
+
+	if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{VideoID: "VID"}); err == nil {
+		t.Fatal("want an error for a zero generation")
+	}
+	if called {
+		t.Error("a zero generation must not reach the daemon")
+	}
+}
+
+// strictReportServer mimics the daemon's /report validation: it 400s a request
+// carrying a video_id or reason outside ^[A-Za-z0-9_-]{1,64}$, and records every
+// body it received.
+func strictReportServer(t *testing.T, got *[]reportRequest) (*httptest.Server, *bytes.Buffer, *provider.Provider) {
+	t.Helper()
+	ok := regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req reportRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		*got = append(*got, req)
+		for _, f := range []string{req.VideoID, req.Reason} {
+			if f != "" && !ok.MatchString(f) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "bad field", "code": "invalid-request"})
+				return
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true, "retired": true, "generation": 9})
+	}))
+	buf := &bytes.Buffer{}
+	return srv, buf, provider.New(client.New(srv.URL), provider.WithLogger(slog.New(slog.NewTextHandler(buf, nil))))
+}
+
+// A diagnostic the daemon refuses must not decide whether a capped session is
+// retired. Rather than pre-screening against a copy of the daemon's rules, the
+// provider lets it answer and retries naming only the generation.
+func TestInvalidateSessionRetriesWithoutRejectedDiagnostics(t *testing.T) {
+	tests := []struct {
+		name string
+		inv  potoken.SessionInvalidation
+	}{
+		{"reason", potoken.SessionInvalidation{Generation: 9, Reason: "capped: 403 past 1 MB"}},
+		{"video id", potoken.SessionInvalidation{Generation: 9, VideoID: "https://youtu.be/x", Reason: "delivery-cap"}},
+		{"both", potoken.SessionInvalidation{Generation: 9, VideoID: "bad id", Reason: "bad reason"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []reportRequest
+			srv, buf, p := strictReportServer(t, &got)
+			defer srv.Close()
+
+			if err := p.InvalidateSession(context.Background(), tt.inv); err != nil {
+				t.Fatalf("InvalidateSession: %v", err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("daemon saw %d reports, want 2 (rejected then bare)", len(got))
+			}
+			if got[1].SessionGeneration != 9 || got[1].VideoID != "" || got[1].Reason != "" {
+				t.Errorf("retry body = %+v, want generation 9 alone", got[1])
+			}
+			// The offending text is the diagnosis; a length would not show a stray
+			// space or colon.
+			log := buf.String()
+			if tt.inv.Reason != "" && !strings.Contains(log, tt.inv.Reason) {
+				t.Errorf("log = %q, want the rejected reason text", log)
+			}
+			if tt.inv.VideoID != "" && !strings.Contains(log, tt.inv.VideoID) {
+				t.Errorf("log = %q, want the rejected video_id text", log)
+			}
+		})
+	}
+}
+
+// A 400 on a report that named no diagnostic cannot be fixed by dropping them,
+// so it surfaces instead of costing a second round trip.
+func TestInvalidateSessionBareRejectionIsNotRetried(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "nope", "code": "invalid-request"})
+	}))
+	defer srv.Close()
+	p := provider.New(client.New(srv.URL))
+
+	if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{Generation: 9}); err == nil {
+		t.Fatal("want the daemon's rejection to surface")
+	}
+	if hits != 1 {
+		t.Errorf("daemon saw %d reports, want 1 (nothing to drop and retry)", hits)
+	}
+}
+
+// A rejection that is not the daemon refusing a field surfaces as-is: dropping
+// diagnostics cannot fix a 500, and retrying would double the load on a daemon
+// already failing.
+func TestInvalidateSessionNonBadRequestIsNotRetried(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	p := provider.New(client.New(srv.URL))
+
+	err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{
+		Generation: 9, VideoID: "VID", Reason: "delivery-cap",
+	})
+	if err == nil {
+		t.Fatal("want the daemon error to surface")
+	}
+	if hits != 1 {
+		t.Errorf("daemon saw %d reports, want 1", hits)
+	}
+}
+
+// Echoing a rejected field back must not let it forge log lines. slog's handlers
+// escape it, so this pins the end-to-end property rather than the mechanism.
+func TestInvalidateSessionPreviewStaysOneLine(t *testing.T) {
+	var got []reportRequest
+	srv, buf, p := strictReportServer(t, &got)
+	defer srv.Close()
+
+	if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{
+		Generation: 9, Reason: "capped\nlevel=ERROR msg=spoofed",
+	}); err != nil {
+		t.Fatalf("InvalidateSession: %v", err)
+	}
+	log := buf.String()
+	if strings.Count(log, "\n") != 1 {
+		t.Errorf("log = %q, want a single line (the newline must arrive escaped)", log)
+	}
+	if !strings.Contains(log, `\n`) {
+		t.Errorf("log = %q, want the newline escaped rather than dropped", log)
+	}
+}
+
+// A long rejected field is truncated so one report cannot flood the log.
+func TestInvalidateSessionPreviewTruncates(t *testing.T) {
+	var got []reportRequest
+	srv, buf, p := strictReportServer(t, &got)
+	defer srv.Close()
+
+	long := strings.Repeat("é", 300) // multi-byte, so a byte-wise cut would mangle it
+	if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{
+		Generation: 9, Reason: long,
+	}); err != nil {
+		t.Fatalf("InvalidateSession: %v", err)
+	}
+	log := buf.String()
+	if strings.Contains(log, long) {
+		t.Error("log carried the whole reason, want it truncated")
+	}
+	if !strings.Contains(log, "...") {
+		t.Errorf("log = %q, want a truncated preview", log)
+	}
+	if strings.ContainsRune(log, '�') {
+		t.Errorf("log = %q, want no replacement rune from a mid-rune cut", log)
+	}
+}
+
+// ProvideSession is the arm WaxTap can invalidate: it type-asserts
+// SessionInvalidator on the SessionProvider it was configured with, so a session
+// adopted any other way cannot be rotated when googlevideo caps it.
+func TestProvideSessionCarriesGeneration(t *testing.T) {
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"visitor_data":       "VD",
+			"cookies":            []map[string]any{{"name": "YSC", "value": "a"}},
+			"session_generation": 4,
+		})
+	})
+	defer done()
+
+	s, err := p.ProvideSession(context.Background())
+	if err != nil {
+		t.Fatalf("ProvideSession: %v", err)
+	}
+	if s.VisitorData != "VD" || len(s.Cookies) != 1 || s.Generation != 4 {
+		t.Fatalf("session = %+v, want VD with one cookie and generation 4", s)
+	}
+	// The pairing is the point: a provider WaxTap can pull from must also be one it
+	// can report to.
+	var sp potoken.SessionProvider = p
+	if _, ok := sp.(potoken.SessionInvalidator); !ok {
+		t.Fatal("the session provider must also be a SessionInvalidator")
+	}
+}
+
+func TestProvideSessionPropagatesError(t *testing.T) {
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer done()
+
+	if _, err := p.ProvideSession(context.Background()); err == nil {
+		t.Fatal("want the daemon error to surface")
 	}
 }

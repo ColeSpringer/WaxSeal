@@ -1,34 +1,15 @@
-// GENERATED - do not edit. Source: build/js/browser_entrypoint.js and bgutils-js@3.2.0.
-// Rebuild: make jsbundle-browser (esbuild@0.25.12).
+// GENERATED - do not edit. Source: build/js/browser_entrypoint.js and bgutils-js@4.0.2.
+// Rebuild: make jsbundle-browser (esbuild@0.28.1).
 (() => {
   var __defProp = Object.defineProperty;
-  var __export = (target, all) => {
-    for (var name in all)
-      __defProp(target, name, { get: all[name], enumerable: true });
+  var __typeError = (msg) => {
+    throw TypeError(msg);
   };
-
-  // node_modules/bgutils-js/dist/core/index.js
-  var core_exports = {};
-  __export(core_exports, {
-    BotGuardClient: () => BotGuardClient,
-    Challenge: () => challengeFetcher_exports,
-    PoToken: () => webPoClient_exports,
-    WebPoMinter: () => WebPoMinter
-  });
-
-  // node_modules/bgutils-js/dist/core/challengeFetcher.js
-  var challengeFetcher_exports = {};
-  __export(challengeFetcher_exports, {
-    create: () => create,
-    descramble: () => descramble,
-    parseChallengeData: () => parseChallengeData
-  });
-
-  // node_modules/bgutils-js/dist/utils/constants.js
-  var GOOG_BASE_URL = "https://jnn-pa.googleapis.com";
-  var YT_BASE_URL = "https://www.youtube.com";
-  var GOOG_API_KEY = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw";
-  var USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36(KHTML, like Gecko)";
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+  var __accessCheck = (obj, member, msg) => member.has(obj) || __typeError("Cannot " + msg);
+  var __privateGet = (obj, member, getter) => (__accessCheck(obj, member, "read from private field"), getter ? getter.call(obj) : member.get(obj));
+  var __privateAdd = (obj, member, value) => member.has(obj) ? __typeError("Cannot add the same private member more than once") : member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
 
   // node_modules/bgutils-js/dist/utils/helpers.js
   var base64urlCharRegex = /[-_.]/g;
@@ -39,17 +20,20 @@
   };
   var DeferredPromise = class {
     constructor() {
+      __publicField(this, "promise");
+      __publicField(this, "resolve");
+      __publicField(this, "reject");
       this.promise = new Promise((resolve, reject) => {
         this.resolve = resolve;
         this.reject = reject;
       });
     }
   };
-  var BGError = class extends TypeError {
-    constructor(code, message, info) {
+  var BgError = class extends TypeError {
+    constructor(message, info) {
       super(message);
-      this.name = "BGError";
-      this.code = code;
+      __publicField(this, "info");
+      this.name = "BgError";
       if (info)
         this.info = info;
     }
@@ -73,105 +57,116 @@
     }
     return result;
   }
-  function isBrowser() {
-    const isBrowser2 = typeof window !== "undefined" && typeof window.document !== "undefined" && typeof window.document.createElement !== "undefined" && typeof window.HTMLElement !== "undefined" && typeof window.navigator !== "undefined" && typeof window.getComputedStyle === "function" && typeof window.requestAnimationFrame === "function" && typeof window.matchMedia === "function";
-    const hasValidWindow = Object.getOwnPropertyDescriptor(globalThis, "window")?.get?.toString().includes("[native code]") ?? false;
-    return isBrowser2 && hasValidWindow;
-  }
-  function getHeaders() {
-    const headers = {
-      "content-type": "application/json+protobuf",
-      "x-goog-api-key": GOOG_API_KEY,
-      "x-user-agent": "grpc-web-javascript/0.1"
-    };
-    if (!isBrowser()) {
-      headers["user-agent"] = USER_AGENT;
+
+  // node_modules/bgutils-js/dist/utils/EventEmitterLike.js
+  var _listeners, _onceWrappers;
+  var EventEmitterLike = class {
+    constructor() {
+      __privateAdd(this, _listeners, /* @__PURE__ */ new Map());
+      __privateAdd(this, _onceWrappers, /* @__PURE__ */ new Map());
     }
-    return headers;
-  }
-  function buildURL(endpointName, useYouTubeAPI) {
-    return `${useYouTubeAPI ? YT_BASE_URL : GOOG_BASE_URL}/${useYouTubeAPI ? "api/jnn/v1" : "$rpc/google.internal.waa.v1.Waa"}/${endpointName}`;
-  }
-
-  // node_modules/bgutils-js/dist/core/challengeFetcher.js
-  async function create(bgConfig, interpreterHash) {
-    const requestKey = bgConfig.requestKey;
-    if (!bgConfig.fetch)
-      throw new BGError("BAD_CONFIG", "No fetch function provided");
-    const payload = [requestKey];
-    if (interpreterHash)
-      payload.push(interpreterHash);
-    const response = await bgConfig.fetch(buildURL("Create", bgConfig.useYouTubeAPI), {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok)
-      throw new BGError("REQUEST_FAILED", "Failed to fetch challenge", { status: response.status });
-    const rawData = await response.json();
-    return parseChallengeData(rawData);
-  }
-  function parseChallengeData(rawData) {
-    let challengeData = [];
-    if (rawData.length > 1 && typeof rawData[1] === "string") {
-      const descrambled = descramble(rawData[1]);
-      challengeData = JSON.parse(descrambled || "[]");
-    } else if (rawData.length && typeof rawData[0] === "object") {
-      challengeData = rawData[0];
+    emit(type, ...args) {
+      const listeners = __privateGet(this, _listeners).get(type);
+      if (!listeners || listeners.size === 0)
+        return;
+      for (const listener of [...listeners]) {
+        listener(...args);
+      }
     }
-    const [messageId, wrappedScript, wrappedUrl, interpreterHash, program, globalName, , clientExperimentsStateBlob] = challengeData;
-    const privateDoNotAccessOrElseSafeScriptWrappedValue = Array.isArray(wrappedScript) ? wrappedScript.find((value) => value && typeof value === "string") : null;
-    const privateDoNotAccessOrElseTrustedResourceUrlWrappedValue = Array.isArray(wrappedUrl) ? wrappedUrl.find((value) => value && typeof value === "string") : null;
-    return {
-      messageId,
-      interpreterJavascript: {
-        privateDoNotAccessOrElseSafeScriptWrappedValue,
-        privateDoNotAccessOrElseTrustedResourceUrlWrappedValue
-      },
-      interpreterHash,
-      program,
-      globalName,
-      clientExperimentsStateBlob
-    };
-  }
-  function descramble(scrambledChallenge) {
-    const buffer = base64ToU8(scrambledChallenge);
-    if (buffer.length)
-      return new TextDecoder().decode(buffer.map((b) => b + 97));
-  }
+    on(type, listener) {
+      let listeners = __privateGet(this, _listeners).get(type);
+      if (!listeners) {
+        listeners = /* @__PURE__ */ new Set();
+        __privateGet(this, _listeners).set(type, listeners);
+      }
+      listeners.add(listener);
+    }
+    once(type, listener) {
+      const wrapper = (...args) => {
+        this.off(type, listener);
+        listener(...args);
+      };
+      let wrappersByType = __privateGet(this, _onceWrappers).get(listener);
+      if (!wrappersByType) {
+        wrappersByType = /* @__PURE__ */ new Map();
+        __privateGet(this, _onceWrappers).set(listener, wrappersByType);
+      }
+      wrappersByType.set(type, wrapper);
+      this.on(type, wrapper);
+    }
+    off(type, listener) {
+      const listeners = __privateGet(this, _listeners).get(type);
+      if (!listeners)
+        return;
+      let target = listener;
+      const wrappersByType = __privateGet(this, _onceWrappers).get(listener);
+      if (wrappersByType) {
+        const onceWrapper = wrappersByType.get(type);
+        if (onceWrapper) {
+          target = onceWrapper;
+          wrappersByType.delete(type);
+          if (wrappersByType.size === 0)
+            __privateGet(this, _onceWrappers).delete(listener);
+        }
+      }
+      listeners.delete(target);
+      if (listeners.size === 0)
+        __privateGet(this, _listeners).delete(type);
+    }
+    removeAllListeners(type) {
+      if (!type) {
+        __privateGet(this, _listeners).clear();
+        __privateGet(this, _onceWrappers).clear();
+        return;
+      }
+      __privateGet(this, _listeners).delete(type);
+      for (const [listener, wrappersByType] of __privateGet(this, _onceWrappers).entries()) {
+        wrappersByType.delete(type);
+        if (wrappersByType.size === 0)
+          __privateGet(this, _onceWrappers).delete(listener);
+      }
+    }
+  };
+  _listeners = new WeakMap();
+  _onceWrappers = new WeakMap();
 
-  // node_modules/bgutils-js/dist/core/webPoClient.js
-  var webPoClient_exports = {};
-  __export(webPoClient_exports, {
-    decodeColdStartToken: () => decodeColdStartToken,
-    generate: () => generate,
-    generateColdStartToken: () => generateColdStartToken,
-    generatePlaceholder: () => generatePlaceholder
-  });
-
-  // node_modules/bgutils-js/dist/core/botGuardClient.js
-  var BotGuardClient = class _BotGuardClient {
+  // node_modules/bgutils-js/dist/core/BotGuardClient.js
+  var BotGuardClient = class _BotGuardClient extends EventEmitterLike {
     constructor(options) {
-      this.deferredVmFunctions = new DeferredPromise();
-      this.defaultTimeout = 3e3;
+      super();
+      __publicField(this, "vm");
+      __publicField(this, "program");
+      __publicField(this, "userInteractionElement");
+      __publicField(this, "syncSnapshotFunction");
+      __publicField(this, "deferredVmFunctions", new DeferredPromise());
+      __publicField(this, "defaultTimeout", 3e3);
+      if (!options.globalObject || !options.globalName || !options.program) {
+        throw new BgError("Invalid options", { options });
+      }
       this.userInteractionElement = options.userInteractionElement;
-      this.vm = options.globalObj[options.globalName];
+      this.vm = options.globalObject[options.globalName];
       this.program = options.program;
+    }
+    on(type, listener) {
+      super.on(type, listener);
+    }
+    off(type, listener) {
+      super.off(type, listener);
     }
     /**
      * Factory method to create and load a BotGuardClient instance.
      * @param options - Configuration options for the BotGuardClient.
-     * @returns A promise that resolves to a loaded BotGuardClient instance.
+     * @returns A loaded BotGuardClient instance.
      */
     static async create(options) {
       return await new _BotGuardClient(options).load();
     }
     async load() {
       if (!this.vm)
-        throw new BGError("VM_INIT", "VM not found");
+        throw new BgError("EGOU: BotGuard unavailable");
       if (!this.vm.a)
-        throw new BGError("VM_INIT", "VM init function not found");
-      const vmFunctionsCallback = (asyncSnapshotFunction, shutdownFunction, passEventFunction, checkCameraFunction) => {
+        throw new BgError("ELIU: BotGuard initialization function unavailable");
+      const vmSetupCallback = (asyncSnapshotFunction, shutdownFunction, passEventFunction, checkCameraFunction) => {
         this.deferredVmFunctions.resolve({
           asyncSnapshotFunction,
           shutdownFunction,
@@ -179,13 +174,62 @@
           checkCameraFunction
         });
       };
+      const logEvent = (event, elapsedTime) => {
+        this.emit("record-bg-event", { event, elapsedTime });
+      };
+      const incrementClientErrorCount = (errorCode) => {
+        this.emit("increment-client-error-count", { errorCode });
+      };
+      const recordPayloadSize = (payloadSize) => {
+        this.emit("record-payload-size", { payloadSize });
+      };
+      const recordLatency = (latency, et) => {
+        this.emit("record-latency", { latency, et });
+      };
+      const incrementEventCount = (event) => {
+        this.emit("increment-bg-event-count", { event });
+      };
+      const loggerFunctions = [
+        logEvent,
+        incrementClientErrorCount,
+        recordPayloadSize,
+        recordLatency,
+        incrementEventCount
+      ];
+      const vmTelemetryCallback = (latency, eventFlag1, eventFlag2) => {
+        let event = "k";
+        if (eventFlag1) {
+          event = "h";
+        } else if (eventFlag2) {
+          event = "u";
+        }
+        incrementEventCount(event);
+        logEvent(event, latency);
+      };
       try {
-        this.syncSnapshotFunction = await this.vm.a(this.program, vmFunctionsCallback, true, this.userInteractionElement, () => {
-        }, [[], []])[0];
+        this.syncSnapshotFunction = await this.vm.a(this.program, vmSetupCallback, true, this.userInteractionElement, vmTelemetryCallback, [[], []], void 0, false, loggerFunctions)?.[0];
       } catch (error) {
-        throw new BGError("VM_ERROR", "Could not load program", { error });
+        throw new BgError("Could not load program", { error });
       }
       return this;
+    }
+    /**
+     * Calls a VM function with a timeout.
+     * @param vmFunctionName - The name of the VM function to execute.
+     * @param timeout - The timeout in milliseconds.
+     * @param args - The arguments to pass to the VM function.
+     */
+    async execute(vmFunctionName, timeout, ...args) {
+      return await Promise.race([
+        (async () => {
+          const vmFunctions = await this.deferredVmFunctions.promise;
+          const vmFunction = vmFunctions[vmFunctionName];
+          if (!vmFunction)
+            throw new BgError(`${vmFunctionName} function not found`);
+          return vmFunction(...args);
+        })(),
+        new Promise((_, reject) => setTimeout(() => reject(new BgError("VM operation timed out")), timeout))
+      ]);
     }
     /**
      * Takes a snapshot asynchronously.
@@ -203,75 +247,41 @@
      * console.log(result);
      * ```
      */
-    async snapshot(args, timeout = 3e3) {
-      return await Promise.race([
-        new Promise(async (resolve, reject) => {
-          const vmFunctions = await this.deferredVmFunctions.promise;
-          if (!vmFunctions.asyncSnapshotFunction)
-            return reject(new BGError("ASYNC_SNAPSHOT", "Asynchronous snapshot function not found"));
-          await vmFunctions.asyncSnapshotFunction((response) => resolve(response), [
-            args.contentBinding,
-            args.signedTimestamp,
-            args.webPoSignalOutput,
-            args.skipPrivacyBuffer
-          ]);
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new BGError("TIMEOUT", "VM operation timed out")), timeout))
-      ]);
+    async snapshot(args, timeout = this.defaultTimeout) {
+      return await new Promise(async (resolve, reject) => {
+        await this.execute("asyncSnapshotFunction", timeout, (response) => resolve(response), [
+          args.contentBinding,
+          args.signedTimestamp,
+          args.webPoSignalOutput,
+          args.skipPrivacyBuffer
+        ]).catch(reject);
+      });
     }
     /**
      * Passes an event to the VM.
-     * @throws Error Throws an error if the pass event function is not found.
      */
     async passEvent(args, timeout = this.defaultTimeout) {
-      return await Promise.race([
-        (async () => {
-          const vmFunctions = await this.deferredVmFunctions.promise;
-          if (!vmFunctions.passEventFunction)
-            throw new BGError("PASS_EVENT", "Pass event function not found");
-          vmFunctions.passEventFunction(args);
-        })(),
-        new Promise((_, reject) => setTimeout(() => reject(new BGError("TIMEOUT", "VM operation timed out")), timeout))
-      ]);
+      return this.execute("passEventFunction", timeout, args);
     }
     /**
      * Checks the "camera".
-     * @throws Error Throws an error if the check camera function is not found.
      */
     async checkCamera(args, timeout = this.defaultTimeout) {
-      return await Promise.race([
-        (async () => {
-          const vmFunctions = await this.deferredVmFunctions.promise;
-          if (!vmFunctions.checkCameraFunction)
-            throw new BGError("CHECK_CAMERA", "Check camera function not found");
-          vmFunctions.checkCameraFunction(args);
-        })(),
-        new Promise((_, reject) => setTimeout(() => reject(new BGError("TIMEOUT", "VM operation timed out")), timeout))
-      ]);
+      return this.execute("checkCameraFunction", timeout, args);
     }
     /**
-     * Shuts down the VM. Taking a snapshot after this will throw an error.
-     * @throws Error Throws an error if the shutdown function is not found.
+     * Shuts down the VM. Once called, the VM is no longer usable.
      */
     async shutdown(timeout = this.defaultTimeout) {
-      return await Promise.race([
-        (async () => {
-          const vmFunctions = await this.deferredVmFunctions.promise;
-          if (!vmFunctions.shutdownFunction)
-            throw new BGError("SHUTDOWN", "Shutdown function not found");
-          vmFunctions.shutdownFunction();
-        })(),
-        new Promise((_, reject) => setTimeout(() => reject(new BGError("TIMEOUT", "VM operation timed out")), timeout))
-      ]);
+      return this.execute("shutdownFunction", timeout);
     }
     /**
      * Takes a snapshot synchronously.
      * @returns The snapshot result.
-     * @throws Error Throws an error if the synchronous snapshot function is not found.
      */
     async snapshotSynchronous(args) {
       if (!this.syncSnapshotFunction)
-        throw new BGError("SYNC_SNAPSHOT", "Synchronous snapshot function not found");
+        throw new BgError("Synchronous snapshot function not found");
       return this.syncSnapshotFunction([
         args.contentBinding,
         args.signedTimestamp,
@@ -281,117 +291,48 @@
     }
   };
 
-  // node_modules/bgutils-js/dist/core/webPoMinter.js
+  // node_modules/bgutils-js/dist/core/WebPoMinter.js
   var WebPoMinter = class _WebPoMinter {
     constructor(mintCallback) {
+      __publicField(this, "mintCallback");
       this.mintCallback = mintCallback;
     }
+    /**
+     * Factory method to create a WebPoMinter instance.
+     * @param integrityTokenResponse - The integrity token response object.
+     * @param webPoSignalOutput - The output array containing the minter function.
+     */
     static async create(integrityTokenResponse, webPoSignalOutput2) {
       const getMinter = webPoSignalOutput2[0];
       if (!getMinter)
-        throw new BGError("VM_ERROR", "PMD:Undefined");
+        throw new BgError("PMD:Undefined");
       if (!integrityTokenResponse.integrityToken)
-        throw new BGError("INTEGRITY_ERROR", "No integrity token provided", { integrityTokenResponse });
+        throw new BgError("No integrity token provided", { integrityTokenResponse });
       const mintCallback = await getMinter(base64ToU8(integrityTokenResponse.integrityToken));
       if (!(mintCallback instanceof Function))
-        throw new BGError("VM_ERROR", "APF:Failed");
+        throw new BgError("APF:Failed");
       return new _WebPoMinter(mintCallback);
     }
-    async mintAsWebsafeString(identifier) {
-      const result = await this.mint(identifier);
-      return u8ToBase64(result, true);
+    /**
+     * Mints a proof and returns it as a web-safe base64 string.
+     * @param contentBinding - A Visitor ID, Video ID, or Data Sync ID.
+     */
+    async mintAsWebsafeString(contentBinding) {
+      return u8ToBase64(await this.mint(contentBinding), true);
     }
-    async mint(identifier) {
-      const result = await this.mintCallback(new TextEncoder().encode(identifier));
+    /**
+     * Mints a proof and returns it as a Uint8Array.
+     * @param contentBinding - A Visitor ID, Video ID, or Data Sync ID.
+     */
+    async mint(contentBinding) {
+      const result = await this.mintCallback(new TextEncoder().encode(contentBinding));
       if (!result)
-        throw new BGError("VM_ERROR", "YNJ:Undefined");
+        throw new BgError("YNJ:Undefined");
       if (!(result instanceof Uint8Array))
-        throw new BGError("VM_ERROR", "ODM:Invalid");
+        throw new BgError("ODM:Invalid");
       return result;
     }
   };
-
-  // node_modules/bgutils-js/dist/core/webPoClient.js
-  async function generate(args) {
-    const { program, bgConfig, globalName } = args;
-    const { identifier } = bgConfig;
-    const botguard = await BotGuardClient.create({ program, globalName, globalObj: bgConfig.globalObj });
-    const webPoSignalOutput2 = [];
-    const botguardResponse = await botguard.snapshot({ webPoSignalOutput: webPoSignalOutput2 });
-    const payload = [bgConfig.requestKey, botguardResponse];
-    const integrityTokenResponse = await bgConfig.fetch(buildURL("GenerateIT", bgConfig.useYouTubeAPI), {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify(payload)
-    });
-    const integrityTokenJson = await integrityTokenResponse.json();
-    const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] = integrityTokenJson;
-    const integrityTokenData = {
-      integrityToken,
-      estimatedTtlSecs,
-      mintRefreshThreshold,
-      websafeFallbackToken
-    };
-    const webPoMinter = await WebPoMinter.create(integrityTokenData, webPoSignalOutput2);
-    const poToken = await webPoMinter.mintAsWebsafeString(identifier);
-    return { poToken, integrityTokenData };
-  }
-  function generateColdStartToken(identifier, clientState) {
-    const encodedIdentifier = new TextEncoder().encode(identifier);
-    if (encodedIdentifier.length > 118)
-      throw new BGError("BAD_INPUT", "Content binding is too long.", { identifierLength: encodedIdentifier.length });
-    const timestamp = Math.floor(Date.now() / 1e3);
-    const randomKeys = [Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)];
-    const header = randomKeys.concat([
-      0,
-      clientState ?? 1
-    ], [
-      timestamp >> 24 & 255,
-      timestamp >> 16 & 255,
-      timestamp >> 8 & 255,
-      timestamp & 255
-    ]);
-    const packet = new Uint8Array(2 + header.length + encodedIdentifier.length);
-    packet[0] = 34;
-    packet[1] = header.length + encodedIdentifier.length;
-    packet.set(header, 2);
-    packet.set(encodedIdentifier, 2 + header.length);
-    const payload = packet.subarray(2);
-    const keyLength = randomKeys.length;
-    for (let i = keyLength; i < payload.length; i++) {
-      payload[i] ^= payload[i % keyLength];
-    }
-    return u8ToBase64(packet, true);
-  }
-  function generatePlaceholder(identifier, clientState) {
-    return generateColdStartToken(identifier, clientState);
-  }
-  function decodeColdStartToken(token) {
-    const packet = base64ToU8(token);
-    const payloadLength = packet[1];
-    const totalPacketLength = 2 + payloadLength;
-    if (packet.length !== totalPacketLength)
-      throw new BGError("BAD_INPUT", "Invalid packet length.", { packetLength: packet.length, expectedLength: totalPacketLength });
-    const payload = packet.subarray(2);
-    const keyLength = 2;
-    for (let i = keyLength; i < payload.length; ++i) {
-      payload[i] ^= payload[i % keyLength];
-    }
-    const keys = [payload[0], payload[1]];
-    const unknownVal = payload[2];
-    const clientState = payload[3];
-    const timestamp = payload[4] << 24 | payload[5] << 16 | payload[6] << 8 | payload[7];
-    const date = new Date(timestamp * 1e3);
-    const identifier = new TextDecoder().decode(payload.subarray(8));
-    return {
-      identifier,
-      timestamp,
-      unknownVal,
-      clientState,
-      keys,
-      date
-    };
-  }
 
   // browser_entrypoint.js
   var G = globalThis;
@@ -400,17 +341,17 @@
   var minter;
   defHidden("runBotguard", async (interpreterJavascript, program, globalName) => {
     new Function(interpreterJavascript)();
-    const botguard = await core_exports.BotGuardClient.create({
+    const botguard = await BotGuardClient.create({
       program,
       globalName,
-      globalObj: G
+      globalObject: G
     });
     webPoSignalOutput = [];
     const botguardResponse = await botguard.snapshot({ webPoSignalOutput });
     return botguardResponse;
   });
   defHidden("newMinter", async (integrityToken) => {
-    minter = await core_exports.WebPoMinter.create({ integrityToken }, webPoSignalOutput);
+    minter = await WebPoMinter.create({ integrityToken }, webPoSignalOutput);
     return true;
   });
   defHidden("mint", async (identifier) => {

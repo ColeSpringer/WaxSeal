@@ -214,6 +214,100 @@ func TestDoJSONCanceledDuringBackoffReturnsContextCanceled(t *testing.T) {
 	}
 }
 
+// A backoff that cannot fit before the deadline must be skipped, and the status
+// that provoked it reported, rather than slept into a bare context timeout that
+// names no cause. The server is hit once: the retry the pause existed for could
+// not have completed anyway.
+func TestDoJSONDeadlineTooShortReportsStatus(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := New(srv.Client())
+	c.MaxDelay = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req = req.WithContext(ctx)
+
+	start := time.Now()
+	_, err := c.DoJSON(req, 1<<10)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the 429 status, not a bare deadline", err)
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("err = %v, want it to name status 429", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("returned after %v, want an immediate fail-fast (no backoff sleep)", elapsed)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("server hit %d times, want 1 (the retry cannot fit the deadline)", got)
+	}
+}
+
+// A deadline with room to spare must still back off and retry: the fail-fast is
+// scoped to pauses the caller's budget cannot absorb, not to deadlines generally.
+func TestDoJSONRoomyDeadlineStillRetries(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.Client())
+	c.BaseDelay = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req = req.WithContext(ctx)
+
+	body, err := c.DoJSON(req, 1<<10)
+	if err != nil {
+		t.Fatalf("DoJSON: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body = %q", body)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("server hit %d times, want 2 (503 then ok)", got)
+	}
+}
+
+// A transport error on a context too close to its deadline surfaces as that
+// error, not as the timeout the skipped backoff would have run into.
+func TestDoJSONDeadlineTooShortReportsTransportError(t *testing.T) {
+	transportErr := errors.New("connection reset")
+	var calls int32
+	c := New(&http.Client{Transport: errRoundTripper{err: transportErr, calls: &calls}})
+	c.BaseDelay = 3 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequest(http.MethodGet, "http://example.invalid/", nil)
+	req = req.WithContext(ctx)
+
+	_, err := c.DoJSON(req, 1<<10)
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("err = %v, want the transport error %v", err, transportErr)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("transport calls = %d, want 1 (the retry cannot fit the deadline)", got)
+	}
+}
+
 func TestDoNoRetryOnCanceledContext(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

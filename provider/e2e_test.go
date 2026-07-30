@@ -219,19 +219,24 @@ func TestSessionOnlyFullLengthHTTP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	sess, err := p.Session(ctx)
+	sess, err := p.ProvideSession(ctx)
 	if err != nil {
 		t.Fatalf("session handoff: %v", err)
 	}
 	if sess.VisitorData == "" {
 		t.Fatalf("daemon returned an empty visitor_data")
 	}
+	// Without a generation the daemon's session cannot be named in a report, so a
+	// delivery cap on it would have no escape.
+	if sess.Generation == 0 {
+		t.Fatalf("daemon returned no session_generation")
+	}
 
 	jar, _ := cookiejar.New(nil)
 	tap, err := waxtap.New(waxtap.Options{
 		HTTPClient:      &http.Client{Jar: jar, Timeout: 120 * time.Second},
 		POTokenProvider: p,         // GVS token only; no player-context provider
-		Session:         sess,      // adopt the established identity
+		SessionProvider: p,         // the adoption arm WaxTap can invalidate when googlevideo caps it
 		Client:          clientWeb, // uniform client chain is required for session adoption
 	})
 	if err != nil {
