@@ -4,8 +4,8 @@ github.com/colespringer/waxflow v0.0.0-20260730025520-35107bc1aae3 h1:mPA8bbswsA
 github.com/colespringer/waxflow v0.0.0-20260730025520-35107bc1aae3/go.mod h1:8mAo9F494kAckHAdJRd6xQa3xJsjOYhy+6C096s1ans=
 github.com/colespringer/waxlabel v1.2.0 h1:QJEQ6o6pdcMUv9a7aH13tQii7uY08PntOb1MmlMwXCw=
 github.com/colespringer/waxlabel v1.2.0/go.mod h1:vNfr3pXMymG1dBnoMJc7/1JFdtmHBP+8Jhz5dYlriyA=
-github.com/colespringer/waxtap/v3 v3.0.1 h1:t7Aig0oGKZiQ3DrpYzVcmyDx4yrnU5xKZv5S9Q+tntU=
-github.com/colespringer/waxtap/v3 v3.0.1/go.mod h1:9ePlg9Ak6WGlkk83YKlwkR3LTEeGI0gQH23aXh26vXM=
+github.com/colespringer/waxtap/v3 v3.1.0 h1:a2U0eDvzBNBImdlZY6Dpeevkl0s7fM3/yTX962jAtxY=
+github.com/colespringer/waxtap/v3 v3.1.0/go.mod h1:9ePlg9Ak6WGlkk83YKlwkR3LTEeGI0gQH23aXh26vXM=
 github.com/dlclark/regexp2/v2 v2.5.2 h1:HAsucWRhsqcDzl6Ua9aR8JwYOTzrZyPrF0/FNxJVAI0=
 github.com/dlclark/regexp2/v2 v2.5.2/go.mod h1:avUrQvPaLz2DrFNHJF0taWAFFX2C1GMSSoeiqFjcBmU=
 github.com/dop251/goja v0.0.0-20260723142020-b4aef50fa347 h1:RZr+96+PKQjn444QL1K9MtncwJ/PwfE+3TJLCYJL8es=
