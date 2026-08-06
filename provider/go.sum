@@ -1,11 +1,11 @@
 github.com/Masterminds/semver/v3 v3.5.0 h1:kQceYJfbupGfZOKZQg0kou0DgAKhzDg2NZPAwZ/2OOE=
 github.com/Masterminds/semver/v3 v3.5.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
-github.com/colespringer/waxflow v0.0.0-20260730025520-35107bc1aae3 h1:mPA8bbswsA8EYPXwTYu5Wq2TBDq6XD6cq6QeH7C9jEE=
-github.com/colespringer/waxflow v0.0.0-20260730025520-35107bc1aae3/go.mod h1:8mAo9F494kAckHAdJRd6xQa3xJsjOYhy+6C096s1ans=
-github.com/colespringer/waxlabel v1.2.0 h1:QJEQ6o6pdcMUv9a7aH13tQii7uY08PntOb1MmlMwXCw=
-github.com/colespringer/waxlabel v1.2.0/go.mod h1:vNfr3pXMymG1dBnoMJc7/1JFdtmHBP+8Jhz5dYlriyA=
-github.com/colespringer/waxtap/v3 v3.1.0 h1:a2U0eDvzBNBImdlZY6Dpeevkl0s7fM3/yTX962jAtxY=
-github.com/colespringer/waxtap/v3 v3.1.0/go.mod h1:9ePlg9Ak6WGlkk83YKlwkR3LTEeGI0gQH23aXh26vXM=
+github.com/colespringer/waxflow v0.0.0-20260805235143-c6100344a117 h1:4iRvkJuNI18YDPencTG4hvDcHea0wdYZ2PtbEzgb41M=
+github.com/colespringer/waxflow v0.0.0-20260805235143-c6100344a117/go.mod h1:8mAo9F494kAckHAdJRd6xQa3xJsjOYhy+6C096s1ans=
+github.com/colespringer/waxlabel v1.3.0 h1:It/LIyZ4X8FGSWpgHbFPLcYkQsuNxMQcT/UWKTISjfU=
+github.com/colespringer/waxlabel v1.3.0/go.mod h1:vNfr3pXMymG1dBnoMJc7/1JFdtmHBP+8Jhz5dYlriyA=
+github.com/colespringer/waxtap/v3 v3.1.2 h1:D8KWaRD2sGsfnnbcQ/jG9fv+jFxDhq83yha1Jl9ovZ4=
+github.com/colespringer/waxtap/v3 v3.1.2/go.mod h1:NbdV6llSfjoWHKaAduNZxXpYQS1bb1kktLkXAGi5bHc=
 github.com/dlclark/regexp2/v2 v2.5.2 h1:HAsucWRhsqcDzl6Ua9aR8JwYOTzrZyPrF0/FNxJVAI0=
 github.com/dlclark/regexp2/v2 v2.5.2/go.mod h1:avUrQvPaLz2DrFNHJF0taWAFFX2C1GMSSoeiqFjcBmU=
 github.com/dop251/goja v0.0.0-20260723142020-b4aef50fa347 h1:RZr+96+PKQjn444QL1K9MtncwJ/PwfE+3TJLCYJL8es=
