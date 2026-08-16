@@ -4,12 +4,12 @@ go 1.26
 
 require (
 	github.com/colespringer/waxseal v0.0.0-00010101000000-000000000000
-	github.com/colespringer/waxtap/v3 v3.1.2
+	github.com/colespringer/waxtap/v3 v3.1.3
 )
 
 require (
-	github.com/colespringer/waxflow v0.0.0-20260805235143-c6100344a117 // indirect
-	github.com/colespringer/waxlabel v1.3.0 // indirect
+	github.com/colespringer/waxflow v0.0.0-20260816051810-ba4adcdb22b9 // indirect
+	github.com/colespringer/waxlabel v1.4.2 // indirect
 	github.com/dlclark/regexp2/v2 v2.5.2 // indirect
 	github.com/dop251/goja v0.0.0-20260723142020-b4aef50fa347 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
