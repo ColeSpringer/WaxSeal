@@ -1472,6 +1472,11 @@ func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.Retired { // retires gen 1; sess→nil, gen stays 1
 		t.Fatalf("first report = %+v, want Retired", res)
 	}
+	// Drain the report budget so the rate-limit predicate is also true for the
+	// re-report, which is what makes the case ordering below observable.
+	m.mu.Lock()
+	m.reportTokens = 0
+	m.mu.Unlock()
 	// Report gen 1 again before any request relaunches the session.
 	res := m.ReportDegraded(1, "vid", "cap")
 	if res.Accepted || res.Generation != 1 {
@@ -1483,16 +1488,19 @@ func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	if got := m.metrics.DegradationReportsRejectedStale.Load(); got != 0 {
 		t.Errorf("degradation_reports_rejected_stale = %d, want 0 (current gen, not stale)", got)
 	}
-	// The sess==nil case must precede the debounce case: a report-driven retire sets
-	// lastReportRetireAt, so this re-report also satisfies the debounce predicate.
-	// A miscount here (rate_limited == 1) would mean the switch was reordered.
+	// The sess==nil case must precede the rate-limit case: with the budget drained
+	// above, this re-report also satisfies the rate-limit predicate. A miscount
+	// here (rate_limited == 1) would mean the switch was reordered.
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 0 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 0 (already-retired must not route to debounce)", got)
 	}
 }
 
-// A second report within the debounce window is rate-limited.
-func TestMinterReportDegradedRateLimited(t *testing.T) {
+// Report-driven recycles allow a burst of ReportBurst before rate-limiting, so
+// a consumer whose bulk-enumeration throttle escape rotates identities several
+// times in one run is never declined mid-sequence. The report after the burst
+// is rate-limited with a positive retry hint.
+func TestMinterReportBurstThenRateLimited(t *testing.T) {
 	m, _, _, _ := newStreamingMinter(0, func(string) (browser.PlayerContext, error) {
 		return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
 	})
@@ -1500,18 +1508,23 @@ func TestMinterReportDegradedRateLimited(t *testing.T) {
 	if err := m.Warm(ctx); err != nil { // gen 1
 		t.Fatalf("warm: %v", err)
 	}
-	if res := m.ReportDegraded(1, "vid", "cap"); !res.Retired { // retires gen 1, starts debounce
-		t.Fatalf("first report = %+v, want Retired", res)
+	for gen := uint64(1); gen <= ReportBurst; gen++ {
+		if res := m.ReportDegraded(gen, "vid", "cap"); !res.Retired {
+			t.Fatalf("report %d = %+v, want Retired (within the burst allowance)", gen, res)
+		}
+		if _, g, err := m.PlayerContext(ctx, "vid"); err != nil || g != gen+1 { // relaunch
+			t.Fatalf("relaunch %d: gen=%d err=%v, want gen=%d", gen, g, err, gen+1)
+		}
 	}
-	if _, gen, err := m.PlayerContext(ctx, "vid"); err != nil || gen != 2 { // relaunch, gen 2 live
-		t.Fatalf("relaunch: gen=%d err=%v, want gen=2", gen, err)
-	}
-	res := m.ReportDegraded(2, "vid", "cap") // within debounce
+	res := m.ReportDegraded(ReportBurst+1, "vid", "cap") // budget spent
 	if res.Accepted || res.RetryAfterSeconds <= 0 {
-		t.Fatalf("within-debounce report = %+v, want !Accepted and RetryAfterSeconds>0", res)
+		t.Fatalf("report past the burst = %+v, want !Accepted and RetryAfterSeconds>0", res)
 	}
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 1 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 1", got)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != ReportBurst {
+		t.Errorf("report_driven_recycles = %d, want %d", got, ReportBurst)
 	}
 }
 
@@ -1593,9 +1606,15 @@ func TestMinterReportDuplicateWhilePending(t *testing.T) {
 	}
 }
 
-// A deferred report-driven retirement starts the debounce window.
-func TestMinterReportDeferredStartsDebounce(t *testing.T) {
+// A deferred report-driven retirement spends report budget just like an
+// immediate one. With a single token left, the handoff's deferred retire
+// consumes it, so the next report is rate-limited.
+func TestMinterReportDeferredConsumesBudget(t *testing.T) {
 	m, _, _, release, done := startBlockingPlayerContext(t)
+
+	m.mu.Lock()
+	m.reportTokens = 1 // the deferred retire below spends the last token
+	m.mu.Unlock()
 
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
 		t.Fatalf("report while busy = %+v, want RetirementPending", res)
@@ -1609,7 +1628,7 @@ func TestMinterReportDeferredStartsDebounce(t *testing.T) {
 	}
 	res := m.ReportDegraded(2, "vid", "cap")
 	if res.Accepted || res.RetryAfterSeconds <= 0 {
-		t.Fatalf("report after a deferred retire = %+v, want rate limited (the deferred path must start the debounce)", res)
+		t.Fatalf("report after a deferred retire = %+v, want rate limited (the deferred path must spend report budget)", res)
 	}
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 1 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 1", got)
@@ -1652,11 +1671,11 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 	}
 }
 
-// A report that loses the retire race to another goroutine must not arm the
-// debounce. lastReportRetireAt advances only when this report actually recycled
+// A report that loses the retire race to another goroutine must not spend
+// report budget. A token is consumed only when this report actually recycled
 // the session. Running several rounds makes the race show up without relying on
 // timing.
-func TestMinterReportNoopRetireDoesNotArmDebounce(t *testing.T) {
+func TestMinterReportNoopRetireDoesNotSpendBudget(t *testing.T) {
 	for round := 0; round < 200; round++ {
 		m, _, _, _ := newStreamingMinter(0, nil)
 		if err := m.Warm(context.Background()); err != nil { // gen 1
@@ -1670,11 +1689,13 @@ func TestMinterReportNoopRetireDoesNotArmDebounce(t *testing.T) {
 		wg.Wait()
 
 		m.mu.Lock()
-		armed := !m.lastReportRetireAt.IsZero()
+		spent := m.reportTokens < ReportBurst
 		m.mu.Unlock()
-		// The debounce is armed only when this report's own retire succeeded.
-		if armed != res.Retired {
-			t.Fatalf("round %d: debounce armed=%v but report Retired=%v (a no-op retire must not arm the debounce)", round, armed, res.Retired)
+		// Budget is spent only when this report's own retire succeeded. Refill
+		// cannot mask a spend here: it tops out at ReportBurst, and a consumed
+		// token cannot re-accrue within a test round under the 5m default.
+		if spent != res.Retired {
+			t.Fatalf("round %d: budget spent=%v but report Retired=%v (a no-op retire must not spend report budget)", round, spent, res.Retired)
 		}
 	}
 }
@@ -2047,7 +2068,9 @@ func TestMinterMetricsRecycleSecondsClampedAtZero(t *testing.T) {
 	}
 }
 
-// ReportDebounce controls when a subsequent report is accepted.
+// ReportDebounce controls how fast spent report budget refills: one token per
+// window, so with the budget drained a report is accepted only once a full
+// window has passed.
 func TestMinterReportDebounceConfigurable(t *testing.T) {
 	m := NewMinter("v", browser.Options{}, 0, 250*time.Millisecond)
 	m.launch = func(context.Context) (minterSession, error) { return &fakeSession{mint: okMint}, nil }
@@ -2055,19 +2078,21 @@ func TestMinterReportDebounceConfigurable(t *testing.T) {
 	if err := m.Warm(ctx); err != nil { // gen 1
 		t.Fatalf("warm: %v", err)
 	}
-	// A report 200ms after retirement is within the 250ms window.
+	// 200ms of refill on a drained budget is 0.8 tokens under a 250ms window.
 	m.mu.Lock()
-	m.lastReportRetireAt = time.Now().Add(-200 * time.Millisecond)
+	m.reportTokens = 0
+	m.reportRefillAt = time.Now().Add(-200 * time.Millisecond)
 	m.mu.Unlock()
 	if res := m.ReportDegraded(1, "vid", "cap"); res.Accepted {
-		t.Fatalf("report 200ms after a retire = %+v, want rate limited under a 250ms debounce", res)
+		t.Fatalf("report 200ms after draining the budget = %+v, want rate limited under a 250ms debounce", res)
 	}
-	// A report 300ms after retirement is outside the configured window.
+	// 300ms of refill is a full token.
 	m.mu.Lock()
-	m.lastReportRetireAt = time.Now().Add(-300 * time.Millisecond)
+	m.reportTokens = 0
+	m.reportRefillAt = time.Now().Add(-300 * time.Millisecond)
 	m.mu.Unlock()
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.Accepted {
-		t.Fatalf("report 300ms after a retire = %+v, want accepted under a 250ms debounce", res)
+		t.Fatalf("report 300ms after draining the budget = %+v, want accepted under a 250ms debounce", res)
 	}
 }
 

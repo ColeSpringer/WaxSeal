@@ -36,8 +36,10 @@ type Config struct {
 	// reaches this age. A zero value disables time-based recycling.
 	StreamingMaxAge time.Duration
 
-	// ReportDebounce is the minimum interval between session recycles caused by
-	// consumer reports. A non-positive value uses minter.DefaultReportDebounce.
+	// ReportDebounce is the refill interval of the report-driven recycle budget:
+	// bursts of up to minter.ReportBurst recycles are allowed before
+	// rate-limiting, and past the burst the budget refills at one recycle per
+	// interval. A non-positive value uses minter.DefaultReportDebounce.
 	ReportDebounce time.Duration
 
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail

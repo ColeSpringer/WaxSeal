@@ -1493,18 +1493,20 @@ func TestHandleReportRateLimited(t *testing.T) {
 		s.routes().ServeHTTP(w, r)
 		return w
 	}
-	if w := post("/report", `{"session_generation":1,"reason":"cap"}`); w.Code != http.StatusOK {
-		t.Fatalf("first report status = %d", w.Code)
+	// Spend the whole burst allowance: each report recycles, each player-context
+	// relaunches the next generation.
+	for gen := 1; gen <= minter.ReportBurst; gen++ {
+		if w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, gen)); w.Code != http.StatusOK {
+			t.Fatalf("report %d status = %d", gen, w.Code)
+		}
+		pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
+		var pc map[string]any
+		json.Unmarshal(pcW.Body.Bytes(), &pc)
+		if got, _ := pc["session_generation"].(float64); int(got) != gen+1 {
+			t.Fatalf("relaunch %d generation = %v, want %d", gen, pc["session_generation"], gen+1)
+		}
 	}
-	// Relaunch to a live generation 2.
-	pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
-	var pc map[string]any
-	json.Unmarshal(pcW.Body.Bytes(), &pc)
-	gen2, _ := pc["session_generation"].(float64)
-	if gen2 != 2 {
-		t.Fatalf("relaunch generation = %v, want 2", pc["session_generation"])
-	}
-	w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, int(gen2)))
+	w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, minter.ReportBurst+1))
 	if w.Code != http.StatusOK {
 		t.Fatalf("rate-limited report status = %d", w.Code)
 	}

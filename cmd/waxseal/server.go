@@ -71,10 +71,12 @@ func newServerCmd() *cobra.Command {
 			"first streaming request after a recycle waits for re-attestation and\n"+
 			"establishment. Idle sessions are not recycled. Minimum 1m.")
 	f.StringVar(&o.reportDebounce, "report-debounce", "",
-		"minimum spacing between consumer-report-driven (POST /report) session recycles\n"+
-			"(flag > WAXSEAL_REPORT_DEBOUNCE env > 5m default). This limits\n"+
-			"re-attestation caused by reports and applies separately to each tenant.\n"+
-			"Minimum 5s; report rate-limiting cannot be disabled.")
+		fmt.Sprintf("sustained spacing between consumer-report-driven (POST /report) session\n"+
+			"recycles (flag > WAXSEAL_REPORT_DEBOUNCE env > 5m default). Bursts of up\n"+
+			"to %d recycles are allowed before rate-limiting; the budget refills at one\n"+
+			"recycle per interval. This limits re-attestation caused by reports and\n"+
+			"applies separately to each tenant. Minimum 5s; report rate-limiting\n"+
+			"cannot be disabled.", minter.ReportBurst))
 	f.BoolVar(&o.metricsPublic, "metrics-public", false,
 		"serve full per-tenant /metrics detail (tenant labels + activity) to\n"+
 			"unauthenticated scrapes on a keyed daemon. Ignored without\n"+

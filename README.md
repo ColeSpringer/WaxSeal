@@ -196,9 +196,10 @@ Google login.
 Report a degraded stream by the `session_generation` from `/session` or
 `/player-context`. `session_generation` is required; optional `video_id` and
 `reason` must be 1-64 characters from `[A-Za-z0-9_-]`. Reports are scoped and
-rate-limited per tenant: after a report-driven recycle, another report within
-`--report-debounce` (default `5m`) is rejected with `retry_after_seconds`, and
-stale or future generations are ignored.
+rate-limited per tenant: report-driven recycles draw from a budget of 4 that
+refills at one per `--report-debounce` (default `5m`). A report past the budget
+is rejected with `retry_after_seconds`, and stale or future generations are
+ignored.
 
 ```jsonc
 // request
@@ -214,8 +215,8 @@ stale or future generations are ignored.
 ```
 
 `/metrics` counts each report by disposition: `degradation_reports_accepted`
-(applied to the live session), `degradation_reports_rate_limited` (within the
-debounce window), `degradation_reports_rejected_stale` (an old or replaced
+(applied to the live session), `degradation_reports_rate_limited` (past the
+report budget), `degradation_reports_rejected_stale` (an old or replaced
 generation), and `degradation_reports_already_retired` (the current generation,
 already retired by a crash or a prior report; a benign no-op).
 
@@ -317,9 +318,12 @@ hosts keep each daemon's profiles private.
 The `crashes` metric counts unexpected browser loss from Chromium events or a
 failed health probe, not retirement from age, a report, or operation retries.
 `--report-debounce` (default `5m`) throttles all report-driven recycles for a
-tenant across generations, not just repeats of one generation; this is deliberate
-anti-storm behavior, and workloads with legitimately bursty degradations may
-lower it.
+tenant across generations, not just repeats of one generation. Bursts of up to 4
+recycles are allowed before the limit bites, enough for a consumer whose
+bulk-enumeration throttle escape rotates its identity several times in quick
+succession; past the burst, the budget refills at one recycle per interval. This
+is deliberate anti-storm behavior; workloads that recycle faster on a sustained
+basis may lower it.
 
 Health checks use `/ping`, which after authentication returns HTTP 200 with
 `ok:true` or `ok:false` and an always-present `reason`: `ok`, `no-session`

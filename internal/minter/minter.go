@@ -25,7 +25,7 @@ type Minter struct {
 	log             *slog.Logger
 	maxAge          time.Duration // recycle the session once it is older than this
 	streamingMaxAge time.Duration // recycle on the next streaming handoff once older than this; 0 disables
-	reportDebounce  time.Duration // minimum spacing between report-driven recycles
+	reportDebounce  time.Duration // refill interval of the report budget (see ReportBurst)
 
 	// launch starts and attests a session. Tests replace it so the reliability
 	// logic can run without a browser.
@@ -41,11 +41,15 @@ type Minter struct {
 	negCache    map[string]negEntry // terminal player-context errors by video_id, guarded by mu
 
 	// mu guards the streaming deadline, outstanding degradation report, and report
-	// debounce state. A suspect mark must not outlive its generation.
+	// budget state. A suspect mark must not outlive its generation.
 	streamingDeadline    time.Time
 	reportSuspectGen     uint64
 	reportSuspectVideoID string
-	lastReportRetireAt   time.Time
+	// reportTokens is the remaining report-driven recycle budget, a token bucket
+	// refilled at one token per reportDebounce up to ReportBurst. reportRefillAt
+	// is when refill last accrued.
+	reportTokens   float64
+	reportRefillAt time.Time
 
 	mintMu  sync.Mutex // serializes the in-browser mint calls (single page)
 	metrics minterMetrics
@@ -126,9 +130,22 @@ const (
 	// 0.8 MB for typical entries and about 10 MB for unusually large tokens.
 	minterCacheMax = 1024
 
-	// DefaultReportDebounce limits report-driven re-attestation to 12 times per
-	// hour.
+	// DefaultReportDebounce limits report-driven re-attestation to a sustained
+	// 12 times per hour. Bursts up to ReportBurst are allowed first, so the
+	// debounce is the refill interval of the report budget rather than a hard
+	// spacing between recycles.
 	DefaultReportDebounce = 5 * time.Minute
+
+	// ReportBurst is how many report-driven recycles may happen back to back
+	// before rate-limiting. It is sized for the largest rotation sequence a
+	// well-behaved consumer performs in one operation: a bulk-enumeration
+	// throttle escape retires its identity and re-asks up to four times before
+	// giving up, and a mid-sequence decline makes the consumer misread
+	// throttled entries as gone. A full budget covers that whole sequence; a
+	// budget drained by recent reports may not, since it refills at only one
+	// token per debounce interval, which is what keeps the sustained rate at
+	// one recycle per interval.
+	ReportBurst = 4
 
 	// pingProbeTimeout allows for a busy host without leaving /ping unbounded.
 	pingProbeTimeout = 5 * time.Second
@@ -149,8 +166,9 @@ var ErrNoSession = errors.New("waxseal: no attested session")
 // NewMinter builds a single-identity minter for video (the landing watch id). It
 // launches a browser only when an operation first needs a session.
 // streamingMaxAge forces a fresh session on the next streaming handoff once the
-// current one exceeds that age (0 disables); reportDebounce is the minimum spacing
-// between report-driven recycles (<=0 uses DefaultReportDebounce).
+// current one exceeds that age (0 disables); reportDebounce is the refill
+// interval of the report-driven recycle budget, which allows bursts up to
+// ReportBurst (<=0 uses DefaultReportDebounce).
 func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDebounce time.Duration) *Minter {
 	log := opts.Logger
 	if log == nil {
@@ -166,6 +184,8 @@ func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDeboun
 		maxAge:          minterDefaultMaxAge,
 		streamingMaxAge: streamingMaxAge,
 		reportDebounce:  reportDebounce,
+		reportTokens:    ReportBurst, // start with the full burst allowance
+		reportRefillAt:  time.Now(),
 		cache:           make(map[string]cachedToken),
 		negCache:        make(map[string]negEntry),
 	}
@@ -348,9 +368,9 @@ func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, ui
 		if m.retire(cur, reason, false) {
 			if suspect {
 				m.metrics.ReportDrivenRecycles.Add(1)
-				// Deferred and immediate report-driven recycles share one debounce.
+				// Deferred and immediate report-driven recycles share one budget.
 				m.mu.Lock()
-				m.lastReportRetireAt = time.Now()
+				m.spendReportTokenLocked()
 				m.mu.Unlock()
 			} else {
 				m.metrics.StreamingRecycles.Add(1)
@@ -390,7 +410,7 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	// Marking the generation before releasing m.mu deduplicates concurrent reports.
 	m.mu.Lock()
 	cur := m.gen
-	sinceLast := time.Since(m.lastReportRetireAt)
+	m.refillReportTokensLocked(time.Now())
 	switch {
 	case gen != cur:
 		// A genuinely old or future generation: the reported session was already
@@ -402,12 +422,12 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 		// The current generation, but its session was already retired (a crash or a
 		// prior report) in the brief window before the next request relaunches. A
 		// benign no-op distinct from a stale report. This case is load-bearing in
-		// its position: a report-driven retire leaves gen unchanged and sets
-		// lastReportRetireAt, so both this predicate and the debounce predicate
-		// (sinceLast < reportDebounce) are true for a re-report of the same gen. It
-		// must precede the pending and debounce cases, or an already-retired report
-		// is miscounted as rate-limited. TestMinterReportDegradedAlreadyRetired pins
-		// the ordering (already_retired == 1, rate_limited == 0).
+		// its position: a report-driven retire leaves gen unchanged and spends
+		// report budget, so this predicate and the rate-limit predicate
+		// (reportTokens < 1) can both be true for a re-report of the same gen. It
+		// must precede the pending and rate-limit cases, or an already-retired
+		// report is miscounted as rate-limited. TestMinterReportDegradedAlreadyRetired
+		// pins the ordering (already_retired == 1, rate_limited == 0).
 		m.mu.Unlock()
 		m.metrics.DegradationReportsAlreadyRetired.Add(1)
 		return ReportResult{Accepted: false, Generation: cur}
@@ -415,9 +435,9 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 		// Retirement is already queued for the next streaming handoff.
 		m.mu.Unlock()
 		return ReportResult{Accepted: true, RetirementPending: true, Generation: gen}
-	case sinceLast < m.reportDebounce:
-		// Recycled within the debounce window: tell the consumer how long to back off.
-		retryAfter := ceilSeconds(m.reportDebounce - sinceLast)
+	case m.reportTokens < 1:
+		// Budget spent: tell the consumer how long until one token refills.
+		retryAfter := ceilSeconds(time.Duration((1 - m.reportTokens) * float64(m.reportDebounce)))
 		m.mu.Unlock()
 		m.metrics.DegradationReportsRateLimited.Add(1)
 		return ReportResult{Accepted: false, Generation: cur, RetryAfterSeconds: retryAfter}
@@ -430,12 +450,12 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	// Only the first report for this generation attempts immediate retirement.
 	if m.mintMu.TryLock() {
 		acted := m.retire(gen, "consumer report: "+reason, false)
-		// Arm the debounce only when this report actually recycles the session. If a
-		// crash watcher or max-age retirement already closed the generation, retire is
-		// a no-op and should not suppress the next real report.
+		// Spend report budget only when this report actually recycles the session.
+		// If a crash watcher or max-age retirement already closed the generation,
+		// retire is a no-op and should not eat into the next real report's budget.
 		if acted {
 			m.mu.Lock()
-			m.lastReportRetireAt = time.Now()
+			m.spendReportTokenLocked()
 			m.mu.Unlock()
 			m.metrics.ReportDrivenRecycles.Add(1)
 		}
@@ -452,6 +472,25 @@ func ceilSeconds(d time.Duration) int {
 		return 0
 	}
 	return int((d + time.Second - 1) / time.Second)
+}
+
+// refillReportTokensLocked accrues report budget at one token per
+// reportDebounce, capped at ReportBurst. The caller must hold m.mu.
+func (m *Minter) refillReportTokensLocked(now time.Time) {
+	elapsed := now.Sub(m.reportRefillAt)
+	if elapsed <= 0 {
+		return
+	}
+	m.reportTokens = min(m.reportTokens+float64(elapsed)/float64(m.reportDebounce), ReportBurst)
+	m.reportRefillAt = now
+}
+
+// spendReportTokenLocked consumes one token of report budget. Called only after
+// a report-driven retire actually recycled the session, so a no-op retire never
+// spends budget. The caller must hold m.mu.
+func (m *Minter) spendReportTokenLocked() {
+	m.refillReportTokensLocked(time.Now())
+	m.reportTokens = max(m.reportTokens-1, 0)
 }
 
 // Mint returns a token for (scope, binding), reporting whether it came from cache.
