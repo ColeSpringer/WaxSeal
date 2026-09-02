@@ -56,6 +56,44 @@ func TestWithDefaults(t *testing.T) {
 	}
 }
 
+// LandingURL only makes sense together with StopAfterLoad: a LandingURL session
+// that continued past the load event would have no identity to capture.
+func TestValidateLaunchOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opts    Options
+		wantErr bool
+	}{
+		{"landing url without stop after load", Options{LandingURL: "http://127.0.0.1:1/"}, true},
+		{"landing url with stop after load", Options{LandingURL: "http://127.0.0.1:1/", StopAfterLoad: true}, false},
+		{"stop after load alone", Options{StopAfterLoad: true}, false},
+		{"neither set", Options{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateLaunchOptions(tc.opts)
+			if tc.wantErr && err == nil {
+				t.Error("validateLaunchOptions = nil, want an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateLaunchOptions = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// LaunchPool must reject the same invalid Options as Launch, and it must do so
+// before it starts Chromium: an invalid LandingURL/StopAfterLoad combination
+// returns the validation error straight away rather than a launch failure.
+func TestLaunchPoolValidatesOptions(t *testing.T) {
+	_, err := LaunchPool(Options{LandingURL: "http://127.0.0.1:1/"})
+	if err == nil {
+		t.Fatal("LaunchPool with LandingURL but no StopAfterLoad = nil error, want the validation error")
+	}
+	if !strings.Contains(err.Error(), "StopAfterLoad") {
+		t.Errorf("LaunchPool error = %v, want it to name StopAfterLoad (the same error validateLaunchOptions returns)", err)
+	}
+}
+
 // TestUAOverride pins normalizeUA's actual emitted Network.setUserAgentOverride
 // payload. The CDP wire golden marshals a separate hand-written struct, so it
 // cannot catch drift in this producer, such as Architecture changing to x86_64,
@@ -271,6 +309,52 @@ func TestBufferedReachesEnd(t *testing.T) {
 		if got := bufferedReachesEnd(tt.length, tt.bufferedEnd); got != tt.want {
 			t.Errorf("bufferedReachesEnd(%d, %.1f) = %v, want %v", tt.length, tt.bufferedEnd, got, tt.want)
 		}
+	}
+}
+
+// TestReduceStreamingURL pins reduceStreamingURL's output for the cases the
+// diagnostic log lines depend on: a realistic googlevideo SABR URL, one missing
+// some of the kept parameters, and input that net/url cannot parse at all. Every
+// case's want string is checked to contain none of the signed fields (sig, lsig,
+// pot, n) present in the realistic input, so a regression that widens the kept
+// parameter set fails here instead of in a live log line.
+func TestReduceStreamingURL(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "realistic googlevideo URL",
+			in: "https://rr3---sn-4g5ednsz.googlevideo.com/videoplayback?expire=1750000000&ei=abcDEF123" +
+				"&ip=203.0.113.5&id=o-AbCdEfGhIjKlMnOpQrStUv&itag=140&source=youtube&requiressl=yes" +
+				"&spc=abcXYZ123_-Q&vprv=1&mime=audio%2Fmp4&clen=12345678&dur=634.624&mt=1750000000" +
+				"&fvip=3&c=WEB&n=someNSigValue&sig=abcdef1234567890fedcba&lsig=xyz9876543210abc" +
+				"&pot=aBogusPlayerOrGVSToken%3D%3D",
+			want: "rr3---sn-4g5ednsz.googlevideo.com/videoplayback?id=o-AbCdEfGhIjKlMnOpQrStUv&expire=1750000000&spc=abcXYZ123_-Q",
+		},
+		{
+			name: "missing some of the kept params",
+			in:   "https://r5---sn-abcxyz.googlevideo.com/videoplayback?expire=1750000001&id=o-ShortIdHere&itag=251&mime=audio%2Fwebm",
+			want: "r5---sn-abcxyz.googlevideo.com/videoplayback?id=o-ShortIdHere&expire=1750000001",
+		},
+		{
+			name: "junk that fails to parse",
+			in:   "%",
+			want: "<unparseable>",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := reduceStreamingURL(tt.in)
+			if got != tt.want {
+				t.Errorf("reduceStreamingURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			for _, secret := range []string{"sig=", "lsig=", "pot=", "n=someNSigValue"} {
+				if strings.Contains(got, secret) {
+					t.Errorf("reduceStreamingURL(%q) = %q, must not contain %q", tt.in, got, secret)
+				}
+			}
+		})
 	}
 }
 

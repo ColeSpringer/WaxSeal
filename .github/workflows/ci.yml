@@ -9,10 +9,11 @@ permissions:
   contents: read
 
 jobs:
-  # Build, vet, and run the offline race tests, plus the real-Chromium CDP
-  # pipe-transport tests (-tags live) against a pinned browser. The committed
-  # browser bundle removes the Node dependency. Only the network YouTube and
-  # BotGuard e2e (-tags e2e) still run manually, needing network access.
+  # Build, gofmt-check, vet, and run the offline race tests, plus the
+  # real-Chromium CDP pipe-transport tests (-tags live) against a pinned
+  # browser. The committed browser bundle removes the Node dependency. Only
+  # the network YouTube and BotGuard e2e (-tags e2e) still run manually,
+  # needing network access.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -22,6 +23,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go build ./...
+      # gofmt covers this whole checkout by path, including the nested
+      # provider/ module, whose own job below only builds and vets it.
+      - run: make fmt-check
       - run: go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
@@ -42,7 +46,7 @@ jobs:
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
 
-  # Build and vet the nested WaxTap adapter module separately.
+  # Build and vet the nested consumer-adapter module separately.
   provider:
     runs-on: ubuntu-latest
     steps:
@@ -88,10 +92,22 @@ jobs:
       - name: rebuild and diff against the committed bundle
         run: make verify-assets
 
-  # Build the container image to verify the Dockerfile. Running it needs Chromium
-  # and network access.
+  # Build the container image and smoke-test it. The probe covers the startup path
+  # an image has to get right: Chromium launching, fetching a page over HTTP,
+  # rendering it, and running JavaScript in it. It navigates a served URL rather
+  # than a data: page because a data: page never goes through the network service,
+  # so only a served URL proves the whole browser can load a page. It stops before
+  # identity capture, which reads ytcfg from a real watch page, because that would
+  # tie this gate to how YouTube answers a datacenter IP. `--network none` is what
+  # makes that hold: the page comes from a loopback server the command runs itself,
+  # so nothing outside the container is reachable and a red build here means the
+  # image is broken.
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: DOCKER_BUILDKIT=1 docker build .
+      - run: DOCKER_BUILDKIT=1 docker build -t waxseal:ci .
+      - name: the built image can start a renderer and complete a navigation
+        run: |
+          docker run --rm --network none --shm-size=1gb --entrypoint waxseal waxseal:ci \
+            doctor --stop-after-load

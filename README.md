@@ -78,6 +78,15 @@ go run ./cmd/waxseal ping                       # check a running daemon
 Prefer the warm daemon for repeated requests. Commands that take `--video` want a
 bare video ID, not a URL.
 
+`doctor` can also stop short of the full check. `--skip-attest` reports the
+captured identity without attesting, leaving the `attest` key out of the report
+rather than showing an empty grade. `--stop-after-load` stops earlier still, at
+the load event of a page the command serves to itself on loopback, so it verifies
+that Chromium renders and navigates with no external network at all;
+`--landing-url` aims that check at some other page. Neither combines with
+`--full`, which needs an attested session. The container image is smoke-tested
+with `waxseal doctor --stop-after-load` on an isolated network.
+
 ## HTTP API
 
 | Method | Endpoint | Purpose |
@@ -101,7 +110,11 @@ under [Errors](#errors).
 token or **visitor data** for a GVS token, up to 4096 bytes. The optional `scope`
 (`player`, `gvs`, `pot`, or omitted) only namespaces cache entries;
 `content_binding` selects the token type. The response sets `X-Pot-Cache: hit`
-when served from the cache or `miss` when freshly minted.
+when served from the cache or `miss` when freshly minted. A cache miss keeps a
+fresh mint at least 12 seconds clear of the last context establishment on that
+browser session, for the same grading reason described under `/player-context`
+below, so a request that misses the cache just after any establishment on that
+browser session, not only the startup proof, may wait up to that long.
 
 ```jsonc
 // request
@@ -162,11 +175,41 @@ status-1 protection code embedded in the signed URL.
 }
 ```
 
+Two things happen before the daemon serves a context. It proves full-length
+streaming once per browser session, on the landing video or, if that one is
+unavailable or too short, a fallback candidate, because a context that is the
+session's first playback is graded as a preview about as often as not. A session
+that cannot prove it is refused rather than served, and a failed proof is not
+retried on every request: it refuses immediately for the next 30 seconds without
+another attempt, and if the proof still fails once that cool-down has passed, the
+session is relaunched once and the fresh session is proved in its place, refusing
+only if that also fails. The refusal arrives as the `player-context-failed` error
+(502) and is safe to retry once the cool-down passes, so a consumer does not need
+to treat it as a problem with the video. It also keeps the served context at
+least 12 seconds away from the last token mint or proof playback on that browser
+session, and keeps a token mint the same distance from the last establishment,
+because a context taken within a few seconds of either is graded the same way.
+Contexts served earlier do not extend that window, so back-to-back requests are
+not delayed by one another. The first context after startup or a relaunch may
+wait for both steps; later requests normally find the session proved and the
+window already clear. A context that clears both steps is then served without
+any further, per-request check: the daemon removes the measured cause of a
+graded preview and refuses when it cannot prove the session, but it does not
+itself grade the URL it hands out. The startup self-test performs the proof
+before the daemon accepts traffic. `WAXSEAL_MINT_SEPARATION` overrides the
+spacing with any positive Go duration, for example `20s`.
+
 ### `GET /session`
 
 Exports the guest identity for the session-adoption path (`--session-url` plus
-`--potoken-url`), after verifying full-length streaming. No request body, and no
-Google login.
+`--potoken-url`), after verifying full-length streaming with the same cool-down
+and one-relaunch-per-streak policy described under `/player-context`. No request
+body, and no Google login. If the startup self-test already proved the session
+this call is immediate; if it did not, this call performs the proof itself, and
+unlike a served context it is not held back by the mint-separation window, since
+`/session` hands out the identity itself rather than a context tied to a recent
+mint. A session that cannot prove full-length streaming is refused as
+`no-session` (503) rather than exported.
 
 ```jsonc
 // response
@@ -256,15 +299,18 @@ metrics access. When both are set, `--metrics-public` wins. Both are ignored on 
 keyless daemon.
 
 The full view is `{"tenants":N,"per_tenant":{"<label>":{...}}}`, each tenant
-object carrying lifetime counters (`mints`, `crashes`, `player_contexts`, the
-four `degradation_reports_*` dispositions above, and so on) plus current state.
-Detail fields are always present so the schema stays stable across retirement,
-crash, and recycle; a field that does not apply is `null` or `""` rather than
-omitted. For example `last_browser_proof_age_secs` is `null` until the first
-proof, which reserves `0` for "just proved", and `streaming_seconds_until_recycle`
-appears only when time-based recycling is enabled (`--streaming-max-age` > 0). The
-redacted view is `{"redacted":true,"aggregate":{...}}`: the same counters summed
-across tenants, with no labels and no tenant count.
+object carrying lifetime counters (`mints`, `crashes`, `player_contexts`,
+`separation_waits` for requests held back to keep a mint and an establishment
+apart, `unproven_rejections` for contexts refused because the session could not
+prove full-length streaming, the four `degradation_reports_*` dispositions above,
+and so on) plus current state. Detail fields are always present so the schema
+stays stable across retirement, crash, and recycle; a field that does not apply
+is `null` or `""` rather than omitted. For example `last_browser_proof_age_secs`
+is `null` until the first proof, which reserves `0` for "just proved", and
+`streaming_seconds_until_recycle` appears only when time-based recycling is
+enabled (`--streaming-max-age` > 0). The redacted view is
+`{"redacted":true,"aggregate":{...}}`: the same counters summed across tenants,
+with no labels and no tenant count.
 
 ### Errors
 
@@ -333,7 +379,9 @@ logged at `warn`). Alert only on `probe-failed`; a caller that disconnects
 mid-probe is not counted as one. For status-code-only checks (k8s, `curl -f`,
 HAProxy), `?strict=true` maps `probe-failed` to **503** while `no-session` and
 healthy stay **200**, and `waxseal ping --strict` does the same from the CLI, so
-liveness probes do not fail during the benign re-establishment window.
+liveness probes do not fail during the benign re-establishment window. The image's
+`HEALTHCHECK` runs `waxseal ping --strict` for exactly that reason; multi-tenant
+deployments must add `--key <key>` to it.
 
 WaxSeal is meant for loopback or a trusted network and does not implement CORS;
 because it mints tokens, browser-origin access is out of scope. Run
@@ -357,9 +405,27 @@ self-skip when no browser is found (`WAXSEAL_CHROME_BIN` picks one,
 tests live in the nested `provider/` module and must run from that directory,
 since a root-level `go test -tags e2e ./...` silently descends into nothing; they
 need a warm daemon and include the full-length WEB SABR download
-(`go test -tags e2e -run PlayerContextOnlyFullLength ./...`). The `client` package
-is a reusable, WaxTap-free HTTP client; the `provider/` module adapts it to
-WaxTap's `potoken.Provider` interface.
+(`go test -tags e2e -run PlayerContextOnlyFullLength ./...`). Set
+`WAXSEAL_E2E_LOG_LEVEL=debug` to see the in-process daemon's debug logs in
+`go test -v` output for that suite. `TestAgingMatrix` is a separate, opt-in
+measurement of how an artifact's age affects a capped stream, not a regression
+test: it skips unless `WAXSEAL_E2E_AGING=1` (which artifact's age predicts a
+truncated stream) or `=2` (how much separation between a mint and a served
+context is enough) is set, runs for tens of minutes, and only ever reports a
+tally, never a pass/fail on truncation. `WAXSEAL_E2E_AGING_N` overrides the
+per-arm iteration count (default 6) and `WAXSEAL_E2E_AGING_DELAY` overrides the
+run-wide delay between warming and streaming (default `30s`; an arm carrying its
+own delay ignores it). By default every in-process daemon the suite starts keeps
+its own mint-to-establishment gate (12s unless `WAXSEAL_MINT_SEPARATION`
+overrides it), so a default run is really a regression check: every arm is
+expected to stream full length. `WAXSEAL_E2E_AGING_SEPARATION` (a Go duration
+such as `1ms`) overrides that gate on those daemons so the arms measure raw gaps
+again, the way the matrix originally separated them; because attestation always
+pre-mints a token, the token age arms then measure time since attestation rather
+than since their own mint call, which usually just returns that cached token.
+The `client` package is a reusable, consumer-agnostic HTTP client; the
+`provider/` module adapts it to the token-provider interface a streaming
+consumer expects.
 
 CLI exit codes: `0` success, `1` runtime failure, `2` usage error, `3` unavailable
 video, `130` interruption.

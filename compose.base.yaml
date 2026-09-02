@@ -18,6 +18,10 @@ services:
     image: ghcr.io/colespringer/waxseal:${WAXSEAL_VERSION:-latest}
     container_name: waxseal
     restart: unless-stopped # tini is PID 1 and reaps Chromium child processes
+    # Cover the daemon's 60s drain budget so `docker stop` does not SIGKILL a
+    # container that is still finishing a request. Compose defaults to 10s. If
+    # --shutdown-timeout is raised, raise this to match.
+    stop_grace_period: 70s
     shm_size: "1gb" # working space for headless Chromium
     cap_drop:
       - ALL

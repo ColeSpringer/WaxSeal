@@ -19,6 +19,12 @@ func (t *Tenants) InjectSessionForTest(ctx context.Context, apiKey string, sess 
 		return nil, err
 	}
 	m.launch = func(context.Context) (minterSession, error) { return sess, nil }
+	// Dependent-package tests exercise handler plumbing, not the spacing between a
+	// mint and a context establishment: turn the separation gates off so no
+	// handler waits out the window, and skip the attestation-time mint so the
+	// injected session records only the calls the test's own request drives.
+	m.mintSeparation = 0
+	m.skipPremint = true
 	if err := m.Warm(ctx); err != nil {
 		return nil, err
 	}

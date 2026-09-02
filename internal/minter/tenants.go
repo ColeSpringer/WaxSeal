@@ -26,6 +26,7 @@ type Tenants struct {
 	log             *slog.Logger
 	streamingMaxAge time.Duration // forwarded to each tenant Minter; 0 disables
 	reportDebounce  time.Duration // forwarded to each tenant Minter; <=0 uses the default
+	mintSeparation  time.Duration // forwarded to each tenant Minter; positive overrides the env-derived default
 
 	// newSession creates an attested tenant session. Tests replace it to avoid
 	// launching a browser.
@@ -40,8 +41,10 @@ const defaultTenant = "default"
 
 // NewTenants builds a registry over pool. Keys maps API keys to tenant labels. An
 // empty map selects keyless single-tenant mode. streamingMaxAge and reportDebounce
-// configure each tenant's Minter.
-func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options, streamingMaxAge, reportDebounce time.Duration) *Tenants {
+// configure each tenant's Minter. mintSeparation, when positive, overrides the
+// env-derived mint-to-establishment spacing for every tenant's Minter; a
+// non-positive value leaves each Minter to resolve its own env-derived default.
+func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options, streamingMaxAge, reportDebounce, mintSeparation time.Duration) *Tenants {
 	log := opts.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -53,6 +56,7 @@ func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts b
 		log:             log,
 		streamingMaxAge: streamingMaxAge,
 		reportDebounce:  reportDebounce,
+		mintSeparation:  mintSeparation,
 		keys:            keys,
 		minters:         make(map[string]*Minter),
 	}
@@ -97,7 +101,7 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 	defer t.mu.Unlock()
 	m, ok := t.minters[label]
 	if !ok {
-		m = NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce)
+		m = NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
 		m.launch = func(ctx context.Context) (minterSession, error) {
 			return t.newSession(ctx, t.video)
 		}

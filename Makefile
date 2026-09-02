@@ -21,7 +21,7 @@ IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 # :latest.
 PUSH_LATEST ?= 0
 
-.PHONY: all help test jsbundle-browser verify-assets release deps clean \
+.PHONY: all help fmt-check test jsbundle-browser verify-assets release deps clean \
         docker-build docker-login docker-push release-guard
 
 all: jsbundle-browser
@@ -29,7 +29,8 @@ all: jsbundle-browser
 # help lists the common targets; run `make help` to print it.
 help:
 	@echo "WaxSeal make targets:"
-	@echo "  test              offline Go test suite"
+	@echo "  fmt-check         fail if any file needs gofmt (covers provider/ too)"
+	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle, fail if it differs from the committed bytes"
 	@echo "  release           build Linux/macOS amd64+arm64 binaries into $(DIST)/"
@@ -38,10 +39,19 @@ help:
 	@echo "  deps              install the Node toolchain for the bundle"
 	@echo "  clean             remove build output"
 
-# test runs the offline suite. The committed bundle means CI and `go test ./...`
-# do not need Node.
-test:
-	go test ./...
+# fmt-check fails when any file needs gofmt. `gofmt -l` exits 0 even when it
+# lists files, so the output itself is the signal.
+fmt-check:
+	@out=$$(gofmt -l . 2>&1); \
+	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+# test runs the offline suite: the root module with the race detector (matching
+# CI), then the nested provider/ module. The committed bundle means it does not
+# need Node. The -tags e2e suite needs network and a warm daemon; the README
+# documents running it separately.
+test: fmt-check
+	go test -race ./...
+	cd provider && go test -race ./...
 
 # jsbundle-browser builds the bgutils-js and BotGuard entrypoint as an ES2020
 # IIFE. Chromium evaluates the committed bundle, which Go embeds from

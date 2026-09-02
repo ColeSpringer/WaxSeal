@@ -30,8 +30,9 @@ FROM debian:bookworm-slim
 # Chromium renders WebGL with its own bundled SwiftShader because --disable-gpu is
 # set, so the system Mesa/LLVM software-GL stack is never loaded at runtime.
 # chromium-common declares those packages as a dependency, so force-purge them after
-# the install to drop ~158 MB. The daemon never runs apt again, so the unmet-
-# dependency note this leaves in the dpkg database has no runtime effect.
+# the install to drop 218 MB (1.09 GB with them, 872 MB without). The daemon never
+# runs apt again, so the unmet-dependency note this leaves in the dpkg database has
+# no runtime effect.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
@@ -57,7 +58,9 @@ ENTRYPOINT ["/usr/bin/tini", "--", "waxseal"]
 CMD ["server", "--host", "0.0.0.0"]
 
 # Use the built-in health probe instead of curl. The start period covers browser
-# warm-up, and the timeout covers a lazy attestation. Multi-tenant deployments
-# must add `--key <key>`.
+# warm-up, and the timeout covers a lazy attestation. --strict fails only on a
+# probe failure: a `POST /report` retires the session and re-establishment is lazy,
+# and that benign window must not mark the container unhealthy. Multi-tenant
+# deployments must add `--key <key>`.
 HEALTHCHECK --interval=30s --timeout=110s --start-period=120s --retries=3 \
-  CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416"]
+  CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416", "--strict"]

@@ -11,11 +11,12 @@ on:
 
 jobs:
   # Build the version-stamped Linux and macOS binaries and attach them, plus a
-  # SHA256SUMS manifest, to the release for the tag. The release is created with
-  # generated notes if it does not exist yet; an existing release (for example
-  # one created by hand with written notes) keeps its body and just gains the
-  # assets. The binaries embed the committed JS bundle but need a system Chromium
-  # at runtime.
+  # SHA256SUMS manifest, to the release for the tag. If no release exists yet
+  # for the tag, one is created as a draft with an empty body, so a human
+  # writes the notes and publishes it; this workflow never publishes a release
+  # on its own. An existing release (for example one created by hand with
+  # written notes) keeps its body and just gains the assets. The binaries
+  # embed the committed JS bundle but need a system Chromium at runtime.
   binaries:
     runs-on: ubuntu-latest
     permissions:
@@ -36,29 +37,57 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --generate-notes --verify-tag || true
+            --draft --notes "" --verify-tag || true
           gh release upload "$GITHUB_REF_NAME" \
             dist/waxseal-* dist/SHA256SUMS.txt --clobber
 
-  # Build and push the runtime image (VERSION and latest) to GHCR with the
-  # built-in token. This does not reuse `make docker-push`: that target's login
-  # and scope checks are written for a human's gh OAuth token, which the Actions
-  # GITHUB_TOKEN is not. `make docker-build` has no such checks. Single platform
-  # (linux/amd64), matching the manual release; add buildx for multi-arch later.
+  # Build and push the runtime image (VERSION and, for a stable release,
+  # latest) to GHCR with the built-in token. This does not reuse `make
+  # docker-push`: that target's login and scope checks are written for a
+  # human's gh OAuth token, which the Actions GITHUB_TOKEN is not, and `make
+  # docker-build` has no such checks. Bypassing `make docker-push` also
+  # bypasses its `PUSH_LATEST` guard (Makefile), so the push step below
+  # reimplements that gate directly: `:latest` moves only when the tag's
+  # version has no semver prerelease suffix, so a release candidate such as
+  # v1.2.0-rc1 is pushed under its own tag but never repoints the public
+  # `:latest`. Single platform (linux/amd64), matching the manual release; add
+  # buildx for multi-arch later.
+  #
+  # The same image smoke test the CI workflow runs sits between the build and
+  # the first push. CI never sees a tag push, and this build resolves
+  # `apt-get install chromium` fresh, so without the probe here a release
+  # could publish an image that no run of any workflow ever started.
+  # `--pull=never` on the probe keeps it honest: the image under test can only
+  # be the one `make docker-build` just produced, never a same-tagged image
+  # pulled back down from GHCR now that this job is logged in.
   image:
     runs-on: ubuntu-latest
     permissions:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # GitHub Actions expressions have no substring-strip function, so VERSION
+      # cannot be a job-level env: value computed with ${{ }}; compute it once in
+      # a shell step instead and export it to every later step in the job.
+      - name: compute VERSION
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: log in to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: build and push
+      - name: build the image
+        run: make docker-build VERSION="$VERSION"
+      - name: the built image can start a renderer and complete a navigation
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          make docker-build VERSION="$VERSION"
+          docker run --rm --network none --shm-size=1gb --pull=never \
+            --entrypoint waxseal "ghcr.io/colespringer/waxseal:$VERSION" \
+            doctor --stop-after-load
+      - name: push
+        run: |
           docker push "ghcr.io/colespringer/waxseal:$VERSION"
-          docker push "ghcr.io/colespringer/waxseal:latest"
+          # Build metadata after + can contain hyphens and is not a prerelease; strip it first.
+          case "${VERSION%%+*}" in
+            *-*) echo "prerelease $VERSION; :latest not moved" ;;
+            *)   docker push "ghcr.io/colespringer/waxseal:latest" ;;
+          esac

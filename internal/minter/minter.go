@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,12 @@ type Minter struct {
 	maxAge          time.Duration // recycle the session once it is older than this
 	streamingMaxAge time.Duration // recycle on the next streaming handoff once older than this; 0 disables
 	reportDebounce  time.Duration // refill interval of the report budget (see ReportBurst)
+	mintSeparation  time.Duration // spacing kept between an in-page mint and a context establishment
+
+	// skipPremint turns off the mint ensure performs at attestation. Only
+	// InjectSessionForTest sets it, so a dependent package's injected session sees
+	// only the mints its own request drives.
+	skipPremint bool
 
 	// launch starts and attests a session. Tests replace it so the reliability
 	// logic can run without a browser.
@@ -50,6 +57,39 @@ type Minter struct {
 	// is when refill last accrued.
 	reportTokens   float64
 	reportRefillAt time.Time
+
+	// lastMintAt, lastProofAt, and lastEstablishAt are when the page last
+	// completed an in-page mint, a full-length proof playback, and a context
+	// establishment. waitSeparation keeps mintSeparation between the served
+	// context and the later of the mint and the proof, and between a mint and the
+	// last establishment. A context handed out earlier does not extend the
+	// window: consecutive handoffs are graded fine. All three are cleared when a
+	// new generation is published, because they describe one page's history.
+	lastMintAt      time.Time
+	lastProofAt     time.Time
+	lastEstablishAt time.Time
+
+	// proofFailGen and proofFailedAt record the generation and time of that
+	// generation's most recent failed full-length proof, so ensureProven can
+	// refuse a repeat request on cool-down instead of paying another proof
+	// attempt. Both are cleared when a new generation is published and whenever a
+	// proof succeeds.
+	proofFailGen  uint64
+	proofFailedAt time.Time
+	// proofCooldownWarnedAt is the proofFailedAt value the cool-down warning has
+	// already fired for, so repeated refusals within the same cool-down window log
+	// the warning once instead of once per refused request. Cleared alongside
+	// proofFailGen and proofFailedAt.
+	proofCooldownWarnedAt time.Time
+
+	// proofRelaunched marks that the current failure streak already spent its one
+	// proof-driven relaunch. The relaunch backoff elsewhere in the pool only
+	// rate-limits how often a relaunch can happen; it does not stop a
+	// persistently unprovable environment from restarting Chromium again on
+	// every cool-down forever. This flag is that stop: it survives a new
+	// generation, however that generation came to exist, and only a successful
+	// proof (markProved) clears it.
+	proofRelaunched bool
 
 	mintMu  sync.Mutex // serializes the in-browser mint calls (single page)
 	metrics minterMetrics
@@ -90,6 +130,10 @@ type minterMetrics struct {
 	LaunchFailures atomic.Int64
 	Mints          atomic.Int64
 	MintFailures   atomic.Int64 // per attempt (see minterMetrics doc)
+	// Escalations counts the decision to abandon a session generation after
+	// repeated failures on the mint, player-context, or proof ladder, whether the
+	// relaunch of a fresh generation happens immediately or is deferred to the
+	// next request that touches this Minter.
 	Escalations    atomic.Int64
 	CacheHits      atomic.Int64
 	CacheMisses    atomic.Int64
@@ -103,6 +147,12 @@ type minterMetrics struct {
 	// be confirmed beyond the status-2 cap. Attempts are counted by
 	// PlayerContextFailures; this counter is once per request.
 	Status2Rejections atomic.Int64
+	// SeparationWaits counts operations held back to keep an in-page mint and a
+	// context establishment mintSeparation apart. One wait can cover one request.
+	SeparationWaits atomic.Int64
+	// UnprovenRejections counts player-context requests refused because the
+	// session could not prove full-length streaming. Once per request.
+	UnprovenRejections atomic.Int64
 
 	// Session recycles are separated by cause.
 	StreamingRecycles    atomic.Int64 // time-based recycle on a streaming handoff
@@ -147,6 +197,29 @@ const (
 	// one recycle per interval.
 	ReportBurst = 4
 
+	// defaultMintSeparation is how far apart the daemon keeps an in-page mint and
+	// a context establishment. A consumer that streamed a context established
+	// 0.6 s from the mint of the token it sent was graded a preview every time
+	// (0 of 6 streams ran to completion), while the same measurement at 10.6 s
+	// ran full length every time (6 of 6). 12 s is that measured edge plus
+	// margin. WAXSEAL_MINT_SEPARATION overrides it.
+	defaultMintSeparation = 12 * time.Second
+
+	// mintSeparationEnv overrides defaultMintSeparation with a positive Go
+	// duration, for example "20s".
+	mintSeparationEnv = "WAXSEAL_MINT_SEPARATION"
+
+	// mintSeparationWarn marks an override large enough that a first context has
+	// to wait most of the way to the per-request budget before it is served.
+	mintSeparationWarn = 60 * time.Second
+
+	// proofRetryCooldown bounds how often a session that failed to prove
+	// full-length streaming pays another proof attempt. A proof can run up to a
+	// minute under mintMu, so retrying it on every request would make a
+	// permanently broken session hold up every other request behind it and still
+	// refuse each one; the cool-down lets most of them fail fast instead.
+	proofRetryCooldown = 30 * time.Second
+
 	// pingProbeTimeout allows for a busy host without leaving /ping unbounded.
 	pingProbeTimeout = 5 * time.Second
 
@@ -163,13 +236,23 @@ var selfTestMintRetryDelay = 1 * time.Second
 // state from a real probe failure.
 var ErrNoSession = errors.New("waxseal: no attested session")
 
+// ErrUnproven reports that the browser session could not prove full-length
+// streaming, so no context was handed out. A context that would be the session's
+// first playback is graded a preview about as often as not, so the daemon refuses
+// rather than serving one. It is exported so a caller can tell a refusal apart
+// from an extraction failure.
+var ErrUnproven = errors.New("waxseal: session has not proved full-length streaming")
+
 // NewMinter builds a single-identity minter for video (the landing watch id). It
 // launches a browser only when an operation first needs a session.
 // streamingMaxAge forces a fresh session on the next streaming handoff once the
 // current one exceeds that age (0 disables); reportDebounce is the refill
 // interval of the report-driven recycle budget, which allows bursts up to
-// ReportBurst (<=0 uses DefaultReportDebounce).
-func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDebounce time.Duration) *Minter {
+// ReportBurst (<=0 uses DefaultReportDebounce). mintSeparation, when positive,
+// overrides the env-derived spacing kept between an in-page mint and a context
+// establishment (see resolveMintSeparation); a non-positive value keeps that
+// env-derived default.
+func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDebounce, mintSeparation time.Duration) *Minter {
 	log := opts.Logger
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -184,6 +267,7 @@ func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDeboun
 		maxAge:          minterDefaultMaxAge,
 		streamingMaxAge: streamingMaxAge,
 		reportDebounce:  reportDebounce,
+		mintSeparation:  resolveMintSeparation(mintSeparation, log),
 		reportTokens:    ReportBurst, // start with the full burst allowance
 		reportRefillAt:  time.Now(),
 		cache:           make(map[string]cachedToken),
@@ -191,6 +275,329 @@ func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDeboun
 	}
 	m.launch = m.launchReal
 	return m
+}
+
+// mintSeparationUnparseableOnce and mintSeparationLargeOnce each log their
+// warning at most once per process. NewMinter runs mintSeparationFromEnv once per
+// tenant constructor, and a fleet of tenants sharing one WaxSeal process also
+// shares one WAXSEAL_MINT_SEPARATION, so without this every tenant would repeat
+// the identical warning at startup.
+var (
+	mintSeparationUnparseableOnce sync.Once
+	mintSeparationLargeOnce       sync.Once
+)
+
+// mintSeparationFromEnv reads the mint-to-establishment spacing. The environment
+// value wins when it parses as a positive Go duration; anything else keeps the
+// default and logs why, once per process.
+func mintSeparationFromEnv(log *slog.Logger) time.Duration {
+	raw := os.Getenv(mintSeparationEnv)
+	if raw == "" {
+		return defaultMintSeparation
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		mintSeparationUnparseableOnce.Do(func() {
+			log.Warn("minter: ignoring "+mintSeparationEnv+"; want a positive Go duration such as 20s",
+				"value", raw, "using", defaultMintSeparation)
+		})
+		return defaultMintSeparation
+	}
+	if d > mintSeparationWarn {
+		mintSeparationLargeOnce.Do(func() {
+			log.Warn("minter: "+mintSeparationEnv+" is large; values near the request budget make first contexts time out",
+				"value", d)
+		})
+	}
+	return d
+}
+
+// resolveMintSeparation returns mintSeparation when it is positive, an explicit
+// constructor override such as server.Config.MintSeparation. A non-positive
+// value (the common case: no override was configured) falls back to the
+// env-derived default, so WAXSEAL_MINT_SEPARATION keeps working for callers that
+// never set the constructor option.
+func resolveMintSeparation(mintSeparation time.Duration, log *slog.Logger) time.Duration {
+	if mintSeparation > 0 {
+		return mintSeparation
+	}
+	return mintSeparationFromEnv(log)
+}
+
+// waitSeparation blocks until mintSeparation has passed since from, so in-page
+// attestation work and a context establishment never land within that window of
+// each other in either order. what names the operation being held back and after
+// names the anchor the window is measured from, for the log line. A zero from
+// (nothing recorded on this session yet) and a non-positive separation both
+// return immediately.
+//
+// Every caller reaches this while holding mintMu and keeps holding it for the
+// whole wait: releasing it here would let other page work slip into the window
+// and reset the anchor being measured against. The cost is bounded by
+// mintSeparation and normally paid once per generation, and it can hold up
+// whatever else is waiting on mintMu behind it by at most that long, such as a
+// /ping probe's retirement of a dead session or a cache-missing /get_pot.
+func (m *Minter) waitSeparation(ctx context.Context, from time.Time, what, after string) error {
+	if from.IsZero() || m.mintSeparation <= 0 {
+		return nil
+	}
+	wait := m.mintSeparation - time.Since(from)
+	if wait <= 0 {
+		return nil
+	}
+	m.metrics.SeparationWaits.Add(1)
+	m.log.Info("minter: separation wait", "what", what, "after", after, "wait", wait.Round(time.Millisecond))
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(wait):
+		return nil
+	}
+}
+
+// waitBeforeMint holds a mint back until it is mintSeparation clear of the last
+// in-page playback attempt (see markPlayback), successful or not: a failed
+// establishment still touched the page, so a mint served right after it is
+// graded the same as one served right after a successful context.
+func (m *Minter) waitBeforeMint(ctx context.Context) error {
+	m.mu.Lock()
+	establishAt := m.lastEstablishAt
+	m.mu.Unlock()
+	return m.waitSeparation(ctx, establishAt, "mint", "establishment")
+}
+
+// waitBeforeEstablish holds a context establishment back until it is
+// mintSeparation clear of the last in-page attestation work on this session,
+// which is the later of the token mint and the proof playback. A context handed
+// out earlier is not an anchor: a second context taken moments after the first
+// streams full length. what names the caller.
+func (m *Minter) waitBeforeEstablish(ctx context.Context, what string) error {
+	m.mu.Lock()
+	anchor, after := m.lastMintAt, "mint"
+	if m.lastProofAt.After(anchor) {
+		anchor, after = m.lastProofAt, "proof"
+	}
+	m.mu.Unlock()
+	return m.waitSeparation(ctx, anchor, what, after)
+}
+
+// ensureProven makes the session prove full-length streaming before it hands out
+// a context. A context that is the session's first playback is graded a preview
+// about as often as not, so the proof runs first and the request is refused when
+// it cannot pass. The proof happens once per session (the startup self-test
+// normally performs it before any request arrives), and it is not held back by
+// the separation window: the daemon's own playback right after a mint is
+// harmless, only the context it serves a consumer is not.
+//
+// A session that cannot prove is not retried on every request: the first
+// failure on a generation starts proofRetryCooldown, during which later
+// requests are refused at once without another proof attempt. A second failure
+// once the cool-down has passed is treated like the mint and player-context
+// ladders' second level: the session is relaunched once and the fresh session is
+// proved in its place, so a permanently broken session does not refuse every
+// request forever by itself. That relaunch is spent once per failure streak
+// rather than once per generation; see proofRelaunched.
+//
+// A proof attempt that ends because the caller's own context ended is handled
+// two ways. A plain cancellation means the caller left, so nothing is recorded.
+// A proof that instead ran out the request's own deadline means the environment
+// failed to prove within the budget the handler gave it, not that the caller
+// left, so it is recorded like any other failure: recording it lets the
+// cool-down bound the next request instead of letting it burn the whole budget
+// again under mintMu. Either way the returned error is ctx.Err(), so the
+// server's timeout mapping is unchanged.
+//
+// ensureProven returns the session and generation the caller should use for the
+// rest of the request: sess and gen unchanged on success or a refusal, or the
+// relaunched pair after a second failure that still had its relaunch to spend.
+// what names the caller ("player-context" or "session") and appears on every
+// warn line this function emits, so a log reader can tell which endpoint paid
+// for a given proof attempt or refusal.
+func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint64, what string) (minterSession, uint64, error) {
+	if sess.Established() {
+		return sess, gen, nil
+	}
+
+	m.mu.Lock()
+	onCooldown := m.proofFailGen == gen && time.Since(m.proofFailedAt) < proofRetryCooldown
+	var remaining time.Duration
+	var warnCooldown bool
+	if onCooldown {
+		remaining = (proofRetryCooldown - time.Since(m.proofFailedAt)).Round(time.Millisecond)
+		// Warn once per cool-down window: repeated refusals compare the window's
+		// own proofFailedAt against the last value warned about, rather than firing
+		// on every refused request.
+		if m.proofCooldownWarnedAt != m.proofFailedAt {
+			m.proofCooldownWarnedAt = m.proofFailedAt
+			warnCooldown = true
+		}
+	}
+	m.mu.Unlock()
+	if onCooldown {
+		if warnCooldown {
+			m.log.Warn("minter: refusing "+what+"; session is in a proof cool-down",
+				"what", what, "gen", gen, "remaining", remaining)
+		}
+		m.log.Debug("minter: refusing "+what+"; session is in a proof cool-down",
+			"what", what, "gen", gen, "remaining", remaining)
+		m.metrics.UnprovenRejections.Add(1)
+		return sess, gen, ErrUnproven
+	}
+
+	proofErr := sess.EnsureEstablished(ctx)
+	// Any playback attempt, successful or not, arms the mint gate: see markPlayback.
+	m.markPlayback()
+	if proofErr == nil {
+		m.markProved()
+		return sess, gen, nil
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return sess, gen, ctx.Err()
+	}
+	deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	m.log.Warn("minter: refusing "+what+"; session could not prove full-length streaming",
+		"gen", gen, "err", proofErr)
+
+	secondFailure, relaunch := m.recordProofFailure(gen, true)
+	if !secondFailure {
+		// This refusal is returned to the caller either way (as ctx.Err() or as a
+		// wrapped ErrUnproven), so it counts once here rather than once per branch.
+		m.metrics.UnprovenRejections.Add(1)
+		if deadline {
+			return sess, gen, ctx.Err()
+		}
+		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+	}
+	if !relaunch {
+		m.log.Warn("minter: proof-driven relaunch for this failure streak was already spent; the session will be recycled by a successful proof, a crash, a consumer report, or the max-age recycle",
+			"what", what, "gen", gen)
+		m.metrics.UnprovenRejections.Add(1)
+		if deadline {
+			return sess, gen, ctx.Err()
+		}
+		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+	}
+
+	// A second failure on the same generation, past the cool-down, with this
+	// failure streak's relaunch still unspent (recordProofFailure just claimed
+	// it): relaunch once and prove the fresh session.
+	m.metrics.Escalations.Add(1)
+	if deadline {
+		// ctx's own deadline is what ended this proof, so this request has no
+		// budget left to launch and prove a fresh session. Retire the generation
+		// and let the next request's ensure relaunch instead; do not launch here.
+		// This request is refused, so it is counted like the branches above.
+		m.metrics.UnprovenRejections.Add(1)
+		m.retire(gen, "proof timed out twice; relaunching on the next request", false)
+		return sess, gen, ctx.Err()
+	}
+	m.retire(gen, "proof failed twice; relaunching", false)
+	newSess, newGen, err := m.ensure(ctx)
+	if err != nil {
+		// A failed launch is already counted by launch_failures inside ensure, so unproven_rejections is deliberately not incremented here.
+		return nil, 0, err
+	}
+	proofErr = newSess.EnsureEstablished(ctx)
+	m.markPlayback()
+	if proofErr != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return newSess, newGen, ctx.Err()
+		}
+		newDeadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		m.log.Warn("minter: refusing "+what+"; relaunched session could not prove full-length streaming",
+			"gen", newGen, "err", proofErr)
+		// Record the fresh generation's own failure, but never let this call claim
+		// the failure streak's relaunch: that grant was already spent (or kept
+		// unspent) by the recordProofFailure call above, and a generation that
+		// ensure just published cannot legitimately carry a prior failure of its
+		// own. secondFailure should therefore always be false here; a true value
+		// would mean gen and newGen collided, which is worth a warn rather than a
+		// silent second relaunch.
+		if secondFailure, _ := m.recordProofFailure(newGen, false); secondFailure {
+			m.log.Warn("minter: relaunched session's generation already carried a proof-failure record; a freshly published generation should never carry one",
+				"what", what, "gen", newGen)
+		}
+		// The whole call is refused here: the first failure on gen only triggered
+		// the relaunch and was never itself returned to a caller, so this is the
+		// request's only rejection.
+		m.metrics.UnprovenRejections.Add(1)
+		if newDeadline {
+			return newSess, newGen, ctx.Err()
+		}
+		return newSess, newGen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+	}
+	m.markProved()
+	return newSess, newGen, nil
+}
+
+// recordProofFailure marks generation gen's most recent proof attempt as
+// failed and reports whether this is gen's second recorded failure and, if so,
+// whether this failure streak still has its one relaunch to spend. claimRelaunch
+// tells recordProofFailure whether this call is even eligible to spend the
+// streak's relaunch: a caller passes false when it must record a failure but must
+// never itself trigger a relaunch, such as the self-test (which never relaunches)
+// or a check performed on a generation that was just published (which cannot
+// legitimately own the streak's grant). A streak's relaunch is granted at most
+// once: a caller that receives relaunchGranted == true is the sole owner of that
+// grant, because claiming it (setting proofRelaunched) happens in the same
+// critical section that decides it is available. gen is always the caller's
+// current generation, so mintMu (held by every caller through Mint or
+// PlayerContext) rules out a concurrent claim on a different generation racing
+// this one.
+func (m *Minter) recordProofFailure(gen uint64, claimRelaunch bool) (secondFailure, relaunchGranted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	secondFailure = m.proofFailGen == gen
+	m.proofFailGen = gen
+	m.proofFailedAt = time.Now()
+	if secondFailure && claimRelaunch && !m.proofRelaunched {
+		m.proofRelaunched = true
+		relaunchGranted = true
+	}
+	return secondFailure, relaunchGranted
+}
+
+// markMinted records a completed in-page mint.
+func (m *Minter) markMinted() {
+	m.mu.Lock()
+	m.lastMintAt = time.Now()
+	m.mu.Unlock()
+}
+
+// markEstablished records a completed context establishment.
+func (m *Minter) markEstablished() {
+	m.mu.Lock()
+	m.lastEstablishAt = time.Now()
+	m.mu.Unlock()
+}
+
+// markPlayback records that the page attempted in-page playback establishment,
+// successfully or not: sess.PlayerContext in PlayerContext and
+// sess.EnsureEstablished in ensureProven and SelfTest each call it after every
+// attempt. A failed establishment still touched the page, so it arms the mint
+// gate (waitBeforeMint) exactly like a successful one; markEstablished and
+// markProved additionally run on the success paths for their own bookkeeping
+// (the context-gate anchor lastProofAt, and clearing the proof-failure state).
+func (m *Minter) markPlayback() {
+	m.mu.Lock()
+	m.lastEstablishAt = time.Now()
+	m.mu.Unlock()
+}
+
+// markProved records a completed full-length proof playback. A proof is also an
+// establishment as far as the mint gate is concerned, so it sets both marks, and
+// it clears any pending proof-failure cool-down: the session just demonstrated it
+// can establish, so a stale failure record for it is moot.
+func (m *Minter) markProved() {
+	m.mu.Lock()
+	now := time.Now()
+	m.lastProofAt = now
+	m.lastEstablishAt = now
+	m.proofFailGen = 0
+	m.proofFailedAt = time.Time{}
+	m.proofCooldownWarnedAt = time.Time{}
+	m.proofRelaunched = false
+	m.mu.Unlock()
 }
 
 // jitter varies d by up to 10 percent so a fleet of minters does not recycle in
@@ -264,6 +671,32 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 
 		sess, err := m.launch(ctx)
 
+		// Mint the visitor's GVS token before the session is published. Every other
+		// caller is still parked on the single-flight channel, so this mint cannot
+		// interleave with another call on the same page, and it puts the token a
+		// consumer streams with well ahead of the first context establishment,
+		// which is the spacing waitSeparation then maintains. A failure here is not
+		// fatal: the session is published anyway and the next token request mints
+		// on demand.
+		var premint browser.MintResult
+		var premintBinding string
+		preminted := false
+		if err == nil && !m.skipPremint {
+			premintBinding = sess.Identity().VisitorData
+			res, mintErr := sess.Mint(ctx, premintBinding)
+			switch {
+			case mintErr == nil:
+				m.metrics.Mints.Add(1)
+				premint, preminted = res, true
+			case ctx.Err() != nil:
+				// A canceled or timed-out launch is not a mint failure, matching Mint.
+				m.log.Warn("minter: startup mint abandoned", "err", mintErr)
+			default:
+				m.metrics.MintFailures.Add(1)
+				m.log.Warn("minter: startup mint failed; the next token request mints on demand", "err", mintErr)
+			}
+		}
+
 		m.mu.Lock()
 		m.launching = nil
 		close(ch)
@@ -274,11 +707,32 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		}
 		m.sess = sess
 		m.gen++
+		// A new page has no mint, proof, or establishment behind it, and no prior
+		// generation's proof failure applies to it. The pre-mint above, when it
+		// succeeded, is this generation's first mark.
+		m.lastMintAt = time.Time{}
+		m.lastProofAt = time.Time{}
+		m.lastEstablishAt = time.Time{}
+		m.proofFailGen = 0
+		m.proofFailedAt = time.Time{}
+		m.proofCooldownWarnedAt = time.Time{}
 		// A generation bump invalidates every cached token. Under m.mu, no
 		// new-generation cachePut can interleave before the clear, so every existing
 		// entry belongs to the old session. Clear only the positive cache: an
 		// unplayable video remains unplayable across a relaunch.
 		clear(m.cache)
+		if preminted {
+			m.lastMintAt = time.Now()
+			// Cache the pre-mint under both the gvs and the default (pot) scope: scope
+			// only namespaces the cache and the token is identical either way, so a
+			// consumer that asks for either gets the hit. Writing it here, in the same
+			// critical section that publishes m.sess, means a waiter released by
+			// close(ch) above can never observe the session without also seeing its
+			// token, even though that waiter cannot actually proceed until this
+			// critical section ends.
+			m.cachePutLocked(cacheKey("gvs", premintBinding), premint, m.gen)
+			m.cachePutLocked(cacheKey("pot", premintBinding), premint, m.gen)
+		}
 		m.attestedAt = time.Now()
 		// Arm the streaming deadline for this generation.
 		if m.streamingMaxAge > 0 {
@@ -511,10 +965,27 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		m.metrics.CacheHits.Add(1)
 		return r, true, nil
 	}
-	m.metrics.CacheMisses.Add(1)
 
 	sess, gen, err := m.ensure(ctx)
 	if err != nil {
+		return browser.MintResult{}, false, err
+	}
+	// This call may be what triggered the launch, in which case ensure's own
+	// pre-mint could have just filled this exact entry. Check once more before
+	// minting again and overwriting it with a second, redundant token.
+	if r, ok := m.cacheGet(key); ok {
+		m.metrics.CacheHits.Add(1)
+		return r, true, nil
+	}
+	// Neither the pre-launch check nor the post-ensure recheck served this
+	// binding, so this call pays for an in-page mint below: a genuine miss.
+	// Counted here, after both rechecks, so a request served by the pre-mint
+	// counts as a hit only, and a request whose launch failed above is counted by
+	// launch_failures alone rather than also as a cache miss.
+	m.metrics.CacheMisses.Add(1)
+	// A token minted right after an establishment is graded the same way as one
+	// the establishment followed, so the mint waits too.
+	if err := m.waitBeforeMint(ctx); err != nil {
 		return browser.MintResult{}, false, err
 	}
 	res, err = sess.Mint(ctx, binding)
@@ -528,6 +999,9 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		}
 		m.metrics.MintFailures.Add(1)
 		m.log.Warn("minter: mint failed; retrying on same session", "gen", gen, "err", err)
+		if err := m.waitBeforeMint(ctx); err != nil {
+			return browser.MintResult{}, false, err
+		}
 		res, err = sess.Mint(ctx, binding)
 	}
 	if err != nil { // level 2: escalate to a relaunch and re-attest on a fresh session.
@@ -541,6 +1015,8 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		if err != nil {
 			return browser.MintResult{}, false, err
 		}
+		// No recheck here: the relaunch's pre-mint binds its own fresh browser
+		// identity, never this request's binding, so it cannot have filled this key.
 		if res, err = sess.Mint(ctx, binding); err != nil {
 			if ctx.Err() != nil {
 				return browser.MintResult{}, false, ctx.Err()
@@ -550,6 +1026,7 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		}
 	}
 	m.metrics.Mints.Add(1)
+	m.markMinted()
 	m.cachePut(key, res, gen)
 	return res, false, nil
 }
@@ -574,9 +1051,23 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, 0, err
 	}
 
+	// Prove the session before serving any context from it, then keep the context
+	// away from the last in-page mint. refreshStreamingSession may have relaunched
+	// and pre-minted, which is why both run after it. ensureProven may itself
+	// relaunch on a second proof failure, so it hands back the session and
+	// generation the rest of this request must use.
+	sess, gen, err = m.ensureProven(ctx, sess, gen, "player-context")
+	if err != nil {
+		return browser.PlayerContext{}, gen, err
+	}
+	if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
+		return browser.PlayerContext{}, gen, err
+	}
 	pc, err := sess.PlayerContext(ctx, videoID)
+	m.markPlayback() // any attempt, successful or not, arms the mint gate.
 	if err == nil {
 		m.metrics.PlayerContexts.Add(1)
+		m.markEstablished()
 		return pc, gen, nil
 	}
 	if m.playerContextStop(ctx, videoID, err) { // terminal or cancelled: don't escalate.
@@ -585,9 +1076,14 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 
 	// level 1: transient failure, one in-place retry, no re-attest.
 	m.log.Warn("minter: player-context failed; retrying on same session", "gen", gen, "err", err)
+	if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
+		return browser.PlayerContext{}, gen, err
+	}
 	pc, err = sess.PlayerContext(ctx, videoID)
+	m.markPlayback()
 	if err == nil {
 		m.metrics.PlayerContexts.Add(1)
+		m.markEstablished()
 		return pc, gen, nil
 	}
 	if m.playerContextStop(ctx, videoID, err) {
@@ -619,7 +1115,17 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	if err != nil {
 		return browser.PlayerContext{}, 0, err
 	}
+	// The relaunched page has never played and was pre-minted, so this attempt
+	// needs the same proof and the same spacing as the two before it.
+	sess, gen, err = m.ensureProven(ctx, sess, gen, "player-context")
+	if err != nil {
+		return browser.PlayerContext{}, gen, err
+	}
+	if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
+		return browser.PlayerContext{}, gen, err
+	}
 	pc, err = sess.PlayerContext(ctx, videoID)
+	m.markPlayback()
 	if err != nil {
 		m.metrics.PlayerContextFailures.Add(1)
 		if errors.Is(err, browser.ErrUnplayable) {
@@ -629,6 +1135,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, gen, fmt.Errorf("minter: player-context failed after relaunch: %w", err)
 	}
 	m.metrics.PlayerContexts.Add(1)
+	m.markEstablished()
 	return pc, gen, nil
 }
 
@@ -711,17 +1218,24 @@ func (m *Minter) cacheGet(key string) (browser.MintResult, bool) {
 }
 
 func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cachePutLocked(key, res, gen)
+}
+
+// cachePutLocked is cachePut for a caller that already holds m.mu, such as
+// ensure writing the pre-mint's entries in the same critical section that
+// publishes the session.
+func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) {
+	if gen != m.gen { // session was recycled mid-mint; don't cache a stale-gen token.
+		return
+	}
 	ttl := time.Duration(res.Lifetime) * time.Second
 	if ttl <= 0 || ttl > minterMaxCacheTTL {
 		ttl = minterMaxCacheTTL
 	}
 	if ttl -= minterCacheMargin; ttl < 0 {
 		ttl = 0
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gen != m.gen { // session was recycled mid-mint; don't cache a stale-gen token.
-		return
 	}
 	now := time.Now() // one clock read, matching negCachePut
 	// Only a new key can force eviction; refreshing a cached key must not remove
@@ -754,6 +1268,19 @@ func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
 // producing generation. The operation holds mintMu so the values come from the
 // same session generation, and it refreshes a stale or reported-degraded session
 // first so a consumer adopts a fresh identity.
+//
+// A session that has not yet proved runs through ensureProven, the same helper
+// /player-context uses, so /session gets the same cool-down, one-relaunch-per-
+// streak, deadline handling, and unproven_rejections accounting: a session that
+// cannot prove full-length streaming is refused rather than exported. Unlike a
+// served context, the identity and cookies /session hands out are not held back
+// by the mint-separation window: that window exists to keep a context's own
+// establishment away from a recent mint, and ensureProven's proof is exactly the
+// kind of establishment the window already treats as harmless, per its own
+// doc. The daemon binary's normal path pays nothing extra here, because the
+// startup self-test already proves the session before any request arrives, so
+// ensureProven's Established check short-circuits by the time a consumer calls
+// /session.
 func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http.Cookie, uint64, error) {
 	m.mintMu.Lock()
 	defer m.mintMu.Unlock()
@@ -761,7 +1288,8 @@ func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http
 	if err != nil {
 		return browser.Identity{}, nil, 0, err
 	}
-	if err := sess.EnsureEstablished(ctx); err != nil {
+	sess, gen, err = m.ensureProven(ctx, sess, gen, "session")
+	if err != nil {
 		return browser.Identity{}, nil, 0, err
 	}
 	cookies, err := sess.BrowserCookies(ctx)
@@ -895,33 +1423,64 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 	}
 	vd := sess.Identity().VisitorData
 
-	var res browser.MintResult
-	var mintErr error
-	for attempt := 1; attempt <= selfTestMintAttempts; attempt++ {
-		if res, mintErr = sess.Mint(ctx, vd); mintErr == nil {
-			break
-		}
-		// Count attempts, matching the Mint path.
-		m.metrics.MintFailures.Add(1)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if attempt < selfTestMintAttempts {
-			select {
-			case <-ctx.Done():
+	// Attestation already mints this token, so the self-test mints only when that
+	// entry is missing, which means the pre-mint failed.
+	if _, ok := m.cacheGet(cacheKey("gvs", vd)); !ok {
+		var res browser.MintResult
+		var mintErr error
+		for attempt := 1; attempt <= selfTestMintAttempts; attempt++ {
+			if res, mintErr = sess.Mint(ctx, vd); mintErr == nil {
+				break
+			}
+			// Count attempts, matching the Mint path.
+			m.metrics.MintFailures.Add(1)
+			if ctx.Err() != nil {
 				return ctx.Err()
-			case <-time.After(selfTestMintRetryDelay):
+			}
+			if attempt < selfTestMintAttempts {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(selfTestMintRetryDelay):
+				}
 			}
 		}
+		if mintErr != nil {
+			return fmt.Errorf("minter: self-test mint failed after %d attempts: %w", selfTestMintAttempts, mintErr)
+		}
+		m.metrics.Mints.Add(1)
+		m.markMinted()
+		// Cache under both the gvs and the default (pot) scope, matching the
+		// pre-mint's dual write: scope only namespaces the cache and the token is
+		// identical either way.
+		m.cachePut(cacheKey("gvs", vd), res, gen)
+		m.cachePut(cacheKey("pot", vd), res, gen)
 	}
-	if mintErr != nil {
-		return fmt.Errorf("minter: self-test mint failed after %d attempts: %w", selfTestMintAttempts, mintErr)
-	}
-	m.metrics.Mints.Add(1)
-	m.cachePut(cacheKey("gvs", vd), res, gen)
 
-	if err := sess.EnsureEstablished(ctx); err != nil {
-		m.log.Warn("minter: self-test establishment failed; a later /session or /player-context request will retry", "err", err)
+	// The proof playback right after the startup mint is measured harmless, so it
+	// is not held back; only a consumer's own context is. A session that already
+	// proved (a rerun of the self-test) has nothing left to establish:
+	// EnsureEstablished would short-circuit without playing anything, so marking
+	// a fresh proof here would move the separation anchor for free.
+	if !sess.Established() {
+		err := sess.EnsureEstablished(ctx)
+		// Any playback attempt, successful or not, arms the mint gate: see
+		// markPlayback. EnsureEstablished is only reached above when the session was
+		// not already established, so a rerun that finds it already proved never
+		// double-counts this mark.
+		m.markPlayback()
+		if err != nil {
+			m.log.Warn("minter: self-test establishment failed; a later /session or /player-context request will retry", "err", err)
+			// Record the failure on this generation through the same helper
+			// ensureProven uses for a first failure, so the first /player-context
+			// afterwards is refused instantly during the cool-down instead of paying
+			// for another proof attempt against a session that just failed one. The
+			// self-test never relaunches on its own, so it never claims the failure
+			// streak's relaunch: that stays available for ensureProven's own ladder.
+			m.recordProofFailure(gen, false)
+		} else {
+			m.markProved()
+		}
 	}
 	return nil
 }
@@ -937,6 +1496,8 @@ var lifetimeCounterKeys = []string{
 	"player_contexts",
 	"player_context_failures",
 	"status2_rejections",
+	"separation_waits",
+	"unproven_rejections",
 	"crashes",
 	"cache_hits",
 	"cache_misses",
@@ -954,20 +1515,22 @@ var lifetimeCounterKeys = []string{
 // Its key set must match lifetimeCounterKeys.
 func (m *Minter) counterValues() map[string]int64 {
 	return map[string]int64{
-		"attestations":                       m.metrics.Attestations.Load(),
-		"mints":                              m.metrics.Mints.Load(),
-		"mint_failures":                      m.metrics.MintFailures.Load(),
-		"escalations":                        m.metrics.Escalations.Load(),
-		"player_contexts":                    m.metrics.PlayerContexts.Load(),
-		"player_context_failures":            m.metrics.PlayerContextFailures.Load(),
-		"status2_rejections":                 m.metrics.Status2Rejections.Load(),
-		"crashes":                            m.metrics.Crashes.Load(),
-		"cache_hits":                         m.metrics.CacheHits.Load(),
-		"cache_misses":                       m.metrics.CacheMisses.Load(),
-		"cache_evictions":                    m.metrics.CacheEvictions.Load(),
-		"launch_failures":                    m.metrics.LaunchFailures.Load(),
-		"streaming_recycles":                 m.metrics.StreamingRecycles.Load(),
-		"report_driven_recycles":             m.metrics.ReportDrivenRecycles.Load(),
+		"attestations":                        m.metrics.Attestations.Load(),
+		"mints":                               m.metrics.Mints.Load(),
+		"mint_failures":                       m.metrics.MintFailures.Load(),
+		"escalations":                         m.metrics.Escalations.Load(),
+		"player_contexts":                     m.metrics.PlayerContexts.Load(),
+		"player_context_failures":             m.metrics.PlayerContextFailures.Load(),
+		"status2_rejections":                  m.metrics.Status2Rejections.Load(),
+		"separation_waits":                    m.metrics.SeparationWaits.Load(),
+		"unproven_rejections":                 m.metrics.UnprovenRejections.Load(),
+		"crashes":                             m.metrics.Crashes.Load(),
+		"cache_hits":                          m.metrics.CacheHits.Load(),
+		"cache_misses":                        m.metrics.CacheMisses.Load(),
+		"cache_evictions":                     m.metrics.CacheEvictions.Load(),
+		"launch_failures":                     m.metrics.LaunchFailures.Load(),
+		"streaming_recycles":                  m.metrics.StreamingRecycles.Load(),
+		"report_driven_recycles":              m.metrics.ReportDrivenRecycles.Load(),
 		"degradation_reports_accepted":        m.metrics.DegradationReportsAccepted.Load(),
 		"degradation_reports_rejected_stale":  m.metrics.DegradationReportsRejectedStale.Load(),
 		"degradation_reports_already_retired": m.metrics.DegradationReportsAlreadyRetired.Load(),

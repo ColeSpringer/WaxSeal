@@ -42,6 +42,14 @@ type Config struct {
 	// interval. A non-positive value uses minter.DefaultReportDebounce.
 	ReportDebounce time.Duration
 
+	// MintSeparation overrides, for every tenant, the spacing the minter keeps
+	// between an in-page mint and a context establishment, when positive. A
+	// non-positive value leaves each tenant's Minter to resolve its own
+	// env-derived default (WAXSEAL_MINT_SEPARATION, or 12s). The waxseal server
+	// command does not expose a flag for this; it exists for programmatic callers
+	// such as tests that need a daemon with a specific, known spacing.
+	MintSeparation time.Duration
+
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
 	// without a metrics key. It is ignored for keyless daemons, which already
 	// serve full detail.
@@ -97,7 +105,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce),
+		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce, cfg.MintSeparation),
 		log:           log,
 		metricsPublic: cfg.MetricsPublic,
 		// Hash once at startup. Request handling hashes the presented key and
@@ -200,7 +208,10 @@ func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
 // Serve accepts HTTP requests on ln and closes the listener before returning.
 func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
 
-// Shutdown drains in-flight requests, then tears down the browser.
+// Shutdown drains in-flight requests until ctx is done, then tears down the
+// browser regardless of whether the drain finished. The caller supplies the
+// drain budget through ctx; the waxseal server command bounds it with
+// --shutdown-timeout (default 60s).
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.srv.Shutdown(ctx)
 	s.tenants.Close()

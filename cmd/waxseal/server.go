@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,6 +28,7 @@ type serverOpts struct {
 	tenantKeys      string
 	streamingMaxAge string
 	reportDebounce  string
+	shutdownTimeout string
 	metricsPublic   bool
 	metricsKey      string
 	verbose         bool
@@ -45,6 +47,16 @@ const (
 	reportDebounceFloor = 5 * time.Second
 	// reportDebounceWarn marks values that make report-driven recycling infrequent.
 	reportDebounceWarn = time.Hour
+
+	// defaultShutdownTimeout bounds the drain on SIGTERM or SIGINT. It is sized to
+	// the work a real request does, not to requestProcessTimeout: cold
+	// /player-context calls measure 6 to 10 seconds and first-session establishment
+	// is documented at 10 to 30, so this covers both with roughly twice the headroom.
+	// Matching the 3 minute request timeout instead would make `docker compose down`
+	// hang that long against a wedged daemon, since stop_grace_period has to match.
+	// A request still running after a minute is pathological: it is severed, logged,
+	// and the daemon still exits 0. Operators who need longer set --shutdown-timeout.
+	defaultShutdownTimeout = 60 * time.Second
 )
 
 func newServerCmd() *cobra.Command {
@@ -55,7 +67,8 @@ func newServerCmd() *cobra.Command {
 		Long: "Run the HTTP daemon over a real headless Chromium. It defaults to loopback\n" +
 			"at 127.0.0.1:4416. Set --host 0.0.0.0 to expose it. With --tenant-keys,\n" +
 			"each key receives an isolated browser context. Without it, the server is\n" +
-			"keyless. It drains in-flight requests on SIGTERM or SIGINT.",
+			"keyless. On SIGTERM or SIGINT it drains in-flight requests for up to\n" +
+			"--shutdown-timeout (default 60s) before tearing the browser down.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
 	}
@@ -77,6 +90,11 @@ func newServerCmd() *cobra.Command {
 			"recycle per interval. This limits re-attestation caused by reports and\n"+
 			"applies separately to each tenant. Minimum 5s; report rate-limiting\n"+
 			"cannot be disabled.", minter.ReportBurst))
+	f.StringVar(&o.shutdownTimeout, "shutdown-timeout", "",
+		fmt.Sprintf("how long shutdown waits for in-flight requests to finish on\n"+
+			"SIGTERM or SIGINT (flag > WAXSEAL_SHUTDOWN_TIMEOUT env > %s default).\n"+
+			"A request still running when the budget expires is severed and logged;\n"+
+			"the daemon still exits 0.", defaultShutdownTimeout))
 	f.BoolVar(&o.metricsPublic, "metrics-public", false,
 		"serve full per-tenant /metrics detail (tenant labels + activity) to\n"+
 			"unauthenticated scrapes on a keyed daemon. Ignored without\n"+
@@ -157,6 +175,32 @@ func resolveReportDebounce(cmd *cobra.Command, o *serverOpts, logger *slog.Logge
 	} else {
 		logger.Info("report-debounce set", "value", d)
 	}
+	return d, nil
+}
+
+// resolveShutdownTimeout applies flag, environment, and default precedence. The
+// result bounds the SIGTERM/SIGINT drain; a non-positive value would either
+// abandon in-flight requests immediately or make shutdown wait forever, so
+// both are rejected the same as an unparseable duration.
+func resolveShutdownTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logger) (time.Duration, error) {
+	raw := defaultShutdownTimeout.String()
+	if v, ok := os.LookupEnv("WAXSEAL_SHUTDOWN_TIMEOUT"); ok {
+		raw = v
+	}
+	if cmd.Flags().Changed("shutdown-timeout") {
+		raw = o.shutdownTimeout
+	}
+	if raw = strings.TrimSpace(raw); raw == "" {
+		return defaultShutdownTimeout, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, &usageError{msg: fmt.Sprintf("invalid --shutdown-timeout %q: %v (use a Go duration like 60s)", raw, err)}
+	}
+	if d <= 0 {
+		return 0, &usageError{msg: fmt.Sprintf("invalid --shutdown-timeout %q: must be positive", raw)}
+	}
+	logger.Info("shutdown-timeout set", "value", d)
 	return d, nil
 }
 
@@ -248,6 +292,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		return failStartup(logger, err)
 	}
 	reportDebounce, err := resolveReportDebounce(cmd, o, logger)
+	if err != nil {
+		return failStartup(logger, err)
+	}
+	drainTimeout, err := resolveShutdownTimeout(cmd, o, logger)
 	if err != nil {
 		return failStartup(logger, err)
 	}
@@ -348,8 +396,32 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 			return err
 		}
 	}
-	logger.Info("shutting down")
-	shutCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+	logger.Info("shutting down", "drain_timeout", drainTimeout)
+	shutCtx, c := context.WithTimeout(context.Background(), drainTimeout)
 	defer c()
-	return srv.Shutdown(shutCtx)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		// The browser and its profile are torn down by Shutdown regardless of the
+		// drain result, so a drain budget that simply ran out
+		// (context.DeadlineExceeded, wrapped or bare) is routine: it is a warning
+		// about severed connections, not a failed stop. Any other error means the
+		// stop itself failed, and is returned so the existing exit-code mapping
+		// reports a real failure instead of every busy shutdown logging as a
+		// routine warning.
+		if !shutdownOutcome(err) {
+			logger.Error("shutdown failed", "err", err, "drain_timeout", drainTimeout)
+			return err
+		}
+		logger.Warn("drain budget expired; in-flight requests were severed", "err", err, "drain_timeout", drainTimeout)
+	}
+	return nil
+}
+
+// shutdownOutcome classifies the error srv.Shutdown returned. A nil error or a
+// context.DeadlineExceeded (wrapped or bare) means the drain budget simply ran
+// out: routine reports true, since the browser and its profile are torn down
+// by Shutdown regardless of the drain result and only in-flight requests were
+// severed. Any other error means the stop itself failed, so routine reports
+// false and the caller returns the error instead of warning past it.
+func shutdownOutcome(err error) (routine bool) {
+	return err == nil || errors.Is(err, context.DeadlineExceeded)
 }

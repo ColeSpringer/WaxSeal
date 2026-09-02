@@ -89,6 +89,19 @@ type Options struct {
 	NormalizeUA bool          // remove the HeadlessChrome marker in headless mode; UA-CH already matches Chromium
 	Logger      *slog.Logger  // nil discards
 	NavTimeout  time.Duration // watch-page navigation budget (default 45s)
+
+	// LandingURL parks the page here instead of the watch page built from the
+	// video ID. Only youtube.com exposes the ytcfg an identity is read from, so
+	// LandingURL belongs with StopAfterLoad, for checks that need a page loaded
+	// but not a YouTube session behind it.
+	LandingURL string
+
+	// StopAfterLoad returns the Session as soon as the landing page reports a
+	// completed load, before identity capture, signature-timestamp capture, and
+	// bundle injection. Such a Session carries no identity and no HTTP client, so
+	// it can only be closed. It exists so a caller can verify that Chromium
+	// starts a renderer and finishes a navigation without reaching YouTube.
+	StopAfterLoad bool
 }
 
 // Identity contains the browser session values that a consumer needs to adopt
@@ -141,9 +154,13 @@ type Session struct {
 // identities on one browser (multi-tenant), use LaunchPool and Pool.NewSession.
 //
 // Launch does not validate videoID. Callers that accept user input should check it
-// with ValidVideoID before calling Launch.
+// with ValidVideoID before calling Launch. With opts.StopAfterLoad the returned
+// Session stops short of the identity, so it can only be closed.
 func Launch(ctx context.Context, videoID string, opts Options) (*Session, error) {
 	opts = withDefaults(opts)
+	if err := validateLaunchOptions(opts); err != nil {
+		return nil, err
+	}
 	browser, profile, err := launchChromium(opts)
 	if err != nil {
 		return nil, err
@@ -159,6 +176,18 @@ func Launch(ctx context.Context, videoID string, opts Options) (*Session, error)
 	}
 	s.dispose = teardown
 	return s, nil
+}
+
+// validateLaunchOptions rejects Options combinations Launch cannot support.
+// LandingURL only makes sense together with StopAfterLoad: only a YouTube watch
+// page exposes the ytcfg identity capture reads, so a LandingURL session that
+// continued past the load event would have no identity, signature timestamp, or
+// HTTP client to build.
+func validateLaunchOptions(opts Options) error {
+	if opts.LandingURL != "" && !opts.StopAfterLoad {
+		return errors.New("waxseal: Options.LandingURL requires Options.StopAfterLoad")
+	}
+	return nil
 }
 
 func withDefaults(opts Options) Options {
@@ -238,6 +267,9 @@ const launchTimeout = 60 * time.Second
 // for a tenant), navigates to videoID's watch page, captures the identity, injects
 // the bundle, and builds the HTTP client. dispose is left for the caller to set.
 // On error the caller is responsible for teardown.
+//
+// opts.LandingURL replaces the watch page, and opts.StopAfterLoad returns right
+// after the load event, so a caller can exercise launch and navigation alone.
 func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options) (_ *Session, err error) {
 	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID}
 
@@ -261,17 +293,28 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 		}
 	}
 
-	watchURL := "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)
+	landingURL := "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)
+	if opts.LandingURL != "" {
+		landingURL = opts.LandingURL
+	}
+	// Record the parked URL up front so a StopAfterLoad session can report where it
+	// landed. captureIdentity rewrites the whole Identity with the same URL.
+	s.id.WatchURL = landingURL
 	navCtx, cancel := context.WithTimeout(ctx, opts.NavTimeout)
 	defer cancel()
-	if err = s.page.Context(navCtx).Navigate(watchURL); err != nil {
-		return nil, fmt.Errorf("waxseal: navigate watch page: %w", err)
+	if err = s.page.Context(navCtx).Navigate(landingURL); err != nil {
+		return nil, fmt.Errorf("waxseal: navigate landing page: %w", err)
 	}
+	// WaitLoad evaluates in the freshly committed document, so returning here also
+	// proves the renderer started and runs JavaScript.
 	if err = s.page.Context(navCtx).WaitLoad(); err != nil {
 		return nil, fmt.Errorf("waxseal: wait load: %w", err)
 	}
+	if opts.StopAfterLoad {
+		return s, nil
+	}
 
-	if err = s.captureIdentity(navCtx, watchURL); err != nil {
+	if err = s.captureIdentity(navCtx, landingURL); err != nil {
 		return nil, err
 	}
 	// signatureTimestamp is mandatory: a /player request without it returns
@@ -366,6 +409,9 @@ type Pool struct {
 // LaunchPool starts the shared Chromium. Close it to tear everything down.
 func LaunchPool(opts Options) (*Pool, error) {
 	opts = withDefaults(opts)
+	if err := validateLaunchOptions(opts); err != nil {
+		return nil, err
+	}
 	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(opts) }}
 	inst, err := p.newInstance()
 	if err != nil {
@@ -1703,6 +1749,20 @@ const (
 	bandResidual
 )
 
+// String names a confirmBand for diagnostic logging.
+func (b confirmBand) String() string {
+	switch b {
+	case bandCapSafe:
+		return "cap-safe"
+	case bandVerify:
+		return "verify"
+	case bandResidual:
+		return "residual"
+	default:
+		return "unknown"
+	}
+}
+
 // classifyBand chooses the confirm path from LengthSeconds. Unknown length
 // verifies at the full-length target. Known lengths at or below previewCapSecs are
 // cap-safe; the narrow interval above the cap is residual.
@@ -1721,6 +1781,36 @@ func classifyBand(length int) confirmBand {
 // previewCapSecs from passing for any video longer than the cap.
 func bufferedReachesEnd(length int, bufferedEnd float64) bool {
 	return bufferedEnd >= float64(length)-residualEndTol
+}
+
+// reducedStreamingURLParams are the query parameters kept by reduceStreamingURL.
+// They identify a SABR streaming URL without granting access to media through it.
+var reducedStreamingURLParams = [...]string{"id", "expire", "spc"}
+
+// reduceStreamingURL reduces a SABR streaming URL to the fields safe to put in a
+// log line: host, path, and the id, expire, and spc query parameters. It never
+// returns a signature, PoT, n, or lsig, so a logged line cannot be replayed as a
+// working media URL. A URL that fails to parse returns a fixed placeholder rather
+// than echoing the unparseable input, which net/url's own parse error otherwise
+// would (it embeds the original string), and which could itself be a partial
+// signed URL.
+func reduceStreamingURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "<unparseable>"
+	}
+	q := u.Query()
+	var kept []string
+	for _, key := range reducedStreamingURLParams {
+		if v := q.Get(key); v != "" {
+			kept = append(kept, key+"="+v)
+		}
+	}
+	reduced := u.Host + u.Path
+	if len(kept) > 0 {
+		reduced += "?" + strings.Join(kept, "&")
+	}
+	return reduced
 }
 
 // establishStatus1 establishes the requested video and returns its context only
@@ -1749,18 +1839,33 @@ func (s *Session) establishStatus1(ctx context.Context, page *cdp.Page, videoID 
 
 	switch classifyBand(length) {
 	case bandCapSafe:
-		// A preview covers the full video, so the URL cannot truncate.
+		// This band returns the context unconfirmed by design: videos at or under
+		// the preview length have been observed to truncate on it (a 60 second
+		// video stalling on its last segment). A buffered-past-the-cap confirm was
+		// not added here because inside the preview window that acceptor cannot
+		// fail, so it would add latency without proving anything.
+		s.log.Info("waxseal: player-context cap-safe band",
+			"video_id_len", len(videoID),
+			"band", bandCapSafe.String(),
+			"length_seconds", length,
+		)
+		if s.log.Enabled(ctx, slog.LevelDebug) {
+			s.log.Debug("waxseal: player-context cap-safe url",
+				"video_id", videoID,
+				"established_url", reduceStreamingURL(establishedURL),
+			)
+		}
 		return raw, nil
 	case bandVerify:
 		// Buffering past the target is the status-2 discriminator. Do not require
 		// strict playback advance here; under load, the buffer can prove the
 		// transition before currentTime moves.
-		return s.confirmAndReRead(ctx, page, videoID, seekTarget(length), establishedURL, confirmBudget,
+		return s.confirmAndReRead(ctx, page, videoID, seekTarget(length), establishedURL, confirmBudget, bandVerify,
 			func(b bufferedSample) bool { return b.CoversTarget })
 	default: // bandResidual
 		// For the narrow over-cap band, seek at the cap and require the buffer to
 		// reach the true end.
-		return s.confirmAndReRead(ctx, page, videoID, previewCapSecs, establishedURL, confirmBudget,
+		return s.confirmAndReRead(ctx, page, videoID, previewCapSecs, establishedURL, confirmBudget, bandResidual,
 			func(b bufferedSample) bool { return bufferedReachesEnd(length, b.BufferedEnd) })
 	}
 }
@@ -1773,7 +1878,10 @@ func (s *Session) establishStatus1(ctx context.Context, page *cdp.Page, videoID 
 //
 // The re-read has its own small budget so a slow confirm does not starve a
 // healthy post-transition extraction.
-func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID string, target int, establishedURL string, confirmBudget time.Duration, confirmed func(bufferedSample) bool) (playerContextRaw, error) {
+//
+// band identifies which establishStatus1 branch called in, for the diagnostic log
+// line below; it changes no confirm behavior.
+func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID string, target int, establishedURL string, confirmBudget time.Duration, band confirmBand, confirmed func(bufferedSample) bool) (playerContextRaw, error) {
 	cp, cerr := s.confirmPastCap(ctx, page, target, fullLengthTolSecs, establishedURL, time.Now().Add(confirmBudget), confirmed)
 	if cerr != nil {
 		return playerContextRaw{}, cerr // canceled
@@ -1781,7 +1889,32 @@ func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID 
 	if err := confirmError(cp); err != nil {
 		return playerContextRaw{}, err
 	}
-	return s.reReadContext(ctx, page, videoID, time.Now().Add(playerContextReReadBudget))
+	raw, err := s.reReadContext(ctx, page, videoID, time.Now().Add(playerContextReReadBudget))
+	if err != nil {
+		return playerContextRaw{}, err
+	}
+
+	// Diagnostic only: this is the discriminating measurement between a stale
+	// cached URL and a status-2 grade read too early, the two competing
+	// explanations for a truncated stream. It changes no return value or timing.
+	s.log.Info("waxseal: player-context confirmed",
+		"video_id_len", len(videoID),
+		"band", band.String(),
+		"length_seconds", raw.LengthSeconds,
+		"context_url_changed", cp.ContextURLChanged,
+		"buffered_end", cp.BufferedEnd,
+		"current_seconds", cp.CurrentSeconds,
+		"outcome", cp.Outcome,
+		"final_url_matches_established", raw.ServerAbrStreamingURL == establishedURL,
+	)
+	if s.log.Enabled(ctx, slog.LevelDebug) {
+		s.log.Debug("waxseal: player-context confirmed urls",
+			"video_id", videoID,
+			"established_url", reduceStreamingURL(establishedURL),
+			"final_url", reduceStreamingURL(raw.ServerAbrStreamingURL),
+		)
+	}
+	return raw, nil
 }
 
 // confirmError maps a completed confirm probe to the minter recovery class. A

@@ -280,7 +280,7 @@ func TestRoutesMethodMatching(t *testing.T) {
 
 func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodGet, "/get_pot", nil) // no API key
@@ -311,7 +311,7 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 // needed.
 func TestHeadGate(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0), // keyless, no browser
+		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0, 0), // keyless, no browser
 		log:     slog.New(slog.DiscardHandler),
 	}
 	mux := s.routes()
@@ -422,7 +422,7 @@ func TestNotFoundJSONEnvelope(t *testing.T) {
 
 	// Unknown paths on keyed daemons return 404 without an auth challenge.
 	keyed := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r = httptest.NewRequest(http.MethodGet, "/nope", nil) // no API key
@@ -458,7 +458,7 @@ func TestNotFoundJSONEnvelope(t *testing.T) {
 
 func TestTenantUnauthorizedCode(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, "/get_pot", nil)
@@ -518,7 +518,7 @@ func TestDecodeErrMsg(t *testing.T) {
 // live session is needed because the decoder runs right after auth.
 func postKeyed(path, body string) *httptest.ResponseRecorder {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -743,7 +743,7 @@ func (f *fakePlayerSession) Close() { f.closed.Store(true) }
 // (generation 1), so live-session handlers run without a browser.
 func liveServer(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) *Server {
 	t.Helper()
-	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0)
+	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0, 0)
 	for key, sess := range sessions {
 		if _, err := tn.InjectSessionForTest(context.Background(), key, sess); err != nil {
 			t.Fatalf("inject session for %q: %v", key, err)
@@ -802,7 +802,7 @@ func aggregateCounter(t *testing.T, s *Server, name string) float64 {
 // The deadline is forced into the past to keep the test deterministic.
 func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 	ctx := context.Background()
-	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
 	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
 	if err != nil {
 		t.Fatalf("inject: %v", err)
@@ -834,7 +834,7 @@ func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 // behavior to the operator-visible metrics contract.
 func TestMetricsSurfacesCacheEvictions(t *testing.T) {
 	ctx := context.Background()
-	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
 	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
 	if err != nil {
 		t.Fatalf("inject: %v", err)
@@ -1146,7 +1146,7 @@ func TestPingReason(t *testing.T) {
 			}
 
 			// No session yet: benign no-session.
-			noSess := &Server{tenants: minter.NewTenants(nil, "", tc.keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+			noSess := &Server{tenants: minter.NewTenants(nil, "", tc.keys, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 			if resp := ping(noSess); resp["ok"] != false || resp["reason"] != "no-session" {
 				t.Errorf("no-session: ok=%v reason=%v, want false/no-session", resp["ok"], resp["reason"])
 			}
@@ -1209,7 +1209,7 @@ func TestPingStrict(t *testing.T) {
 		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/x", vd: "vd", pingErr: probeErr}})
 	}
 	newNoSession := func() *Server {
-		return &Server{tenants: minter.NewTenants(nil, "", keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+		return &Server{tenants: minter.NewTenants(nil, "", keys, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	}
 
 	// With ?strict=true only a real probe failure flips to 503.
@@ -1415,7 +1415,7 @@ func TestHandleReportLive(t *testing.T) {
 
 func TestHandleReportValidation(t *testing.T) {
 	newSrv := func() *Server {
-		return &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+		return &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	}
 	t.Run("no auth is 401", func(t *testing.T) {
 		s := newSrv()
@@ -1466,7 +1466,7 @@ func TestHandleReportValidation(t *testing.T) {
 
 func TestHandleReportNoSessionReflectsResult(t *testing.T) {
 	// A report for an unwarmed tenant is returned as not accepted.
-	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"cap"}`))
 	r.Header.Set("X-API-Key", "K")
 	w := httptest.NewRecorder()
@@ -1618,7 +1618,7 @@ func TestGetPotDecodeMessages(t *testing.T) {
 }
 
 func TestPlayerContextEmptyBodyReportsMissingVideoID(t *testing.T) {
-	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader("")) // empty body, no query
 	r.Header.Set("X-API-Key", "K")
 	w := httptest.NewRecorder()
@@ -1959,5 +1959,49 @@ func TestInnerDeadlineIsNot504(t *testing.T) {
 	}
 	if w.Code != http.StatusBadGateway || decodeCode(t, w.Body.Bytes()) != CodeMintFailed {
 		t.Errorf("status/code = %d/%q, want 502/%q", w.Code, decodeCode(t, w.Body.Bytes()), CodeMintFailed)
+	}
+}
+
+// TestPlayerContextUnprovenSessionMaps502 checks that a session which cannot
+// prove full-length streaming reaches the client as 502/player-context-failed,
+// the same shape any other refused player-context request uses.
+func TestPlayerContextUnprovenSessionMaps502(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodePlayerContextFailed {
+		t.Errorf("code = %q, want %q", got, CodePlayerContextFailed)
+	}
+	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
+		t.Errorf("unproven_rejections = %v, want 1", got)
+	}
+}
+
+// TestSessionUnprovenSessionMaps503 checks that a session which cannot prove
+// full-length streaming reaches /session as 503/no-session, the same shape any
+// other missing-session response uses. SessionSnapshot routes its proof through
+// the same ensureProven ladder /player-context uses, so the failure also counts
+// toward unproven_rejections.
+func TestSessionUnprovenSessionMaps503(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s, want 503", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeNoSession {
+		t.Errorf("code = %q, want %q", got, CodeNoSession)
+	}
+	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
+		t.Errorf("unproven_rejections = %v, want 1", got)
 	}
 }

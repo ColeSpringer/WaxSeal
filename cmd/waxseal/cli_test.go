@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -241,6 +244,7 @@ func TestServerInvalidPortUsageError(t *testing.T) {
 	// environment.
 	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
 	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
 	code, _, stderr := runCLI("server", "--port", "99999999")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
@@ -255,6 +259,7 @@ func TestServerInvalidPortUsageError(t *testing.T) {
 func TestServerInvalidTenantKeysUsageError(t *testing.T) {
 	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
 	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
 	for _, tc := range []struct {
 		name, keys, wantMsg string
 	}{
@@ -297,6 +302,7 @@ func TestServerMetricsFlagsParse(t *testing.T) {
 func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
 	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
 	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
 	code, _, stderr := runCLI("server", "--tenant-keys", "alice=KEYA,bob=KEYB", "--metrics-key", "KEYA")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
@@ -333,6 +339,7 @@ func TestValidateLandingVideo(t *testing.T) {
 func TestCommandsRejectInvalidLandingVideo(t *testing.T) {
 	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
 	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -592,5 +599,210 @@ func TestResolveReportDebounce(t *testing.T) {
 				t.Errorf("%q exitCodeFor = %d, want 2", bad, got)
 			}
 		})
+	}
+}
+
+// resolveSDT binds the flag before resolving it.
+func resolveSDT(t *testing.T, flagArgs ...string) (time.Duration, error) {
+	t.Helper()
+	var o serverOpts
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().StringVar(&o.shutdownTimeout, "shutdown-timeout", "", "")
+	if err := cmd.ParseFlags(flagArgs); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	return resolveShutdownTimeout(cmd, &o, slog.New(slog.DiscardHandler))
+}
+
+func TestResolveShutdownTimeout(t *testing.T) {
+	t.Run("flag set", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_SHUTDOWN_TIMEOUT")
+		d, err := resolveSDT(t, "--shutdown-timeout", "30s")
+		if err != nil || d != 30*time.Second {
+			t.Fatalf("flag = (%v, %v), want 30s", d, err)
+		}
+	})
+	t.Run("env set", func(t *testing.T) {
+		t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "90s")
+		d, err := resolveSDT(t)
+		if err != nil || d != 90*time.Second {
+			t.Fatalf("env = (%v, %v), want 90s", d, err)
+		}
+	})
+	t.Run("both set: flag wins", func(t *testing.T) {
+		t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "45s")
+		d, err := resolveSDT(t, "--shutdown-timeout", "15s")
+		if err != nil || d != 15*time.Second {
+			t.Fatalf("both set = (%v, %v), want the flag's 15s", d, err)
+		}
+	})
+	t.Run("neither set: default", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_SHUTDOWN_TIMEOUT")
+		d, err := resolveSDT(t)
+		if err != nil || d != defaultShutdownTimeout {
+			t.Fatalf("neither set = (%v, %v), want %v", d, err, defaultShutdownTimeout)
+		}
+	})
+	for _, bad := range []string{"abc", "-5m", "0", "0s"} {
+		t.Run("reject "+bad, func(t *testing.T) {
+			os.Unsetenv("WAXSEAL_SHUTDOWN_TIMEOUT")
+			d, err := resolveSDT(t, "--shutdown-timeout", bad)
+			if err == nil {
+				t.Fatalf("%q = (%v, nil), want an error", bad, d)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("%q exitCodeFor = %d, want 2", bad, got)
+			}
+		})
+	}
+}
+
+// The 60 second default has to cover first-session establishment (documented at
+// 10 to 30 seconds) with real headroom, or a routine stop under load goes back
+// to severing connections the way the bare 5 second literal it replaced did.
+func TestDefaultShutdownTimeoutCoversEstablishment(t *testing.T) {
+	if defaultShutdownTimeout < 45*time.Second {
+		t.Errorf("defaultShutdownTimeout = %v, want at least 45s", defaultShutdownTimeout)
+	}
+}
+
+// TestShutdownOutcome checks the routine-vs-failed classification the shutdown
+// path in runServer applies to srv.Shutdown's error: a nil error or a
+// context.DeadlineExceeded (wrapped or bare) is a routine drain-budget expiry,
+// while any other error means the stop itself failed.
+func TestShutdownOutcome(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, true},
+		{"bare deadline exceeded", context.DeadlineExceeded, true},
+		{"wrapped deadline exceeded", fmt.Errorf("shutdown: %w", context.DeadlineExceeded), true},
+		{"unrelated error", errors.New("listener close failed"), false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shutdownOutcome(tt.err); got != tt.want {
+				t.Errorf("shutdownOutcome(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// --full needs an attested session, so pairing it with a flag that stops short of
+// one is a usage error (exit 2) reported before any browser starts.
+func TestDoctorSkipAttestWithFullIsUsageError(t *testing.T) {
+	for _, stage := range []string{"--skip-attest", "--stop-after-load"} {
+		t.Run(stage, func(t *testing.T) {
+			code, stdout, stderr := runCLI("doctor", stage, "--full")
+			if code != 2 {
+				t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+			}
+			if !strings.Contains(stderr, "--full needs an attested session") {
+				t.Errorf("stderr = %q, want it to explain that --full needs an attested session", stderr)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want nothing written before the usage error", stdout)
+			}
+		})
+	}
+}
+
+// --stop-after-load stops before attestation runs, so combining it with
+// --skip-attest would silently let the earlier stage win; reject the pair
+// instead.
+func TestDoctorStopAfterLoadWithSkipAttestIsUsageError(t *testing.T) {
+	code, stdout, stderr := runCLI("doctor", "--stop-after-load", "--skip-attest")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "--stop-after-load") || !strings.Contains(stderr, "--skip-attest") {
+		t.Errorf("stderr = %q, want it to name both flags", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing written before the usage error", stdout)
+	}
+}
+
+// --landing-url only makes sense with --stop-after-load: identity capture reads
+// ytcfg, which only a watch page exposes.
+func TestDoctorLandingURLRequiresStopAfterLoad(t *testing.T) {
+	code, _, stderr := runCLI("doctor", "--landing-url", "http://127.0.0.1:1/")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "--landing-url needs --stop-after-load") {
+		t.Errorf("stderr = %q, want it to name the missing flag", stderr)
+	}
+}
+
+// The stage flags bind to their fields.
+func TestDoctorStageFlagsParse(t *testing.T) {
+	c := newDoctorCmd()
+	if err := c.ParseFlags([]string{"--skip-attest", "--stop-after-load", "--landing-url", "file:///tmp/x.html"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if skip, _ := c.Flags().GetBool("skip-attest"); !skip {
+		t.Error("--skip-attest did not parse to true")
+	}
+	if stop, _ := c.Flags().GetBool("stop-after-load"); !stop {
+		t.Error("--stop-after-load did not parse to true")
+	}
+	if u, _ := c.Flags().GetString("landing-url"); u != "file:///tmp/x.html" {
+		t.Errorf("--landing-url = %q, want file:///tmp/x.html", u)
+	}
+}
+
+// A skipped attestation omits the attest key entirely, so it cannot be read as a
+// failed grade. An attestation that ran reports its grade.
+func TestDoctorReportOmitsSkippedAttestation(t *testing.T) {
+	id := browser.Identity{VisitorData: "VD"}
+	skipped := doctorReport(id, "")
+	if _, ok := skipped["attest"]; ok {
+		t.Errorf("skipped report = %v, want no attest key", skipped)
+	}
+	if skipped["identity"] != any(id) {
+		t.Errorf("skipped report identity = %v, want %v", skipped["identity"], id)
+	}
+	attested := doctorReport(id, "integrity")
+	if attested["attest"] != "integrity" {
+		t.Errorf("attested report attest = %v, want integrity", attested["attest"])
+	}
+}
+
+// The default --stop-after-load target is served from loopback, so the check
+// needs no external network. The server stops when the returned function runs.
+func TestDoctorLandingPageServesOnLoopback(t *testing.T) {
+	pageURL, stop, err := serveLandingPage()
+	if err != nil {
+		t.Fatalf("serveLandingPage: %v", err)
+	}
+	defer stop()
+
+	u, err := url.Parse(pageURL)
+	if err != nil {
+		t.Fatalf("landing URL %q: %v", pageURL, err)
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		t.Errorf("landing URL %q does not bind loopback", pageURL)
+	}
+	resp, err := http.Get(pageURL)
+	if err != nil {
+		t.Fatalf("GET %s: %v", pageURL, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := string(body); got != landingPageHTML {
+		t.Errorf("body = %q, want %q", got, landingPageHTML)
+	}
+	stop()
+	if resp, err := http.Get(pageURL); err == nil {
+		resp.Body.Close()
+		t.Error("the landing page still answers after stop()")
 	}
 }
