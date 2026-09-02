@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -102,6 +104,49 @@ type Options struct {
 	// it can only be closed. It exists so a caller can verify that Chromium
 	// starts a renderer and finishes a navigation without reaching YouTube.
 	StopAfterLoad bool
+
+	// UAHints selects where the client hints in the user-agent override come
+	// from: UAHintsReal echoes the browser's own navigator.userAgentData, and
+	// UAHintsSynthetic uses the block WaxSeal fabricates from the UA string.
+	// Empty reads WAXSEAL_UA_HINTS and then defaults to UAHintsReal. It only
+	// matters when NormalizeUA is set.
+	UAHints string
+}
+
+// Sources for the UA-CH block installed by NormalizeUA.
+//
+// UAHintsReal is the default: real Chrome randomises its GREASE brand per build,
+// carries a four-part build version, and names its own brand, so a fabricated
+// block is itself a marker. UAHintsSynthetic restores the fabricated block and
+// exists as a kill switch, because this is the one surface whose fidelity can
+// move the attestation grade in either direction.
+const (
+	UAHintsReal      = "real"
+	UAHintsSynthetic = "synthetic"
+)
+
+// uaHintsEnv names the kill switch for the client-hint source.
+const uaHintsEnv = "WAXSEAL_UA_HINTS"
+
+// uaHintsUnknownOnce keeps an unrecognised WAXSEAL_UA_HINTS to one warning per
+// process, since every session constructor resolves the same value.
+var uaHintsUnknownOnce sync.Once
+
+// uaHintsFromEnv reads the client-hint source. Anything but the two known values
+// keeps the default and says so once.
+func uaHintsFromEnv(log *slog.Logger) string {
+	switch raw := strings.TrimSpace(os.Getenv(uaHintsEnv)); raw {
+	case "":
+		return UAHintsReal
+	case UAHintsReal, UAHintsSynthetic:
+		return raw
+	default:
+		uaHintsUnknownOnce.Do(func() {
+			log.Warn("waxseal: ignoring "+uaHintsEnv+"; want "+UAHintsReal+" or "+UAHintsSynthetic,
+				"value", raw, "using", UAHintsReal)
+		})
+		return UAHintsReal
+	}
 }
 
 // Identity contains the browser session values that a consumer needs to adopt
@@ -169,7 +214,8 @@ func Launch(ctx context.Context, videoID string, opts Options) (*Session, error)
 		_ = browser.Close()
 		profile.cleanup()
 	}
-	s, err := setupSession(ctx, browser, videoID, opts)
+	// This Chromium serves one session, so its override cache has one user.
+	s, err := setupSession(ctx, browser, videoID, opts, &uaOverrideCache{})
 	if err != nil {
 		teardown()
 		return nil, err
@@ -187,6 +233,13 @@ func validateLaunchOptions(opts Options) error {
 	if opts.LandingURL != "" && !opts.StopAfterLoad {
 		return errors.New("waxseal: Options.LandingURL requires Options.StopAfterLoad")
 	}
+	// Empty means unset, which withDefaults resolves. Any other unknown value was
+	// typed by a caller, and a typo should not silently pick a mode.
+	switch opts.UAHints {
+	case "", UAHintsReal, UAHintsSynthetic:
+	default:
+		return fmt.Errorf("waxseal: Options.UAHints is %q; want %q or %q", opts.UAHints, UAHintsReal, UAHintsSynthetic)
+	}
 	return nil
 }
 
@@ -196,6 +249,9 @@ func withDefaults(opts Options) Options {
 	}
 	if opts.NavTimeout <= 0 {
 		opts.NavTimeout = 45 * time.Second
+	}
+	if opts.UAHints == "" {
+		opts.UAHints = uaHintsFromEnv(opts.Logger)
 	}
 	return opts
 }
@@ -270,7 +326,7 @@ const launchTimeout = 60 * time.Second
 //
 // opts.LandingURL replaces the watch page, and opts.StopAfterLoad returns right
 // after the load event, so a caller can exercise launch and navigation alone.
-func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options) (_ *Session, err error) {
+func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options, uaCache *uaOverrideCache) (_ *Session, err error) {
 	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID}
 
 	// Bind page creation (createTarget/attachToTarget/Page.enable) to the caller's
@@ -287,8 +343,17 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 		return nil, fmt.Errorf("waxseal: bypass csp: %w", err)
 	}
 
+	// One budget covers everything this setup does on the page: the client-hint
+	// capture, the landing navigation, the identity, and the signature timestamp.
+	// The capture runs on this same page before navigation, so leaving it outside
+	// would make the two budgets additive and let a wedged loopback navigation
+	// spend uaHintsCaptureTimeout on top of the time NavTimeout declares, on every
+	// session and every recycle.
+	navCtx, cancel := context.WithTimeout(ctx, opts.NavTimeout)
+	defer cancel()
+
 	if opts.NormalizeUA {
-		if err = s.normalizeUA(ctx); err != nil {
+		if err = s.normalizeUA(navCtx, opts.UAHints, uaCache); err != nil {
 			return nil, err
 		}
 	}
@@ -300,8 +365,6 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 	// Record the parked URL up front so a StopAfterLoad session can report where it
 	// landed. captureIdentity rewrites the whole Identity with the same URL.
 	s.id.WatchURL = landingURL
-	navCtx, cancel := context.WithTimeout(ctx, opts.NavTimeout)
-	defer cancel()
 	if err = s.page.Context(navCtx).Navigate(landingURL); err != nil {
 		return nil, fmt.Errorf("waxseal: navigate landing page: %w", err)
 	}
@@ -351,8 +414,9 @@ var errPoolClosed = errors.New("waxseal: browser pool is closed")
 type browserInstance struct {
 	browser      *cdp.Browser
 	profile      profileHandle
-	onTeardown   func()    // test hook; nil in production
-	teardownOnce sync.Once // teardown runs at most once even if Close races a relaunch
+	uaOverride   uaOverrideCache // memoised user-agent override for this Chromium
+	onTeardown   func()          // test hook; nil in production
+	teardownOnce sync.Once       // teardown runs at most once even if Close races a relaunch
 }
 
 // teardown closes the browser (group-killing the process), then removes the
@@ -464,7 +528,10 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 		defer cancel()
 		_ = incog.Context(dctx).Close()
 	}
-	s, err := setupSession(ctx, incog, videoID, p.opts)
+	// The override is a constant of the running Chromium, so it is cached on the
+	// instance: every tenant session and every recycle on this browser reuses the
+	// first capture, and a relaunch replaces the instance and so re-captures.
+	s, err := setupSession(ctx, incog, videoID, p.opts, &inst.uaOverride)
 	if err != nil {
 		dispose()
 		return nil, err
@@ -607,6 +674,21 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 		VD, CV, Key, UA string
 		WD              bool
 	}
+	// The two fields do not necessarily appear together, so keep polling for the
+	// client version after visitor_data lands. Every InnerTube request the session
+	// makes without a live version falls back to the pinned constant in
+	// internal/innertube, which drifts. Holding the partial capture means a page
+	// that never exposes INNERTUBE_CLIENT_VERSION still yields a usable session
+	// instead of failing over one late field.
+	//
+	// clientVersionGrace bounds that extra wait. Both fields come out of the same
+	// ytcfg blob and normally appear together, so a few more polls is generous,
+	// while waiting the whole deadline would add 30s to setup on a page that never
+	// exposes the version, and setupSession's navigation budget covers the
+	// client-hint capture, navigation, this capture, and the signature timestamp
+	// in 45s total.
+	const clientVersionGrace = 2 * time.Second
+	var cvDeadline time.Time // set once visitor_data lands with no client version
 	page := s.page.Context(ctx)
 	for {
 		obj, err := page.Eval(js)
@@ -620,12 +702,34 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 			}
 			if jerr := json.Unmarshal([]byte(obj.Str()), &raw); jerr == nil && raw.VD != "" {
 				ident.VD, ident.CV, ident.Key, ident.UA, ident.WD = raw.VD, raw.CV, raw.Key, raw.UA, raw.WD
-				break
+				if raw.CV != "" {
+					break
+				}
+				if cvDeadline.IsZero() {
+					cvDeadline = time.Now().Add(clientVersionGrace)
+				}
 			}
 		}
-		// Success breaks out of the loop immediately after filling ident, so reaching
-		// the deadline here always means visitor_data was not captured.
-		if time.Now().After(deadline) {
+		// The loop breaks immediately on a complete capture, so reaching here with a
+		// grace deadline set means visitor_data is held and only the client version
+		// is missing. Proceed on the pinned fallback rather than failing the session.
+		//
+		// The fallback is written into the identity rather than left empty: this
+		// daemon's own InnerTube calls would recover from an empty version through
+		// GuestContext, but /session serializes the field verbatim, and a consumer
+		// that adopts the session would build its context with no client version at
+		// all, which is worse than one that has drifted.
+		if !cvDeadline.IsZero() {
+			// The outer deadline still applies. It can only be the one to fire when
+			// visitor_data landed in the last moments of the budget, and the partial
+			// capture is held either way.
+			if time.Now().After(cvDeadline) || time.Now().After(deadline) {
+				ident.CV = innertube.FallbackClientVersion
+				s.log.Warn("waxseal: ytcfg exposed no INNERTUBE_CLIENT_VERSION; using the pinned fallback, which drifts",
+					"visitor_data_len", len(ident.VD), "client_version", ident.CV)
+				break
+			}
+		} else if time.Now().After(deadline) {
 			return fmt.Errorf("waxseal: ytcfg visitor_data not available before deadline")
 		}
 		// Check cancellation between polls; otherwise a canceled request can wait
@@ -656,12 +760,116 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 // chromeMajorRE extracts the Chrome major version from a user agent.
 var chromeMajorRE = regexp.MustCompile(`Chrome/(\d+)`)
 
+// headlessMarker is the token that gives a headless build away, in the UA string
+// and in the brand list. Substituting it is the only edit the real-hint path
+// makes; everything else is passed through exactly as the browser reports it.
+//
+// Note for a later reader comparing this against host Google Chrome: Debian
+// chromium, which the shipped image runs, has no "Google Chrome" brand at all.
+// After this change the container correctly reports "Chromium" plus its own
+// randomised GREASE brand, while its UA string still says "Chrome/<version>",
+// because that is exactly what real Debian Chromium looks like. Do not
+// "restore" a fabricated "Google Chrome" brand; fabricating brands is the bug
+// this path removes.
+const headlessMarker = "HeadlessChrome"
+
+// unheadless removes the headless marker from a UA string or a brand name.
+func unheadless(s string) string { return strings.ReplaceAll(s, headlessMarker, "Chrome") }
+
+// uaBrandVersion decodes one navigator.userAgentData brand entry. It mirrors
+// cdp.UserAgentBrandVersion, which is the type it is copied into.
+type uaBrandVersion struct {
+	Brand   string `json:"brand"`
+	Version string `json:"version"`
+}
+
+// uaMetadata is the browser's own navigator.userAgentData, read from a secure
+// context. The low-entropy fields sit at the top level and the rest come back
+// from getHighEntropyValues.
+type uaMetadata struct {
+	UA       string           `json:"ua"`
+	Brands   []uaBrandVersion `json:"brands"`
+	Mobile   bool             `json:"mobile"`
+	Platform string           `json:"platform"`
+	Hints    struct {
+		Architecture    string           `json:"architecture"`
+		Bitness         string           `json:"bitness"`
+		FullVersionList []uaBrandVersion `json:"fullVersionList"`
+		Model           string           `json:"model"`
+		PlatformVersion string           `json:"platformVersion"`
+		UAFullVersion   string           `json:"uaFullVersion"`
+		Wow64           bool             `json:"wow64"`
+	} `json:"hints"`
+}
+
+// cdpBrands copies decoded brands into the CDP wire type, substituting the
+// headless marker. A nil input yields nil, so an absent list stays absent under
+// the omitempty tag rather than serialising as an empty array.
+func cdpBrands(in []uaBrandVersion) []*cdp.UserAgentBrandVersion {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*cdp.UserAgentBrandVersion, 0, len(in))
+	for _, b := range in {
+		out = append(out, &cdp.UserAgentBrandVersion{Brand: unheadless(b.Brand), Version: b.Version})
+	}
+	return out
+}
+
+// uaOverrideFromMetadata builds the override from what the browser reported,
+// changing only the headless marker. Real Chrome randomises its GREASE brand per
+// build, names its own brand, and carries a four-part build version, none of
+// which can be derived from the reduced UA string, so a synthesised block differs
+// from every real browser in stable, inspectable ways.
+//
+// It returns nil when the capture is missing any field the override would
+// otherwise advertise, which sends the caller to the synthesised block. The
+// high-entropy list and full version are included in that check: both are
+// omitempty on the wire, so a capture without them would install an override
+// that announces no Sec-CH-UA-Full-Version-List at all, which no real browser
+// does, rather than the coherent fallback.
+func uaOverrideFromMetadata(m *uaMetadata) *cdp.NetworkSetUserAgentOverride {
+	if m == nil || m.UA == "" || len(m.Brands) == 0 || m.Platform == "" ||
+		len(m.Hints.FullVersionList) == 0 || m.Hints.UAFullVersion == "" {
+		return nil
+	}
+	return &cdp.NetworkSetUserAgentOverride{
+		UserAgent: unheadless(m.UA),
+		UserAgentMetadata: &cdp.UserAgentMetadata{
+			Brands:          cdpBrands(m.Brands),
+			FullVersionList: cdpBrands(m.Hints.FullVersionList),
+			FullVersion:     m.Hints.UAFullVersion,
+			Platform:        m.Platform,
+			PlatformVersion: m.Hints.PlatformVersion,
+			Architecture:    m.Hints.Architecture,
+			Model:           m.Hints.Model,
+			Mobile:          m.Mobile,
+			Bitness:         m.Hints.Bitness,
+			Wow64:           m.Hints.Wow64,
+		},
+	}
+}
+
+// brandList renders a brand list for a log line; the slice holds pointers, which
+// would otherwise print as addresses.
+func brandList(brands []*cdp.UserAgentBrandVersion) string {
+	parts := make([]string, 0, len(brands))
+	for _, b := range brands {
+		parts = append(parts, b.Brand+"/"+b.Version)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // uaOverride builds the Network.setUserAgentOverride request for realUA. It
 // removes HeadlessChrome, derives UA-CH from the observed Chrome major version,
 // and falls back only for malformed input. TestUAOverride pins the exact JSON
 // shape used on the wire.
+//
+// This is the synthesised block. It is what UAHintsSynthetic selects and what the
+// real-hint path falls back to when the capture fails, since a browser with no
+// userAgentData still needs a coherent override.
 func uaOverride(realUA string) *cdp.NetworkSetUserAgentOverride {
-	fixed := strings.Replace(realUA, "HeadlessChrome", "Chrome", 1)
+	fixed := unheadless(realUA)
 	major := "149"
 	if m := chromeMajorRE.FindStringSubmatch(fixed); m != nil {
 		major = m[1]
@@ -688,18 +896,158 @@ func uaOverride(realUA string) *cdp.NetworkSetUserAgentOverride {
 	}
 }
 
+// uaHintsPageHTML is the inert document the client-hint capture serves to itself.
+const uaHintsPageHTML = "<!doctype html><title>waxseal client hints</title><p>ok\n"
+
+// serveUAHintsPage starts an HTTP server on loopback that serves one inert page
+// and returns its URL and a shutdown function.
+//
+// navigator.userAgentData is exposed only in a secure context, and about:blank,
+// where the override has to be installed because it must be in place before the
+// first YouTube request goes out, is not one: its origin is null. A loopback
+// http:// origin is treated as potentially trustworthy, so it exposes the full
+// surface while reaching nothing outside the host.
+func serveUAHintsPage() (string, func(), error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", nil, fmt.Errorf("waxseal: client-hint page listener: %w", err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, uaHintsPageHTML)
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	return "http://" + ln.Addr().String() + "/", func() { _ = srv.Close() }, nil
+}
+
+// uaHintsJS reads the whole navigator.userAgentData surface. brands, mobile, and
+// platform are synchronous; the rest need getHighEntropyValues, which returns a
+// promise that Eval awaits.
+const uaHintsJS = `async () => {
+	const d = navigator.userAgentData;
+	if (!d) return "";
+	const h = await d.getHighEntropyValues(
+		['architecture', 'bitness', 'fullVersionList', 'model', 'platformVersion', 'uaFullVersion', 'wow64']);
+	return JSON.stringify({ua: navigator.userAgent, brands: d.brands, mobile: d.mobile, platform: d.platform, hints: h});
+}`
+
+// uaOverrideCache memoises the real-hint override for one Chromium process. The
+// override is built from navigator.userAgentData, which is a constant of the
+// running binary, so every session on the same browser (each tenant's context,
+// each recycle) would capture the same values; instead the first usable capture
+// is kept for the life of the instance, and a relaunch starts a fresh cache with
+// its new process. Only a usable capture is kept: a failed or incomplete one
+// leaves the cache empty so the next session tries again rather than pinning
+// the synthesised fallback for the browser's lifetime.
+type uaOverrideCache struct {
+	mu       sync.Mutex
+	override *cdp.NetworkSetUserAgentOverride
+}
+
+// realOverride returns the memoised override, running capture to fill the cache
+// the first time. The lock is held across the capture, so concurrent first
+// sessions on one browser share a single capture instead of racing to make one
+// each. The returned override is shared and must be treated as read-only.
+func (c *uaOverrideCache) realOverride(capture func() *cdp.NetworkSetUserAgentOverride) *cdp.NetworkSetUserAgentOverride {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.override == nil {
+		c.override = capture()
+	}
+	return c.override
+}
+
+// uaHintsCaptureTimeout bounds the client-hint capture. It is optional work with
+// a working fallback, so a stuck loopback navigation must degrade to the
+// synthesised block rather than spend the session's whole startup budget.
+const uaHintsCaptureTimeout = 15 * time.Second
+
+// captureUAMetadata reads the browser's own client hints from a loopback page.
+// It leaves the page parked on that document; setupSession navigates onward.
+func (s *Session) captureUAMetadata(ctx context.Context) (*uaMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, uaHintsCaptureTimeout)
+	defer cancel()
+
+	pageURL, stop, err := serveUAHintsPage()
+	if err != nil {
+		return nil, err
+	}
+	defer stop()
+
+	page := s.page.Context(ctx)
+	if err := page.Navigate(pageURL); err != nil {
+		return nil, fmt.Errorf("waxseal: navigate client-hint page: %w", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		return nil, fmt.Errorf("waxseal: wait client-hint page: %w", err)
+	}
+	obj, err := page.Eval(uaHintsJS)
+	if err != nil {
+		return nil, fmt.Errorf("waxseal: read client hints: %w", err)
+	}
+	raw := obj.Str()
+	if raw == "" {
+		return nil, errors.New("waxseal: browser exposes no navigator.userAgentData")
+	}
+	var m uaMetadata
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("waxseal: decode client hints: %w", err)
+	}
+	return &m, nil
+}
+
 // normalizeUA removes the HeadlessChrome marker from navigator.userAgent before
 // navigation and keeps UA-CH consistent. No other fingerprint values are changed.
-func (s *Session) normalizeUA(ctx context.Context) error {
-	obj, err := s.page.Context(ctx).Eval(`() => navigator.userAgent`)
-	if err != nil {
-		return fmt.Errorf("waxseal: read ua for normalize: %w", err)
+//
+// With hints set to UAHintsReal it echoes the browser's own client hints back,
+// substituting only that marker. A capture that fails or comes back unusable
+// falls through to the synthesised block, so a browser without userAgentData
+// still gets a coherent override rather than none.
+func (s *Session) normalizeUA(ctx context.Context, hints string, cache *uaOverrideCache) error {
+	page := s.page.Context(ctx)
+	var override *cdp.NetworkSetUserAgentOverride
+	source := UAHintsSynthetic
+	if hints == UAHintsReal {
+		override = cache.realOverride(func() *cdp.NetworkSetUserAgentOverride {
+			meta, err := s.captureUAMetadata(ctx)
+			if err != nil {
+				s.log.Debug("waxseal: client-hint capture failed; using the synthesized block", "err", err)
+				return nil
+			}
+			o := uaOverrideFromMetadata(meta)
+			if o == nil {
+				s.log.Debug("waxseal: client-hint capture was incomplete; using the synthesized block")
+			}
+			return o
+		})
+		if override != nil {
+			source = UAHintsReal
+		}
 	}
-	override := uaOverride(obj.Str())
-	if err := s.page.Context(ctx).SetUserAgentOverride(override); err != nil {
+	if override == nil {
+		obj, err := page.Eval(`() => navigator.userAgent`)
+		if err != nil {
+			return fmt.Errorf("waxseal: read ua for normalize: %w", err)
+		}
+		override = uaOverride(obj.Str())
+	}
+	if err := page.SetUserAgentOverride(override); err != nil {
 		return fmt.Errorf("waxseal: ua override: %w", err)
 	}
-	s.log.Info("waxseal: normalized UA (HeadlessChrome->Chrome)")
+	// The brands are what distinguishes one Chromium build from another: a Debian
+	// chromium has no "Google Chrome" brand, and every build randomises its own
+	// GREASE brand. Log them so an operator can see what this browser reports
+	// without attaching a debugger to it.
+	s.log.Info("waxseal: normalized UA (HeadlessChrome->Chrome)",
+		"hints", source,
+		"brands", brandList(override.UserAgentMetadata.Brands),
+		"full_version", override.UserAgentMetadata.FullVersion,
+		"platform", override.UserAgentMetadata.Platform,
+		"architecture", override.UserAgentMetadata.Architecture,
+		"bitness", override.UserAgentMetadata.Bitness)
 	return nil
 }
 
@@ -1434,11 +1782,18 @@ type FullLengthProbe struct {
 }
 
 // proofCandidates lists fallback videos for full-length playback checks.
-// Candidates are ordered by preference.
+// Candidates are ordered by preference. Every one must run longer than
+// fullLengthMinVideoSecs, or proveFullLength rejects it as too short before it is
+// ever probed, which costs a page load and an establish and can never succeed.
+// TestProofCandidatesClearTheMinimum enforces that, and holds the durations these
+// comments record.
+//
+// All three are long-running Blender Foundation open movies under Creative
+// Commons, chosen because they stay available and keep their IDs.
 var proofCandidates = []string{
-	DefaultVideo,  // Big Buck Bunny
-	"R6MlUcmOul8", // Tears of Steel
-	"1UaBgr_sq9A", // NASA
+	DefaultVideo,  // Big Buck Bunny, 635s
+	"R6MlUcmOul8", // Tears of Steel, 734s
+	"eRsGyueVLvQ", // Sintel, 888s
 }
 
 // establishFromCandidates tries candidates until one proves full-length

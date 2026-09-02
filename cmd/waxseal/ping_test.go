@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -73,7 +74,9 @@ func TestPingCLIPortRangeMessage(t *testing.T) {
 func TestPingCLIStrict(t *testing.T) {
 	var status int
 	var payload string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		io.WriteString(w, payload)
@@ -100,6 +103,17 @@ func TestPingCLIStrict(t *testing.T) {
 	}
 	if err := run(true); err != nil {
 		t.Errorf("healthy strict: %v, want success", err)
+	}
+	// --strict travels in the query, where the server reads it. It is not a secret,
+	// unlike the key, which TestPingSendsKeyAsHeader pins to the header.
+	if got := gotQuery.Get("strict"); got != "true" {
+		t.Errorf("strict query = %q, want %q", got, "true")
+	}
+	if err := run(false); err != nil {
+		t.Errorf("healthy non-strict (second call): %v, want success", err)
+	}
+	if gotQuery.Has("strict") {
+		t.Errorf("non-strict sent ?strict=%q, want it absent", gotQuery.Get("strict"))
 	}
 
 	// Benign no-session (HTTP 200, ok:false): non-strict reports not-ready, strict
@@ -134,5 +148,41 @@ func TestPingCLIStrict(t *testing.T) {
 	status, payload = http.StatusOK, `{}`
 	if err := run(true); err == nil {
 		t.Error("empty 200 body strict: want error")
+	}
+}
+
+// TestPingSendsKeyAsHeader pins that the API key never reaches the query string,
+// where it would land in proxy and container access logs. The healthcheck runs
+// every few seconds, so a key in the request line is written to those logs for
+// the life of the container.
+func TestPingSendsKeyAsHeader(t *testing.T) {
+	const key = "s3cr3t-tenant-key"
+	var gotHeader, gotQueryKey, gotRawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-API-Key")
+		gotQueryKey = r.URL.Query().Get("key")
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true,"attest":"integrity","reason":"ok"}`)
+	}))
+	defer srv.Close()
+
+	c := newPingCmd()
+	c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", key})
+	c.SetOut(io.Discard)
+	c.SetErr(io.Discard)
+	if err := c.Execute(); err != nil {
+		t.Fatalf("ping --key: %v, want success", err)
+	}
+	if gotHeader != key {
+		t.Errorf("X-API-Key = %q, want %q", gotHeader, key)
+	}
+	if gotQueryKey != "" {
+		t.Errorf("?key = %q, want it absent", gotQueryKey)
+	}
+	// Also check the raw query, so a differently named parameter carrying the key
+	// cannot pass. This is the value that appears in an access log request line.
+	if strings.Contains(gotRawQuery, key) {
+		t.Errorf("raw query %q contains the key", gotRawQuery)
 	}
 }

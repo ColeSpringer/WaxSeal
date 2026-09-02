@@ -38,14 +38,19 @@ type Minter struct {
 	// logic can run without a browser.
 	launch func(ctx context.Context) (minterSession, error)
 
-	mu          sync.Mutex
-	sess        minterSession
-	gen         uint64 // bumps on each (re)attest; invalidates older cache entries
-	attestedAt  time.Time
-	watchCancel context.CancelFunc // cancels the live session's crash watcher on teardown
-	launching   chan struct{}      // non-nil while an attestation is in flight (single-flight)
-	cache       map[string]cachedToken
-	negCache    map[string]negEntry // terminal player-context errors by video_id, guarded by mu
+	mu         sync.Mutex
+	sess       minterSession
+	gen        uint64 // bumps on each (re)attest; invalidates older cache entries
+	attestedAt time.Time
+	// grantExpiresAt is when the tokens of the current generation expire. Every
+	// token an attestation mints carries the same expiry, so one mint reveals it
+	// for the whole generation. Zero means no mint has reported one yet, in which
+	// case maxAge alone bounds the session.
+	grantExpiresAt time.Time
+	watchCancel    context.CancelFunc // cancels the live session's crash watcher on teardown
+	launching      chan struct{}      // non-nil while an attestation is in flight (single-flight)
+	cache          map[string]cachedToken
+	negCache       map[string]negEntry // terminal player-context errors by video_id, guarded by mu
 
 	// mu guards the streaming deadline, outstanding degradation report, and report
 	// budget state. A suspect mark must not outlive its generation.
@@ -90,6 +95,22 @@ type Minter struct {
 	// generation, however that generation came to exist, and only a successful
 	// proof (markProved) clears it.
 	proofRelaunched bool
+
+	// retiredGen and retiredCrash record the last generation torn down and
+	// whether the browser died under it. sessionDied reads them back instead of
+	// inferring the cause from which locks a retirer needed, so a recycle that
+	// happens off the request path cannot be misread as a browser death. Only the
+	// newest teardown is kept: retirement runs in generation order, so a request
+	// whose generation is older than retiredGen has been parked across a whole
+	// launch cycle and has no record of its own left, and is treated as a death
+	// (which is what the lock-ordering inference did for every supersession).
+	retiredGen   uint64
+	retiredCrash bool
+
+	// shortGrantWarnedGen is the generation the unusable-grant warning has already
+	// fired for, so a generation whose every mint reports the same expiry inside
+	// the cache margin logs it once rather than once per mint.
+	shortGrantWarnedGen uint64
 
 	mintMu  sync.Mutex // serializes the in-browser mint calls (single page)
 	metrics minterMetrics
@@ -150,8 +171,12 @@ type minterMetrics struct {
 	// SeparationWaits counts operations held back to keep an in-page mint and a
 	// context establishment mintSeparation apart. One wait can cover one request.
 	SeparationWaits atomic.Int64
-	// UnprovenRejections counts player-context requests refused because the
-	// session could not prove full-length streaming. Once per request.
+	// UnprovenRejections counts player-context requests refused because no
+	// session proved full-length streaming for them: a proof that failed, a
+	// cool-down from an earlier failure, or a browser that died mid-proof and
+	// left the request nothing to serve from. The death is not graded against the
+	// next generation, but the refusal is still the request's outcome and is
+	// counted here, since no other counter records it. Once per request.
 	UnprovenRejections atomic.Int64
 
 	// Session recycles are separated by cause.
@@ -166,6 +191,10 @@ type minterMetrics struct {
 	// generation whose session was already retired by a crash or a prior report.
 	// This is a benign no-op, not a stale report.
 	DegradationReportsAlreadyRetired atomic.Int64
+	// DegradationReportsDuplicatePending counts a repeat report for a generation
+	// whose retirement is already queued for the next streaming handoff. The
+	// retirement itself is only counted once, by the report that queued it.
+	DegradationReportsDuplicatePending atomic.Int64
 }
 
 const (
@@ -407,13 +436,28 @@ func (m *Minter) waitBeforeEstablish(ctx context.Context, what string) error {
 // again under mintMu. Either way the returned error is ctx.Err(), so the
 // server's timeout mapping is unchanged.
 //
+// A browser that dies while the proof is in flight is the one retirement that
+// can happen under mintMu (see sessionDied). That is not a proof failure: the
+// dead page says nothing about whether the session could stream, so it is
+// neither recorded against the cool-down nor allowed to spend the streak's
+// relaunch. The request takes the replacement ensure publishes and proves that
+// instead, once; a replacement that dies too is refused, and the next request
+// relaunches.
+//
 // ensureProven returns the session and generation the caller should use for the
 // rest of the request: sess and gen unchanged on success or a refusal, or the
-// relaunched pair after a second failure that still had its relaunch to spend.
-// what names the caller ("player-context" or "session") and appears on every
-// warn line this function emits, so a log reader can tell which endpoint paid
-// for a given proof attempt or refusal.
+// replacement pair after a second failure that still had its relaunch to spend
+// or after the browser died mid-proof. what names the caller ("player-context"
+// or "session") and appears on every warn line this function emits, so a log
+// reader can tell which endpoint paid for a given proof attempt or refusal.
 func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint64, what string) (minterSession, uint64, error) {
+	return m.prove(ctx, sess, gen, what, true)
+}
+
+// prove is ensureProven's body. replaceOnDeath allows one replacement when the
+// browser dies during the proof; the replacement is proved with it false, so a
+// request takes at most one replacement here.
+func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what string, replaceOnDeath bool) (minterSession, uint64, error) {
 	if sess.Established() {
 		return sess, gen, nil
 	}
@@ -453,6 +497,26 @@ func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint6
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return sess, gen, ctx.Err()
+	}
+	if m.sessionDied(sess, gen, what+" proof", proofErr) {
+		// A proof that ran out the deadline has no budget left to prove a
+		// replacement, so the request is refused; nothing is recorded, since the
+		// dead generation is not the one the next request will find.
+		if ctx.Err() != nil {
+			m.metrics.UnprovenRejections.Add(1)
+			return sess, gen, ctx.Err()
+		}
+		if replaceOnDeath {
+			newSess, newGen, err := m.ensure(ctx)
+			if err != nil {
+				return nil, 0, err
+			}
+			return m.prove(ctx, newSess, newGen, what, false)
+		}
+		m.log.Warn("minter: refusing "+what+"; the replacement session died during its proof as well",
+			"gen", gen, "err", proofErr)
+		m.metrics.UnprovenRejections.Add(1)
+		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
 	}
 	deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	m.log.Warn("minter: refusing "+what+"; session could not prove full-length streaming",
@@ -504,6 +568,21 @@ func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint6
 			return newSess, newGen, ctx.Err()
 		}
 		newDeadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		// A browser that died under the fresh generation is refused with the same
+		// wording the entry path uses, and nothing is held against the next
+		// generation: a dead page's proof says nothing about whether the session
+		// could stream. Checking it first keeps the "could not prove full-length
+		// streaming" warn below off a crash, which sessionDied's own line would
+		// otherwise contradict on the next line of the log.
+		if m.sessionDied(newSess, newGen, what+" proof", proofErr) {
+			m.metrics.UnprovenRejections.Add(1)
+			if newDeadline {
+				return newSess, newGen, ctx.Err()
+			}
+			m.log.Warn("minter: refusing "+what+"; the replacement session died during its proof as well",
+				"gen", newGen, "err", proofErr)
+			return newSess, newGen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+		}
 		m.log.Warn("minter: refusing "+what+"; relaunched session could not prove full-length streaming",
 			"gen", newGen, "err", proofErr)
 		// Record the fresh generation's own failure, but never let this call claim
@@ -622,30 +701,159 @@ func (m *Minter) launchReal(ctx context.Context) (minterSession, error) {
 	return sess, nil
 }
 
-// Warm performs the single-flight attestation before the first request.
+// Warm performs the single-flight attestation before the first request. It
+// holds mintMu like every other caller of ensure: ensure's recycle branch closes
+// an aged session, and a request already holding that session would otherwise
+// find it torn down by a caller it could not serialize against. Production runs
+// Warm before Serve, but the lock makes that ordering a convenience rather than
+// a correctness condition.
 func (m *Minter) Warm(ctx context.Context) error {
+	m.mintMu.Lock()
+	defer m.mintMu.Unlock()
 	_, _, err := m.ensure(ctx)
 	return err
 }
 
+// grantExhaustedLocked reports whether the generation's tokens are inside the
+// cache margin of expiring. Past that point every token this session can mint is
+// one the daemon would refuse to cache, so the session has nothing left to give
+// however young its attestation is. A zero grant (no mint has reported an expiry)
+// exhausts nothing. The caller must hold m.mu.
+//
+// It is the one piece the two recycle predicates share: the max-age half of each
+// stays its own, because they answer different questions.
+func (m *Minter) grantExhaustedLocked(now time.Time) bool {
+	return !m.grantExpiresAt.IsZero() && !now.Before(m.grantExpiresAt.Add(-minterCacheMargin))
+}
+
+// grantWorthRecording reports whether an attestation issued tokens with enough
+// life to be worth recycling for. It measures the grant from the attestation
+// rather than from now, which is what separates the two ways a grant can be
+// spent:
+//
+// A grant that runs down over time is the case the recycle exists for. A fresh
+// attestation gets a fresh grant, so tearing the session down converges.
+//
+// A grant that arrives already inside the cache margin does not. Its replacement
+// arrives just as exhausted, so recycleCauseLocked would fire on the session it
+// just published and every request would tear down a healthy session under
+// mintMu, forever, with no metric moving and no cache ever warming
+// (cachePutLocked declines those tokens either way). Such a grant is dropped: its
+// tokens stay uncacheable, which is the honest outcome, and maxAge alone bounds
+// the session.
+func grantWorthRecording(expiresAt, attestedAt time.Time) bool {
+	return !expiresAt.IsZero() && expiresAt.After(attestedAt.Add(minterCacheMargin))
+}
+
+// recordGrantLocked latches gen's token expiry, reporting whether it was dropped
+// for arriving inside the cache margin so the caller can warn after unlocking. It
+// warns once per generation. attestedAt is when gen was attested, which is what
+// the grant is measured against. The caller must hold m.mu.
+func (m *Minter) recordGrantLocked(gen uint64, attestedAt, expiresAt time.Time) (dropped bool) {
+	if expiresAt.IsZero() {
+		return false
+	}
+	if !grantWorthRecording(expiresAt, attestedAt) {
+		if m.shortGrantWarnedGen == gen {
+			return false
+		}
+		m.shortGrantWarnedGen = gen
+		return true
+	}
+	m.grantExpiresAt = expiresAt
+	return false
+}
+
+// warnShortGrant reports an attestation whose tokens were already inside the
+// cache margin when it issued them. The session keeps serving those tokens
+// uncached until maxAge recycles it, because bounding it by this grant would
+// relaunch on every request without ever reaching a session that could serve one.
+func (m *Minter) warnShortGrant(gen uint64, expiresAt time.Time) {
+	m.log.Warn("minter: attestation granted tokens that were already inside the cache margin; not bounding the session by them",
+		"gen", gen, "expires_in", time.Until(expiresAt).Round(time.Second), "margin", minterCacheMargin)
+}
+
+// recordGrant remembers generation gen's token expiry, which bounds the session
+// alongside maxAge. Every token an attestation mints carries the same expiry, so
+// the first mint to report one fixes it and later mints repeat the same value. A
+// zero expiry records nothing, and a mint that completed against a generation the
+// session has since left records nothing either, matching cachePut.
+func (m *Minter) recordGrant(gen uint64, expiresAt time.Time) {
+	if expiresAt.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	if gen != m.gen || !m.grantExpiresAt.IsZero() {
+		m.mu.Unlock()
+		return
+	}
+	dropped := m.recordGrantLocked(gen, m.attestedAt, expiresAt)
+	m.mu.Unlock()
+	if dropped {
+		m.warnShortGrant(gen, expiresAt)
+	}
+}
+
+// sessionPastMaxAge reports whether the current generation is old enough, or its
+// grant close enough to expiring, that ensure would recycle it. Mint's cache fast
+// path checks it because the recycle, and the cache clear that follows a fresh
+// attestation, live inside ensure.
+//
+// This keys on attestedAt rather than on a live session. During the relaunch
+// window m.sess is nil while m.gen has not yet bumped, so the cache still holds
+// servable entries from the aged generation; keying on m.sess != nil would report
+// fresh there and hand one out. A zero attestedAt (never attested) is not past
+// any bound.
+func (m *Minter) sessionPastMaxAge() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.grantExhaustedLocked(time.Now()) {
+		return true
+	}
+	return !m.attestedAt.IsZero() && m.maxAge > 0 && time.Since(m.attestedAt) > m.maxAge
+}
+
+// recycleCauseLocked names why the live session should be recycled, or returns
+// the empty string when it should not. "age" is an attestation older than maxAge;
+// "grant" is a generation whose tokens are about to expire, which strands the
+// session even while it is young. It keys on a live session because it decides
+// whether to tear one down. The caller must hold m.mu.
+func (m *Minter) recycleCauseLocked() string {
+	switch {
+	case m.sess == nil:
+		return ""
+	case m.maxAge > 0 && time.Since(m.attestedAt) > m.maxAge:
+		return "age"
+	case m.grantExhaustedLocked(time.Now()):
+		return "grant"
+	default:
+		return ""
+	}
+}
+
 // ensure returns the live session and its generation. Concurrent launches
-// coalesce into one attestation, and sessions older than maxAge are recycled.
+// coalesce into one attestation, and a session older than maxAge or past its
+// grant is recycled.
 func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 	for {
 		m.mu.Lock()
 		// This path bypasses retire, so it must also clear the suspect mark.
-		if m.sess != nil && m.maxAge > 0 && time.Since(m.attestedAt) > m.maxAge {
+		if cause := m.recycleCauseLocked(); cause != "" {
 			old, gen, age := m.sess, m.gen, time.Since(m.attestedAt)
 			m.sess = nil
 			cancel := m.watchCancel
 			m.watchCancel = nil
 			m.reportSuspectGen = 0
 			m.reportSuspectVideoID = ""
+			// A recycle is not a crash. Recording it keeps a request that was
+			// holding this generation from reading its own failure as a browser
+			// death (see sessionDied).
+			m.retiredGen, m.retiredCrash = gen, false
 			m.mu.Unlock()
 			if cancel != nil {
 				cancel()
 			}
-			m.log.Info("minter: max-age recycle", "gen", gen, "age", age.Round(time.Second))
+			m.log.Info("minter: session recycle", "gen", gen, "age", age.Round(time.Second), "cause", cause)
 			old.Close()
 			continue
 		}
@@ -697,6 +905,7 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 			}
 		}
 
+		var shortGrant bool
 		m.mu.Lock()
 		m.launching = nil
 		close(ch)
@@ -707,12 +916,15 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		}
 		m.sess = sess
 		m.gen++
+		// Fixed before the pre-mint's grant is recorded, which is measured against it.
+		m.attestedAt = time.Now()
 		// A new page has no mint, proof, or establishment behind it, and no prior
 		// generation's proof failure applies to it. The pre-mint above, when it
 		// succeeded, is this generation's first mark.
 		m.lastMintAt = time.Time{}
 		m.lastProofAt = time.Time{}
 		m.lastEstablishAt = time.Time{}
+		m.grantExpiresAt = time.Time{}
 		m.proofFailGen = 0
 		m.proofFailedAt = time.Time{}
 		m.proofCooldownWarnedAt = time.Time{}
@@ -723,6 +935,12 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		clear(m.cache)
 		if preminted {
 			m.lastMintAt = time.Now()
+			// The pre-mint reports this generation's token expiry, which bounds the
+			// session alongside maxAge. A result without one leaves it unbounded here
+			// and a later mint may still report it, and one that is already inside
+			// the cache margin is dropped rather than bounding the session to a
+			// length it cannot serve.
+			shortGrant = m.recordGrantLocked(m.gen, m.attestedAt, premint.ExpiresAt)
 			// Cache the pre-mint under both the gvs and the default (pot) scope: scope
 			// only namespaces the cache and the token is identical either way, so a
 			// consumer that asks for either gets the hit. Writing it here, in the same
@@ -733,7 +951,6 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 			m.cachePutLocked(cacheKey("gvs", premintBinding), premint, m.gen)
 			m.cachePutLocked(cacheKey("pot", premintBinding), premint, m.gen)
 		}
-		m.attestedAt = time.Now()
 		// Arm the streaming deadline for this generation.
 		if m.streamingMaxAge > 0 {
 			m.streamingDeadline = time.Now().Add(jitter(m.streamingMaxAge))
@@ -745,6 +962,9 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		m.watchCancel = cancel
 		m.mu.Unlock()
 		m.metrics.Attestations.Add(1)
+		if shortGrant {
+			m.warnShortGrant(g, premint.ExpiresAt)
+		}
 		m.log.Info("minter: session ready", "gen", g, "attest", sess.AttestKind())
 		go m.watchCrash(sess, watchCtx, g)
 		return sess, g, nil
@@ -767,6 +987,7 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	m.watchCancel = nil
 	m.reportSuspectGen = 0
 	m.reportSuspectVideoID = ""
+	m.retiredGen, m.retiredCrash = gen, isCrash
 	if isCrash {
 		m.metrics.Crashes.Add(1)
 	}
@@ -781,8 +1002,10 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 
 // watchCrash retires the session when its browser target crashes, detaches, or
 // loses the CDP connection. That lets the next request relaunch instead of first
-// failing against a dead session. Only browser.Session exposes the event stream;
-// test fakes are ignored.
+// failing against a dead session, and a request that already holds the session
+// when it dies takes the replacement rather than grading the dead page (see
+// sessionDied). Only browser.Session exposes the event stream; test fakes are
+// ignored.
 //
 // The context is tied to the session lifetime, not the launch request. WaitCrash
 // returns a reason on browser loss and "" when ctx is cancelled.
@@ -888,6 +1111,7 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	case m.reportSuspectGen == gen:
 		// Retirement is already queued for the next streaming handoff.
 		m.mu.Unlock()
+		m.metrics.DegradationReportsDuplicatePending.Add(1)
 		return ReportResult{Accepted: true, RetirementPending: true, Generation: gen}
 	case m.reportTokens < 1:
 		// Budget spent: tell the consumer how long until one token refills.
@@ -953,34 +1177,60 @@ func (m *Minter) spendReportTokenLocked() {
 // same binding continue to use the cached token.
 func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.MintResult, cached bool, err error) {
 	key := cacheKey(scope, binding)
-	if r, ok := m.cacheGet(key); ok {
-		m.metrics.CacheHits.Add(1)
-		return r, true, nil
+	// A cache-hit-only workload never reaches ensure, where the recycle lives, so
+	// an aged session would serve its cached tokens indefinitely. Skipping the
+	// lookup is what forces this request through ensure instead.
+	if !m.sessionPastMaxAge() {
+		if r, ok := m.cacheGet(key); ok {
+			m.metrics.CacheHits.Add(1)
+			return r, true, nil
+		}
 	}
 
 	m.mintMu.Lock() // one page, so mints serialize
 	defer m.mintMu.Unlock()
-	// Another goroutine may have filled the cache while this call waited for mintMu.
-	if r, ok := m.cacheGet(key); ok {
-		m.metrics.CacheHits.Add(1)
-		return r, true, nil
+	// Another goroutine may have filled the cache while this call waited for
+	// mintMu, and the session may have crossed its bound during that wait. The age
+	// is read again rather than carried across the wait: a request parked behind a
+	// full-length proof would otherwise hand out the generation the first read
+	// found fresh, which is the one this check exists to stop serving.
+	if !m.sessionPastMaxAge() {
+		if r, ok := m.cacheGet(key); ok {
+			m.metrics.CacheHits.Add(1)
+			return r, true, nil
+		}
 	}
 
 	sess, gen, err := m.ensure(ctx)
 	if err != nil {
+		// A lookup skipped above expected ensure to replace the aged session. It
+		// could not, so a cached token is served rather than refused: the entry is
+		// still inside its own expiry (cachePut caps it at expiry minus the margin)
+		// and still generation-matched, because a failed launch publishes no new
+		// generation and so never clears the cache. Without this the entry is
+		// unreachable for the rest of its life while every request 502s.
+		if ctx.Err() == nil {
+			if r, ok := m.cacheGet(key); ok {
+				m.metrics.CacheHits.Add(1)
+				m.log.Warn("minter: serving a cached token from the aged generation; its replacement could not be launched", "err", err)
+				return r, true, nil
+			}
+		}
 		return browser.MintResult{}, false, err
 	}
 	// This call may be what triggered the launch, in which case ensure's own
 	// pre-mint could have just filled this exact entry. Check once more before
-	// minting again and overwriting it with a second, redundant token.
+	// minting again and overwriting it with a second, redundant token. This one is
+	// not gated on session age: ensure has just returned the current generation, so
+	// whatever is cached under it belongs to a session that is not past the bound.
 	if r, ok := m.cacheGet(key); ok {
 		m.metrics.CacheHits.Add(1)
 		return r, true, nil
 	}
-	// Neither the pre-launch check nor the post-ensure recheck served this
-	// binding, so this call pays for an in-page mint below: a genuine miss.
-	// Counted here, after both rechecks, so a request served by the pre-mint
-	// counts as a hit only, and a request whose launch failed above is counted by
+	// No lookup above served this binding (an aged session skips the two before
+	// ensure), so this call pays for an in-page mint below: a genuine miss.
+	// Counted here, after the rechecks, so a request served by the pre-mint counts
+	// as a hit only, and a request whose launch failed above is counted by
 	// launch_failures alone rather than also as a cache miss.
 	m.metrics.CacheMisses.Add(1)
 	// A token minted right after an establishment is graded the same way as one
@@ -989,14 +1239,14 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		return browser.MintResult{}, false, err
 	}
 	res, err = sess.Mint(ctx, binding)
-	if err != nil { // level 1: transient failure, one in-place retry, no re-attest.
-		// A canceled or timed-out caller is not a mint failure. Return the context
-		// error before touching failure metrics or the relaunch ladder. This matches
-		// playerContextStop and Health, and lets a stuck page recover through the
-		// crash watcher or a later /ping-triggered retire instead of this request.
-		if ctx.Err() != nil {
-			return browser.MintResult{}, false, ctx.Err()
-		}
+	// level 1: a live session's transient failure, one in-place retry, no
+	// re-attest. A canceled or timed-out caller is not a mint failure, and neither
+	// is a browser that died under the request: both fall through to the block
+	// below, which returns the context error before touching failure metrics or
+	// the relaunch ladder (matching playerContextStop and Health, so a stuck page
+	// recovers through the crash watcher or a later /ping-triggered retire rather
+	// than this request), or takes the replacement.
+	if err != nil && ctx.Err() == nil && !m.isSuperseded(sess, gen) {
 		m.metrics.MintFailures.Add(1)
 		m.log.Warn("minter: mint failed; retrying on same session", "gen", gen, "err", err)
 		if err := m.waitBeforeMint(ctx); err != nil {
@@ -1004,31 +1254,49 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		}
 		res, err = sess.Mint(ctx, binding)
 	}
-	if err != nil { // level 2: escalate to a relaunch and re-attest on a fresh session.
+	if err != nil {
 		if ctx.Err() != nil {
 			return browser.MintResult{}, false, ctx.Err()
 		}
-		m.metrics.MintFailures.Add(1)
-		m.metrics.Escalations.Add(1)
-		m.retire(gen, "mint failed twice; relaunching", false)
-		sess, gen, err = m.ensure(ctx)
+		// level 2: a live session failed twice; escalate to a relaunch and
+		// re-attest on a fresh session. A session that died under the request is
+		// already retired and graded nowhere: it goes straight to the replacement.
+		if !m.sessionDied(sess, gen, "mint", err) {
+			m.metrics.MintFailures.Add(1)
+			m.metrics.Escalations.Add(1)
+			m.retire(gen, "mint failed twice; relaunching", false)
+		}
+		res, gen, err = m.mintOnReplacement(ctx, binding)
 		if err != nil {
 			return browser.MintResult{}, false, err
-		}
-		// No recheck here: the relaunch's pre-mint binds its own fresh browser
-		// identity, never this request's binding, so it cannot have filled this key.
-		if res, err = sess.Mint(ctx, binding); err != nil {
-			if ctx.Err() != nil {
-				return browser.MintResult{}, false, ctx.Err()
-			}
-			m.metrics.MintFailures.Add(1)
-			return browser.MintResult{}, false, fmt.Errorf("minter: mint failed after relaunch: %w", err)
 		}
 	}
 	m.metrics.Mints.Add(1)
 	m.markMinted()
+	m.recordGrant(gen, res.ExpiresAt)
 	m.cachePut(key, res, gen)
 	return res, false, nil
+}
+
+// mintOnReplacement mints binding on the session ensure publishes next, for a
+// request whose own session is gone: retired by the ladder above, or dead under
+// the request. No cache recheck: the relaunch's pre-mint binds its own fresh
+// browser identity, never this request's binding, so it cannot have filled the
+// caller's key.
+func (m *Minter) mintOnReplacement(ctx context.Context, binding string) (browser.MintResult, uint64, error) {
+	sess, gen, err := m.ensure(ctx)
+	if err != nil {
+		return browser.MintResult{}, 0, err
+	}
+	res, err := sess.Mint(ctx, binding)
+	if err != nil {
+		if ctx.Err() != nil {
+			return browser.MintResult{}, 0, ctx.Err()
+		}
+		m.metrics.MintFailures.Add(1)
+		return browser.MintResult{}, 0, fmt.Errorf("minter: mint failed after relaunch: %w", err)
+	}
+	return res, gen, nil
 }
 
 // PlayerContext returns the attested browser's streaming context for videoID. It
@@ -1070,6 +1338,13 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		m.markEstablished()
 		return pc, gen, nil
 	}
+	// A browser that died under the request is already retired and its failure
+	// is graded nowhere: not counted, not retried against, not escalated. A
+	// caller that has gone away is not owed the replacement, so the stop check
+	// below keeps returning its context error first.
+	if m.playerContextDied(ctx, sess, gen, err) {
+		return m.playerContextOnReplacement(ctx, videoID)
+	}
 	if m.playerContextStop(ctx, videoID, err) { // terminal or cancelled: don't escalate.
 		return browser.PlayerContext{}, gen, err
 	}
@@ -1085,6 +1360,9 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		m.metrics.PlayerContexts.Add(1)
 		m.markEstablished()
 		return pc, gen, nil
+	}
+	if m.playerContextDied(ctx, sess, gen, err) {
+		return m.playerContextOnReplacement(ctx, videoID)
 	}
 	if m.playerContextStop(ctx, videoID, err) {
 		return browser.PlayerContext{}, gen, err
@@ -1111,22 +1389,40 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// level 2: escalate to a relaunch and re-attest on a fresh session.
 	m.metrics.Escalations.Add(1)
 	m.retire(gen, "player-context failed twice; relaunching", false)
-	sess, gen, err = m.ensure(ctx)
+	return m.playerContextOnReplacement(ctx, videoID)
+}
+
+// playerContextOnReplacement serves videoID from the session ensure publishes
+// next, for a request whose own session is gone: retired by the ladder above,
+// or dead under the request. The replacement page has never played and was
+// pre-minted, so it needs the same proof and the same spacing as the attempts
+// before it.
+func (m *Minter) playerContextOnReplacement(ctx context.Context, videoID string) (browser.PlayerContext, uint64, error) {
+	sess, gen, err := m.ensure(ctx)
 	if err != nil {
 		return browser.PlayerContext{}, 0, err
 	}
-	// The relaunched page has never played and was pre-minted, so this attempt
-	// needs the same proof and the same spacing as the two before it.
-	sess, gen, err = m.ensureProven(ctx, sess, gen, "player-context")
+	// This launch is already the request's one extra session, so its proof gets no
+	// death replacement of its own: ensureProven would otherwise launch a third
+	// Chromium under mintMu for a single request, blocking the tenant while it
+	// does, with none of it counted.
+	sess, gen, err = m.prove(ctx, sess, gen, "player-context", false)
 	if err != nil {
 		return browser.PlayerContext{}, gen, err
 	}
 	if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
 		return browser.PlayerContext{}, gen, err
 	}
-	pc, err = sess.PlayerContext(ctx, videoID)
+	pc, err := sess.PlayerContext(ctx, videoID)
 	m.markPlayback()
 	if err != nil {
+		// A caller that timed out or went away during the replacement attempt is
+		// not a player-context failure, matching playerContextStop and
+		// mintOnReplacement: counting it here would inflate the metric an operator
+		// alerts on with every departed caller that reached a relaunch.
+		if ctx.Err() != nil {
+			return browser.PlayerContext{}, gen, ctx.Err()
+		}
 		m.metrics.PlayerContextFailures.Add(1)
 		if errors.Is(err, browser.ErrUnplayable) {
 			m.negCachePut(videoID, err)
@@ -1137,6 +1433,19 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	m.metrics.PlayerContexts.Add(1)
 	m.markEstablished()
 	return pc, gen, nil
+}
+
+// playerContextDied reports whether the ladder should hand this attempt the
+// replacement session. A caller that has gone away is not owed one, and neither
+// is a status-2 confirmation failure: that is timing related rather than
+// evidence of a dead page, it is refused without a relaunch by design, and
+// letting it reach the death path would both pay for the relaunch the design
+// forbids and skip the refusal below that counts status2_rejections.
+func (m *Minter) playerContextDied(ctx context.Context, sess minterSession, gen uint64, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, browser.ErrStatus2Unconfirmed) {
+		return false
+	}
+	return m.sessionDied(sess, gen, "player-context", err)
 }
 
 // playerContextStop records a failed attempt and reports whether retries should
@@ -1238,6 +1547,19 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 		ttl = 0
 	}
 	now := time.Now() // one clock read, matching negCachePut
+	expiry := now.Add(ttl)
+	// Lifetime is the whole grant measured from attest time, so on its own it
+	// would extend an entry past the token it holds once a mint happens late in a
+	// session's life. ExpiresAt is the only mint-time-independent truth, so it
+	// bounds the entry; a token with no margin left is not cached at all.
+	if !res.ExpiresAt.IsZero() {
+		if capped := res.ExpiresAt.Add(-minterCacheMargin); capped.Before(expiry) {
+			expiry = capped
+		}
+	}
+	if !expiry.After(now) {
+		return
+	}
 	// Only a new key can force eviction; refreshing a cached key must not remove
 	// another token. First discard expired entries and track the live entry with the
 	// earliest expiry. If the cache is still full, remove that entry so the new token
@@ -1261,7 +1583,7 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 			m.metrics.CacheEvictions.Add(1)
 		}
 	}
-	m.cache[key] = cachedToken{res: res, expiry: now.Add(ttl), gen: gen}
+	m.cache[key] = cachedToken{res: res, expiry: expiry, gen: gen}
 }
 
 // SessionSnapshot returns an established session's identity, cookies, and the
@@ -1284,19 +1606,34 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http.Cookie, uint64, error) {
 	m.mintMu.Lock()
 	defer m.mintMu.Unlock()
-	sess, gen, err := m.refreshStreamingSession(ctx)
-	if err != nil {
-		return browser.Identity{}, nil, 0, err
+	// A browser that dies after its proof, while its cookies are read, is
+	// replaced like one that dies during the proof, and once only: the
+	// replacement is not itself replaced.
+	for replaced := false; ; replaced = true {
+		sess, gen, err := m.refreshStreamingSession(ctx)
+		if err != nil {
+			return browser.Identity{}, nil, 0, err
+		}
+		// The second pass is already running on a replacement, so its proof gets no
+		// death replacement of its own: prove would otherwise launch again, and a
+		// single /session call could serialize four launches under mintMu.
+		sess, gen, err = m.prove(ctx, sess, gen, "session", !replaced)
+		if err != nil {
+			return browser.Identity{}, nil, 0, err
+		}
+		cookies, err := sess.BrowserCookies(ctx)
+		if err != nil {
+			// One retry against the replacement, whatever took the session away:
+			// sessionDied logs a browser death, and a generation retired for any
+			// other reason is just as worth reading the cookies from its successor.
+			if !replaced && ctx.Err() == nil &&
+				(m.sessionDied(sess, gen, "session", err) || m.isSuperseded(sess, gen)) {
+				continue
+			}
+			return browser.Identity{}, nil, 0, err
+		}
+		return sess.Identity(), cookies, gen, nil
 	}
-	sess, gen, err = m.ensureProven(ctx, sess, gen, "session")
-	if err != nil {
-		return browser.Identity{}, nil, 0, err
-	}
-	cookies, err := sess.BrowserCookies(ctx)
-	if err != nil {
-		return browser.Identity{}, nil, 0, err
-	}
-	return sess.Identity(), cookies, gen, nil
 }
 
 // HealthSnapshot is a consistent view of one session generation. Browser proof
@@ -1323,11 +1660,40 @@ func failHealth(gen uint64, err error) (HealthSnapshot, bool, error) {
 // isSuperseded reports whether the live session or generation changed since
 // (sess, gen) were read. A concurrent goroutine can swap the session mid-probe.
 // A result from the old session describes a stale generation, so Health retries
-// instead of reporting it.
+// instead of reporting it, and the request paths take the replacement (see
+// sessionDied).
 func (m *Minter) isSuperseded(sess minterSession, gen uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.sess != sess || m.gen != gen
+}
+
+// sessionDied reports whether sess was retired out from under the request that
+// holds it because the browser died, and logs the event. Its failure, err,
+// describes a dead page rather than anything the ladders grade, and the crash is
+// already counted by the retirement.
+//
+// Every teardown records the generation it closed and whether that was a crash
+// (retire, ensure's recycle branch, and Close), so the cause is read back rather
+// than inferred from which locks the retirer needed. The inference held only
+// while the crash watcher was the sole retirer that did not need mintMu, which
+// nothing in the type enforces (Warm takes mintMu now, but a later off-request
+// recycle would have made a deliberate teardown look like a death, dropping a
+// genuine failure from the counters and handing out a free relaunch).
+//
+// A generation older than the recorded one has been parked across a whole launch
+// cycle and no longer has a record of its own; it is reported as a death, which
+// is what the inference did for every supersession.
+func (m *Minter) sessionDied(sess minterSession, gen uint64, what string, err error) bool {
+	m.mu.Lock()
+	superseded := m.sess != sess || m.gen != gen
+	died := superseded && (m.retiredGen != gen || m.retiredCrash)
+	m.mu.Unlock()
+	if !died {
+		return false
+	}
+	m.log.Info("minter: "+what+" lost its session mid-request; its failure is not graded", "gen", gen, "err", err)
+	return true
 }
 
 // Health probes the existing session and returns a consistent snapshot tied to
@@ -1450,6 +1816,7 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 		}
 		m.metrics.Mints.Add(1)
 		m.markMinted()
+		m.recordGrant(gen, res.ExpiresAt)
 		// Cache under both the gvs and the default (pot) scope, matching the
 		// pre-mint's dual write: scope only namespaces the cache and the token is
 		// identical either way.
@@ -1509,32 +1876,34 @@ var lifetimeCounterKeys = []string{
 	"degradation_reports_rejected_stale",
 	"degradation_reports_already_retired",
 	"degradation_reports_rate_limited",
+	"degradation_reports_duplicate_pending",
 }
 
 // counterValues returns each process-lifetime counter keyed by its metrics name.
 // Its key set must match lifetimeCounterKeys.
 func (m *Minter) counterValues() map[string]int64 {
 	return map[string]int64{
-		"attestations":                        m.metrics.Attestations.Load(),
-		"mints":                               m.metrics.Mints.Load(),
-		"mint_failures":                       m.metrics.MintFailures.Load(),
-		"escalations":                         m.metrics.Escalations.Load(),
-		"player_contexts":                     m.metrics.PlayerContexts.Load(),
-		"player_context_failures":             m.metrics.PlayerContextFailures.Load(),
-		"status2_rejections":                  m.metrics.Status2Rejections.Load(),
-		"separation_waits":                    m.metrics.SeparationWaits.Load(),
-		"unproven_rejections":                 m.metrics.UnprovenRejections.Load(),
-		"crashes":                             m.metrics.Crashes.Load(),
-		"cache_hits":                          m.metrics.CacheHits.Load(),
-		"cache_misses":                        m.metrics.CacheMisses.Load(),
-		"cache_evictions":                     m.metrics.CacheEvictions.Load(),
-		"launch_failures":                     m.metrics.LaunchFailures.Load(),
-		"streaming_recycles":                  m.metrics.StreamingRecycles.Load(),
-		"report_driven_recycles":              m.metrics.ReportDrivenRecycles.Load(),
-		"degradation_reports_accepted":        m.metrics.DegradationReportsAccepted.Load(),
-		"degradation_reports_rejected_stale":  m.metrics.DegradationReportsRejectedStale.Load(),
-		"degradation_reports_already_retired": m.metrics.DegradationReportsAlreadyRetired.Load(),
-		"degradation_reports_rate_limited":    m.metrics.DegradationReportsRateLimited.Load(),
+		"attestations":                          m.metrics.Attestations.Load(),
+		"mints":                                 m.metrics.Mints.Load(),
+		"mint_failures":                         m.metrics.MintFailures.Load(),
+		"escalations":                           m.metrics.Escalations.Load(),
+		"player_contexts":                       m.metrics.PlayerContexts.Load(),
+		"player_context_failures":               m.metrics.PlayerContextFailures.Load(),
+		"status2_rejections":                    m.metrics.Status2Rejections.Load(),
+		"separation_waits":                      m.metrics.SeparationWaits.Load(),
+		"unproven_rejections":                   m.metrics.UnprovenRejections.Load(),
+		"crashes":                               m.metrics.Crashes.Load(),
+		"cache_hits":                            m.metrics.CacheHits.Load(),
+		"cache_misses":                          m.metrics.CacheMisses.Load(),
+		"cache_evictions":                       m.metrics.CacheEvictions.Load(),
+		"launch_failures":                       m.metrics.LaunchFailures.Load(),
+		"streaming_recycles":                    m.metrics.StreamingRecycles.Load(),
+		"report_driven_recycles":                m.metrics.ReportDrivenRecycles.Load(),
+		"degradation_reports_accepted":          m.metrics.DegradationReportsAccepted.Load(),
+		"degradation_reports_rejected_stale":    m.metrics.DegradationReportsRejectedStale.Load(),
+		"degradation_reports_already_retired":   m.metrics.DegradationReportsAlreadyRetired.Load(),
+		"degradation_reports_rate_limited":      m.metrics.DegradationReportsRateLimited.Load(),
+		"degradation_reports_duplicate_pending": m.metrics.DegradationReportsDuplicatePending.Load(),
 	}
 }
 
@@ -1624,6 +1993,7 @@ func (m *Minter) Close() {
 	m.watchCancel = nil
 	m.reportSuspectGen = 0
 	m.reportSuspectVideoID = ""
+	m.retiredGen, m.retiredCrash = m.gen, false
 	// Replace the maps rather than clearing them so their backing storage can be
 	// reclaimed even if a closed Minter is retained. Tenant shutdown normally
 	// releases the whole Minter, but Close should leave both caches empty on its own.

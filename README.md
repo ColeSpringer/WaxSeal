@@ -260,8 +260,10 @@ ignored.
 `/metrics` counts each report by disposition: `degradation_reports_accepted`
 (applied to the live session), `degradation_reports_rate_limited` (past the
 report budget), `degradation_reports_rejected_stale` (an old or replaced
-generation), and `degradation_reports_already_retired` (the current generation,
-already retired by a crash or a prior report; a benign no-op).
+generation), `degradation_reports_already_retired` (the current generation,
+already retired by a crash or a prior report; a benign no-op), and
+`degradation_reports_duplicate_pending` (a repeat report for a generation whose
+retirement is already queued for the next streaming handoff).
 
 ### Authentication and tenants
 
@@ -274,6 +276,10 @@ curl -s localhost:4416/get_pot -H "X-API-Key: KEYA" -d '{"content_binding":"<id>
 ```
 
 Keys travel in `X-API-Key`, `Authorization: Bearer <key>`, or `?key=<key>`.
+Prefer a header. `?key=<key>` puts the key in the request line, which reverse
+proxies and container runtimes write to their access logs, so a health check
+polling every few seconds leaves the key in those logs for the life of the
+deployment. `waxseal ping --key` and the `client` package both send the header.
 `--tenant-keys` takes comma-separated `label=key` entries or bare keys (which get
 generated labels); labels and keys must be non-empty and unique, and an invalid
 set stops startup before Chromium launches. A keyless daemon on a non-loopback
@@ -302,7 +308,7 @@ The full view is `{"tenants":N,"per_tenant":{"<label>":{...}}}`, each tenant
 object carrying lifetime counters (`mints`, `crashes`, `player_contexts`,
 `separation_waits` for requests held back to keep a mint and an establishment
 apart, `unproven_rejections` for contexts refused because the session could not
-prove full-length streaming, the four `degradation_reports_*` dispositions above,
+prove full-length streaming, the five `degradation_reports_*` dispositions above,
 and so on) plus current state. Detail fields are always present so the schema
 stays stable across retirement, crash, and recycle; a field that does not apply
 is `null` or `""` rather than omitted. For example `last_browser_proof_age_secs`
@@ -379,9 +385,26 @@ logged at `warn`). Alert only on `probe-failed`; a caller that disconnects
 mid-probe is not counted as one. For status-code-only checks (k8s, `curl -f`,
 HAProxy), `?strict=true` maps `probe-failed` to **503** while `no-session` and
 healthy stay **200**, and `waxseal ping --strict` does the same from the CLI, so
-liveness probes do not fail during the benign re-establishment window. The image's
-`HEALTHCHECK` runs `waxseal ping --strict` for exactly that reason; multi-tenant
-deployments must add `--key <key>` to it.
+liveness probes do not fail during the benign re-establishment window. A bare
+`?strict` also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`,
+`banana`) returns **400** rather than quietly running non-strict, so a typo in a
+probe is visible. The image's `HEALTHCHECK` runs `waxseal ping --strict` for
+exactly that reason; multi-tenant deployments must add `--key <key>` to it, which
+sends the key as a header and keeps it out of access logs.
+
+Headless Chromium reports a `HeadlessChrome` token in `navigator.userAgent` and
+in its brand list, so WaxSeal installs a user-agent override that substitutes
+`Chrome` for it. Everything else in that override is the browser's own
+`navigator.userAgentData`, read back from a page WaxSeal serves to itself on
+loopback (the API is exposed only in a secure context, and the `about:blank` the
+override has to be installed on is not one). That keeps the randomised GREASE
+brand, the four-part build version, and the real platform, architecture, and
+bitness, all of which a fabricated block gets wrong in stable and inspectable
+ways. `WAXSEAL_UA_HINTS=synthetic` restores the fabricated block if the real one
+ever grades worse; `real` is the default and any other value is ignored with a
+warning. Note that a Debian `chromium` build, which the image runs, reports no
+`Google Chrome` brand at all while its user agent still says `Chrome/<version>`.
+That is what real Debian Chromium looks like, not a bug.
 
 WaxSeal is meant for loopback or a trusted network and does not implement CORS;
 because it mints tokens, browser-origin access is out of scope. Run

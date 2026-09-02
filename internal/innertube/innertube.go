@@ -18,14 +18,30 @@ import (
 )
 
 const (
-	// clientVersion is a recent WEB InnerTube version. These guest endpoints
-	// require clientName WEB. Callers may replace it with the current version from
-	// ytcfg.INNERTUBE_CLIENT_VERSION.
+	// clientName is the InnerTube client these guest endpoints require.
+	//
+	// clientVersion is a last-resort fallback, used only when a caller passes no
+	// version of its own. The daemon path always supplies the live value: the
+	// browser session captures ytcfg.INNERTUBE_CLIENT_VERSION and passes it to
+	// every InnerTube call, so this constant is reached only by a page that never
+	// exposed the field (which is logged at warn) or by a caller that hardcodes an
+	// empty version. YouTube ships a new WEB version most days, so this literal
+	// will drift; refresh it from a live session with
+	// `go run ./cmd/waxseal doctor 2>&1 | grep client_version` when it gets far
+	// enough behind to matter (doctor logs to stderr).
 	clientName    = "WEB"
-	clientVersion = "2.20260603.05.00"
+	clientVersion = "2.20260901.00.00"
 
 	maxBody = 4 << 20 // response body cap
 )
+
+// FallbackClientVersion is the pinned WEB version above, exported for the one
+// caller that must hand a version to someone else: a browser session whose page
+// never exposed ytcfg.INNERTUBE_CLIENT_VERSION publishes this instead of an empty
+// string, because a consumer that adopts the session builds its own InnerTube
+// context from what /session hands it, and an empty version there is worse than a
+// version that has drifted.
+const FallbackClientVersion = clientVersion
 
 // att/get returns the bgChallenge, and browse returns visitor_data. Variables let
 // tests point these endpoints at an httptest server.
@@ -103,6 +119,11 @@ func parseBGChallenge(raw []byte) (*botguard.Challenge, error) {
 
 // GenerateVisitorData fetches fresh guest visitor_data via browse. It is used
 // only when a caller supplies none of its own.
+//
+// Nothing in the daemon calls it today: every path gets visitor_data from the
+// browser session's captured identity, and only innertube_test.go exercises this.
+// It also builds its context with defaultContext(""), so it cannot carry a live
+// client version. Whether to keep it is a separate decision.
 func GenerateVisitorData(ctx context.Context, client *httpx.Client, userAgent string) (string, error) {
 	body, err := json.Marshal(map[string]any{
 		"context":  json.RawMessage(defaultContext("")),

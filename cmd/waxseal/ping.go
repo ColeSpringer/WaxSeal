@@ -50,9 +50,6 @@ func newPingCmd() *cobra.Command {
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
 	q := url.Values{}
-	if p.key != "" {
-		q.Set("key", p.key)
-	}
 	if p.strict {
 		q.Set("strict", "true")
 	}
@@ -86,6 +83,13 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		// Keep malformed authorities (spaces, bad escapes, broken brackets) on the
 		// usage-error path. Passing a nil request to http.DefaultClient.Do would panic.
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: %v", p.addr, err)}
+	}
+	// The key travels in a header, never in the query string. A health check runs
+	// every few seconds, and reverse proxies and container runtimes log request
+	// lines, so ?key= would write the tenant key into those logs forever. ?strict
+	// stays in the query because it is not a secret.
+	if p.key != "" {
+		req.Header.Set("X-API-Key", p.key)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

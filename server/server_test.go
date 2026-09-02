@@ -692,7 +692,10 @@ type fakePlayerSession struct {
 	pcBlocks        bool           // PlayerContext blocks until ctx is done (/player-context timeout)
 	establishBlocks bool           // EnsureEstablished blocks until ctx is done (/session timeout)
 	cookies         []*http.Cookie // when non-nil, BrowserCookies returns these
-	closed          atomic.Bool
+	// mintExpiresAt, when non-zero, is the attested expiry Mint reports. The
+	// zero default keeps the response layer's now+6h sentinel exercised.
+	mintExpiresAt time.Time
+	closed        atomic.Bool
 }
 
 func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintResult, error) {
@@ -703,7 +706,7 @@ func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintRes
 	if f.mintErr != nil {
 		return browser.MintResult{}, f.mintErr
 	}
-	return browser.MintResult{Kind: "integrity", Lifetime: 3600}, nil
+	return browser.MintResult{Kind: "integrity", Lifetime: 3600, ExpiresAt: f.mintExpiresAt}, nil
 }
 func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browser.PlayerContext, error) {
 	if f.pcBlocks {
@@ -1161,25 +1164,30 @@ func TestPingReason(t *testing.T) {
 }
 
 // TestStrictPingParsing covers how the ?strict query parameter is read: a bare
-// flag enables it, common truthy spellings enable it, and absence or explicit
-// false values disable it.
+// flag enables it, common truthy spellings enable it, absence and explicit false
+// values disable it, and anything ParseBool cannot read is rejected rather than
+// quietly disabling the mode the operator asked for.
 func TestStrictPingParsing(t *testing.T) {
-	cases := map[string]bool{
-		"/ping":              false, // absent
-		"/ping?strict":       true,  // bare flag (no value)
-		"/ping?strict=":      true,  // present, empty value
-		"/ping?strict=true":  true,
-		"/ping?strict=1":     true,
-		"/ping?strict=True":  true, // ParseBool accepts these spellings
-		"/ping?strict=t":     true,
-		"/ping?strict=false": false,
-		"/ping?strict=0":     false,
-		"/ping?strict=nope":  false, // unparseable values are disabled
+	type want struct{ strict, ok bool }
+	cases := map[string]want{
+		"/ping":               {false, true}, // absent
+		"/ping?strict":        {true, true},  // bare flag (no value)
+		"/ping?strict=":       {true, true},  // present, empty value
+		"/ping?strict=true":   {true, true},
+		"/ping?strict=1":      {true, true},
+		"/ping?strict=True":   {true, true}, // ParseBool accepts these spellings
+		"/ping?strict=t":      {true, true},
+		"/ping?strict=false":  {false, true},
+		"/ping?strict=0":      {false, true},
+		"/ping?strict=yes":    {false, false}, // ParseBool does not read these
+		"/ping?strict=on":     {false, false},
+		"/ping?strict=banana": {false, false},
 	}
-	for target, want := range cases {
+	for target, w := range cases {
 		r := httptest.NewRequest(http.MethodGet, target, nil)
-		if got := strictPing(r); got != want {
-			t.Errorf("strictPing(%q) = %v, want %v", target, got, want)
+		strict, ok := strictPing(r)
+		if strict != w.strict || ok != w.ok {
+			t.Errorf("strictPing(%q) = (%v, %v), want (%v, %v)", target, strict, ok, w.strict, w.ok)
 		}
 	}
 }
@@ -1191,16 +1199,19 @@ func TestPingStrict(t *testing.T) {
 	probeErr := errors.New("cdp connection closed")
 	keys := map[string]string{"K": "alice"}
 
-	ping := func(s *Server, strict bool) int {
-		u := "/ping"
-		if strict {
-			u += "?strict=true"
-		}
+	pingTarget := func(s *Server, u string) int {
 		r := httptest.NewRequest(http.MethodGet, u, nil)
 		r.Header.Set("X-API-Key", "K")
 		w := httptest.NewRecorder()
 		s.routes().ServeHTTP(w, r)
 		return w.Code
+	}
+	ping := func(s *Server, strict bool) int {
+		u := "/ping"
+		if strict {
+			u += "?strict=true"
+		}
+		return pingTarget(s, u)
 	}
 	newHealthy := func() *Server {
 		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
@@ -1233,6 +1244,17 @@ func TestPingStrict(t *testing.T) {
 	if code := ping(newHealthy(), false); code != http.StatusOK {
 		t.Errorf("non-strict healthy status = %d, want 200", code)
 	}
+
+	// An unparseable value is a request error, not a silent downgrade to
+	// non-strict, and it is reported whatever the session's health is.
+	for _, u := range []string{"/ping?strict=banana", "/ping?strict=yes", "/ping?strict=on"} {
+		if code := pingTarget(newHealthy(), u); code != http.StatusBadRequest {
+			t.Errorf("%s on a healthy session: status = %d, want 400", u, code)
+		}
+		if code := pingTarget(newFailing(), u); code != http.StatusBadRequest {
+			t.Errorf("%s on a failing probe: status = %d, want 400", u, code)
+		}
+	}
 }
 
 // TestGetPotWarnsOnURLBinding checks that a URL-shaped content_binding still
@@ -1261,6 +1283,50 @@ func TestGetPotWarnsOnURLBinding(t *testing.T) {
 	bareResp := post("aqz-KE-bpKQ")
 	if v, present := bareResp["warning"]; present {
 		t.Errorf("bare ID: warning = %v, want no warning key", v)
+	}
+}
+
+// TestGetPotCacheHeaderAndExpiry covers the cache disposition a consumer reads
+// off /get_pot: the first request for a binding mints and reports a miss, the
+// repeat is served from the cache and reports a hit, and both echo the token's
+// own attested expiry rather than one recomputed from the time of the response.
+func TestGetPotCacheHeaderAndExpiry(t *testing.T) {
+	// Whole seconds, because the response formats with RFC3339.
+	expires := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{
+		"K": {abrURL: "https://r/ok", vd: "vd", mintExpiresAt: expires},
+	})
+	get := func() (string, time.Time) {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+		}
+		var resp struct {
+			ExpiresAt time.Time `json:"expiresAt"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return w.Header().Get("X-POT-Cache"), resp.ExpiresAt
+	}
+
+	disposition, exp := get()
+	if disposition != "miss" {
+		t.Errorf("first request: X-POT-Cache = %q, want %q", disposition, "miss")
+	}
+	if !exp.Equal(expires) {
+		t.Errorf("first request: expiresAt = %v, want the token's own %v", exp, expires)
+	}
+	disposition, exp = get()
+	if disposition != "hit" {
+		t.Errorf("repeat request: X-POT-Cache = %q, want %q", disposition, "hit")
+	}
+	if !exp.Equal(expires) {
+		t.Errorf("repeat request: expiresAt = %v, want the token's own %v (not recomputed on the hit)", exp, expires)
 	}
 }
 

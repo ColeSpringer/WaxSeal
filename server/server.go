@@ -407,19 +407,24 @@ func normalizeScope(raw string) (string, bool) {
 }
 
 // strictPing reports whether ?strict asks /ping to map probe failures to HTTP
-// 503. Healthy sessions and no-session responses stay 200. A bare ?strict
-// enables it; explicit false values disable it.
-func strictPing(r *http.Request) bool {
+// 503, and whether the value parsed. A bare ?strict enables it. An unparseable
+// value is rejected rather than silently disabling the mode, so a typo in a
+// liveness probe fails loudly instead of quietly losing the behaviour.
+// Healthy sessions and no-session responses stay 200.
+func strictPing(r *http.Request) (strict, ok bool) {
 	q := r.URL.Query()
 	if !q.Has("strict") {
-		return false
+		return false, true
 	}
 	v := q.Get("strict")
 	if v == "" { // bare ?strict or ?strict=: presence means enabled
-		return true
+		return true, true
 	}
 	b, err := strconv.ParseBool(v)
-	return err == nil && b
+	if err != nil {
+		return false, false
+	}
+	return b, true
 }
 
 // handlePing probes an existing tenant session without launching Chromium,
@@ -430,6 +435,15 @@ func strictPing(r *http.Request) bool {
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
+		return
+	}
+	// Validate before probing, so an unparseable value is reported whatever the
+	// session's health is. /ping otherwise bypasses the error envelope, but a
+	// rejected parameter is the same class of failure the other handlers report,
+	// so it gets the same shape.
+	strict, ok := strictPing(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `strict must be a boolean ("true", "false", "1", "0"), a bare ?strict, or omitted`)
 		return
 	}
 	snap, live, err := m.Health(r.Context())
@@ -452,7 +466,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 			// Probe failures should be visible in logs even when callers do not poll
 			// /ping. Strict mode also exposes them through the status code.
 			s.log.Warn("ping probe failed", "tenant", label, "err", err)
-			if strictPing(r) {
+			if strict {
 				status = http.StatusServiceUnavailable
 			}
 		}

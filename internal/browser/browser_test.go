@@ -44,6 +44,9 @@ func TestDetectChromeEnvOverride(t *testing.T) {
 }
 
 func TestWithDefaults(t *testing.T) {
+	// The default is read from the environment, so clear the kill switch first:
+	// otherwise this reads whatever WAXSEAL_UA_HINTS the developer has exported.
+	t.Setenv(uaHintsEnv, "")
 	o := withDefaults(Options{})
 	if o.Logger == nil {
 		t.Error("Logger default is nil")
@@ -53,6 +56,28 @@ func TestWithDefaults(t *testing.T) {
 	}
 	if got := withDefaults(Options{NavTimeout: 5 * time.Second}).NavTimeout; got != 5*time.Second {
 		t.Errorf("explicit NavTimeout overwritten: %v", got)
+	}
+
+	// Client hints default to the browser's own, and the kill switch is honoured
+	// from either the field or the environment. An unrecognised env value keeps
+	// the default rather than disabling the override.
+	if o.UAHints != UAHintsReal {
+		t.Errorf("UAHints default = %q, want %q", o.UAHints, UAHintsReal)
+	}
+	if got := withDefaults(Options{UAHints: UAHintsSynthetic}).UAHints; got != UAHintsSynthetic {
+		t.Errorf("explicit UAHints overwritten: %q", got)
+	}
+	for _, tc := range []struct{ env, want string }{
+		{UAHintsSynthetic, UAHintsSynthetic},
+		{"  " + UAHintsSynthetic + "  ", UAHintsSynthetic}, // trimmed
+		{UAHintsReal, UAHintsReal},
+		{"banana", UAHintsReal},
+		{"", UAHintsReal},
+	} {
+		t.Setenv(uaHintsEnv, tc.env)
+		if got := withDefaults(Options{}).UAHints; got != tc.want {
+			t.Errorf("%s=%q gives UAHints %q, want %q", uaHintsEnv, tc.env, got, tc.want)
+		}
 	}
 }
 
@@ -68,6 +93,9 @@ func TestValidateLaunchOptions(t *testing.T) {
 		{"landing url with stop after load", Options{LandingURL: "http://127.0.0.1:1/", StopAfterLoad: true}, false},
 		{"stop after load alone", Options{StopAfterLoad: true}, false},
 		{"neither set", Options{}, false},
+		{"ua hints real", Options{UAHints: UAHintsReal}, false},
+		{"ua hints synthetic", Options{UAHints: UAHintsSynthetic}, false},
+		{"ua hints typo", Options{UAHints: "reall"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateLaunchOptions(tc.opts)
@@ -124,6 +152,160 @@ func TestUAOverride(t *testing.T) {
 	}
 	if hl.UserAgentMetadata.Brands[0].Version != "151" {
 		t.Errorf("major = %q, want 151 (derived from the real UA)", hl.UserAgentMetadata.Brands[0].Version)
+	}
+}
+
+// TestUAOverrideFromMetadata covers the real-hint path: everything the browser
+// reports is passed through untouched, and the only edit is the headless marker.
+// The inputs are shaped like real getHighEntropyValues payloads, including the
+// randomised GREASE brand and the four-part build version, neither of which can
+// be derived from the reduced UA string.
+func TestUAOverrideFromMetadata(t *testing.T) {
+	decode := func(t *testing.T, raw string) *uaMetadata {
+		t.Helper()
+		var m uaMetadata
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("unmarshal capture: %v", err)
+		}
+		return &m
+	}
+
+	t.Run("linux headless keeps the real brands", func(t *testing.T) {
+		// A headless build on Linux/x86_64. This capture carries a HeadlessChrome
+		// brand as well as the marker in the UA string, so both substitutions run.
+		m := decode(t, `{"ua":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/152.0.0.0 Safari/537.36",
+			"brands":[{"brand":"Chromium","version":"152"},{"brand":"Not?A_Brand","version":"24"},{"brand":"HeadlessChrome","version":"152"},{"brand":"Google Chrome","version":"152"}],
+			"mobile":false,"platform":"Linux",
+			"hints":{"architecture":"x86","bitness":"64","model":"","platformVersion":"6.18.0","uaFullVersion":"152.0.7977.75","wow64":false,
+				"fullVersionList":[{"brand":"Chromium","version":"152.0.7977.75"},{"brand":"Not?A_Brand","version":"24.0.0.0"},{"brand":"HeadlessChrome","version":"152.0.7977.75"},{"brand":"Google Chrome","version":"152.0.7977.75"}]}}`)
+		got := uaOverrideFromMetadata(m)
+		if got == nil {
+			t.Fatal("uaOverrideFromMetadata = nil, want an override")
+		}
+		raw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "HeadlessChrome") {
+			t.Errorf("headless marker survived anywhere in the payload: %s", raw)
+		}
+		if got.UserAgent != "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36" {
+			t.Errorf("userAgent = %q", got.UserAgent)
+		}
+		md := got.UserAgentMetadata
+		// The brand the old synthesized block dropped, the GREASE value it replaced
+		// with a constant, and the build version it coarsened to x.0.0.0.
+		if !hasBrand(md.Brands, "Google Chrome", "152") {
+			t.Errorf("brands lost the Google Chrome entry: %+v", brandPairs(md.Brands))
+		}
+		if !hasBrand(md.Brands, "Not?A_Brand", "24") {
+			t.Errorf("brands lost the real GREASE entry: %+v", brandPairs(md.Brands))
+		}
+		if !hasBrand(md.FullVersionList, "Google Chrome", "152.0.7977.75") {
+			t.Errorf("fullVersionList lost the four-part build version: %+v", brandPairs(md.FullVersionList))
+		}
+		if md.FullVersion != "152.0.7977.75" {
+			t.Errorf("fullVersion = %q, want the four-part build version", md.FullVersion)
+		}
+		// The headless brand is renamed, not dropped, so the list length holds.
+		if len(md.Brands) != 4 || len(md.FullVersionList) != 4 {
+			t.Errorf("brand list lengths = %d/%d, want 4/4", len(md.Brands), len(md.FullVersionList))
+		}
+		if md.PlatformVersion != "6.18.0" {
+			t.Errorf("platformVersion = %q, want the reported 6.18.0", md.PlatformVersion)
+		}
+	})
+
+	t.Run("macos arm64 follows the capture", func(t *testing.T) {
+		// The case the synthesized block gets wrong: it pins Linux/x86/64 on every
+		// platform, so a darwin arm64 build emitted Linux hints under a Macintosh UA.
+		m := decode(t, `{"ua":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+			"brands":[{"brand":"Chromium","version":"152"},{"brand":"Not?A_Brand","version":"24"}],
+			"mobile":false,"platform":"macOS",
+			"hints":{"architecture":"arm","bitness":"64","model":"","platformVersion":"15.3.1","uaFullVersion":"152.0.7977.75","wow64":false,
+				"fullVersionList":[{"brand":"Chromium","version":"152.0.7977.75"},{"brand":"Not?A_Brand","version":"24.0.0.0"}]}}`)
+		md := uaOverrideFromMetadata(m).UserAgentMetadata
+		for _, tc := range []struct{ name, got, want string }{
+			{"platform", md.Platform, "macOS"},
+			{"architecture", md.Architecture, "arm"},
+			{"bitness", md.Bitness, "64"},
+			{"platformVersion", md.PlatformVersion, "15.3.1"},
+		} {
+			if tc.got != tc.want {
+				t.Errorf("%s = %q, want %q (it must follow the capture, not the Linux constants)", tc.name, tc.got, tc.want)
+			}
+		}
+	})
+
+	t.Run("an unusable capture falls back", func(t *testing.T) {
+		for name, raw := range map[string]string{
+			"empty object":    `{}`,
+			"no ua":           `{"brands":[{"brand":"Chromium","version":"152"}],"platform":"Linux"}`,
+			"no brands":       `{"ua":"Mozilla/5.0 Chrome/152.0.0.0","platform":"Linux"}`,
+			"no platform":     `{"ua":"Mozilla/5.0 Chrome/152.0.0.0","brands":[{"brand":"Chromium","version":"152"}]}`,
+			"brands are null": `{"ua":"Mozilla/5.0 Chrome/152.0.0.0","brands":null,"platform":"Linux"}`,
+			// The high-entropy fields are omitempty on the wire, so a capture without
+			// them must not become an override that advertises no full-version list.
+			"no fullVersionList": `{"ua":"Mozilla/5.0 Chrome/152.0.0.0","brands":[{"brand":"Chromium","version":"152"}],"platform":"Linux","hints":{"uaFullVersion":"152.0.7977.75"}}`,
+			"no uaFullVersion":   `{"ua":"Mozilla/5.0 Chrome/152.0.0.0","brands":[{"brand":"Chromium","version":"152"}],"platform":"Linux","hints":{"fullVersionList":[{"brand":"Chromium","version":"152.0.7977.75"}]}}`,
+		} {
+			if got := uaOverrideFromMetadata(decode(t, raw)); got != nil {
+				t.Errorf("%s: uaOverrideFromMetadata = %+v, want nil so normalizeUA falls back", name, got)
+			}
+		}
+		if got := uaOverrideFromMetadata(nil); got != nil {
+			t.Errorf("nil capture: uaOverrideFromMetadata = %+v, want nil", got)
+		}
+		// The fallback itself still has to produce a coherent block.
+		fb := uaOverride("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/152.0.0.0 Safari/537.36")
+		if fb.UserAgentMetadata == nil || len(fb.UserAgentMetadata.Brands) == 0 || fb.UserAgentMetadata.Platform == "" {
+			t.Errorf("synthesized fallback is not coherent: %+v", fb)
+		}
+		if strings.Contains(fb.UserAgent, "HeadlessChrome") {
+			t.Errorf("synthesized fallback kept the marker: %q", fb.UserAgent)
+		}
+	})
+}
+
+// hasBrand reports whether brands carries the given brand at the given version.
+func hasBrand(brands []*cdp.UserAgentBrandVersion, brand, version string) bool {
+	return slices.ContainsFunc(brands, func(b *cdp.UserAgentBrandVersion) bool {
+		return b.Brand == brand && b.Version == version
+	})
+}
+
+// brandPairs renders a brand list for a failure message; the slice holds pointers,
+// which print as addresses.
+func brandPairs(brands []*cdp.UserAgentBrandVersion) []string {
+	out := make([]string, 0, len(brands))
+	for _, b := range brands {
+		out = append(out, b.Brand+"/"+b.Version)
+	}
+	return out
+}
+
+// TestUAOverrideCacheKeepsOnlyAUsableCapture pins the memoisation rule: the first
+// usable capture is kept for the browser's lifetime and later sessions never
+// capture again, while a failed or incomplete capture leaves the cache empty so
+// the next session retries instead of inheriting the fallback.
+func TestUAOverrideCacheKeepsOnlyAUsableCapture(t *testing.T) {
+	var c uaOverrideCache
+	calls := 0
+	if got := c.realOverride(func() *cdp.NetworkSetUserAgentOverride { calls++; return nil }); got != nil {
+		t.Fatalf("a failed capture returned %+v, want nil", got)
+	}
+	want := &cdp.NetworkSetUserAgentOverride{UserAgent: "Mozilla/5.0 Chrome/152.0.0.0"}
+	if got := c.realOverride(func() *cdp.NetworkSetUserAgentOverride { calls++; return want }); got != want {
+		t.Fatalf("second capture returned %+v, want the override it produced", got)
+	}
+	if got := c.realOverride(func() *cdp.NetworkSetUserAgentOverride {
+		t.Error("capture ran again after a usable one was cached")
+		return nil
+	}); got != want {
+		t.Errorf("cached call returned %+v, want the memoised override", got)
+	}
+	if calls != 2 {
+		t.Errorf("capture ran %d times, want 2 (a failure, then the one that was kept)", calls)
 	}
 }
 
@@ -404,6 +586,30 @@ func TestBufferedSampleDecode(t *testing.T) {
 	}
 	if b.Current != 72.5 || b.BufferedEnd != 101.2 || !b.CoversTarget || b.State != 1 || b.ABRURL != "https://r/x" {
 		t.Errorf("decoded sample = %+v, want the payload values", b)
+	}
+}
+
+// TestProofCandidatesClearTheMinimum pins that every fallback candidate can
+// actually be probed. A candidate at or below fullLengthMinVideoSecs is rejected
+// as OutcomeVideoTooShort before it is ever tried, so it costs a page load and an
+// establish and can never establish a session.
+func TestProofCandidatesClearTheMinimum(t *testing.T) {
+	// Durations are recorded here rather than fetched, so the offline suite stays
+	// offline. Update alongside proofCandidates. Measured with
+	// `waxseal doctor --full --video <id>`, which reports length_seconds.
+	lengths := map[string]int{
+		DefaultVideo:  635, // Big Buck Bunny
+		"R6MlUcmOul8": 734, // Tears of Steel
+		"eRsGyueVLvQ": 888, // Sintel
+	}
+	for _, id := range proofCandidates {
+		n, ok := lengths[id]
+		if !ok {
+			t.Fatalf("candidate %s has no recorded duration; add one", id)
+		}
+		if n <= fullLengthMinVideoSecs {
+			t.Errorf("candidate %s is %ds, at or below the %ds minimum, so proveFullLength always rejects it", id, n, fullLengthMinVideoSecs)
+		}
 	}
 }
 

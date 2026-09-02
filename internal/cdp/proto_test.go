@@ -74,6 +74,13 @@ func TestArgvHeadfulDropsHeadless(t *testing.T) {
 // TestUACHGolden asserts the marshaled Network.setUserAgentOverride matches the
 // pinned golden byte-for-byte, including the non-omitempty empty
 // model/platformVersion.
+//
+// The literal below is written for this test and is deliberately independent of
+// what internal/browser produces: this pins the wire shape (field order, tags,
+// which fields survive omitempty), not the values WaxSeal chooses. They are
+// allowed to diverge, and they do, since the browser package now echoes the real
+// browser's brands and build version. internal/browser's own TestUAOverride and
+// TestUAOverrideFromMetadata pin the producer.
 func TestUACHGolden(t *testing.T) {
 	const major = "149"
 	const full = "149.0.0.0"

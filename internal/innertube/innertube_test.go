@@ -197,6 +197,53 @@ func TestDefaultContextShape(t *testing.T) {
 	}
 }
 
+// TestGuestContextPrefersTheCallersVersion pins which version reaches the wire.
+// The daemon captures ytcfg.INNERTUBE_CLIENT_VERSION per session and passes it
+// here, so a live version must win; the pinned constant is only the last resort
+// for a caller with none, and it drifts as YouTube ships new WEB versions.
+func TestGuestContextPrefersTheCallersVersion(t *testing.T) {
+	read := func(raw json.RawMessage) map[string]any {
+		t.Helper()
+		var ctx struct {
+			Client map[string]any `json:"client"`
+		}
+		if err := json.Unmarshal(raw, &ctx); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return ctx.Client
+	}
+
+	live := read(GuestContext("VD", "2.29991231.99.99"))
+	if live["clientVersion"] != "2.29991231.99.99" {
+		t.Errorf("clientVersion = %v, want the caller's live version", live["clientVersion"])
+	}
+	if live["clientVersion"] == clientVersion {
+		t.Error("a live version was replaced by the pinned fallback")
+	}
+	if live["visitorData"] != "VD" {
+		t.Errorf("visitorData = %v, want VD", live["visitorData"])
+	}
+
+	// An empty version is the only case that reaches the constant. captureIdentity
+	// logs at warn when it hands one over, so this path is visible in the daemon.
+	fallback := read(GuestContext("VD", ""))
+	if fallback["clientVersion"] != clientVersion {
+		t.Errorf("clientVersion = %v, want the pinned fallback %q", fallback["clientVersion"], clientVersion)
+	}
+	// A session whose page never exposed the version publishes FallbackClientVersion
+	// through /session, so a consumer adopting it builds the same context the
+	// daemon's own calls would. The two must be one value, not two that drift.
+	if FallbackClientVersion != clientVersion {
+		t.Errorf("FallbackClientVersion = %q, clientVersion = %q; they must be the same version", FallbackClientVersion, clientVersion)
+	}
+	if got := read(GuestContext("VD", FallbackClientVersion))["clientVersion"]; got != fallback["clientVersion"] {
+		t.Errorf("GuestContext with FallbackClientVersion = %v, want the same as with an empty version (%v)", got, fallback["clientVersion"])
+	}
+	if fallback["clientName"] != clientName {
+		t.Errorf("clientName = %v, want %q", fallback["clientName"], clientName)
+	}
+}
+
 // swap sets *p to v and returns a function restoring the old value.
 func swap(p *string, v string) func() {
 	old := *p
