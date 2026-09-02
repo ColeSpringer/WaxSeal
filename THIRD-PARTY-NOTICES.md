@@ -18,7 +18,7 @@ was copied. Algorithms ported from MIT sources are attributed below.
 
 ## Go module dependencies
 
-- **github.com/spf13/cobra** and **spf13/pflag** (Apache-2.0): CLI framework.
+- **github.com/spf13/cobra** (Apache-2.0) and **spf13/pflag** (BSD-3-Clause): CLI framework.
 
 WaxSeal speaks the Chrome DevTools Protocol to Chromium through
 `internal/cdp`, a standard-library client maintained in this repository. The
