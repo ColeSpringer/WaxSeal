@@ -193,3 +193,45 @@ func TestTenantsConcurrent(t *testing.T) {
 		t.Errorf("session creations = %d, want 3 (one per tenant, single-flighted)", got)
 	}
 }
+
+// A request that outlives the shutdown drain still resolves its key, so it must
+// get a Minter (not a spurious 401), but that Minter must refuse to launch
+// against a pool that is already closed. A lazily created one is born closed.
+func TestTenantsCloseIsTerminal(t *testing.T) {
+	tn, calls := newTestTenants(map[string]string{"KEYA": "alice", "KEYB": "bob"})
+	ctx := context.Background()
+	if err := tn.WarmOne(ctx, "KEYA"); err != nil {
+		t.Fatalf("WarmOne: %v", err)
+	}
+	tn.Close()
+
+	// An existing tenant: its Minter was closed by Close itself.
+	if err := tn.WarmOne(ctx, "KEYA"); !errors.Is(err, ErrClosed) {
+		t.Errorf("WarmOne on an existing tenant after Close = %v, want ErrClosed", err)
+	}
+	// A tenant created after Close: valid key, resolvable, but cannot launch.
+	m, label, err := tn.Minter("KEYB")
+	if err != nil {
+		t.Fatalf("Minter(KEYB) after Close = %v, want a resolvable tenant", err)
+	}
+	if label != "bob" {
+		t.Errorf("label = %q, want bob", label)
+	}
+	if err := m.Warm(ctx); !errors.Is(err, ErrClosed) {
+		t.Errorf("Warm on a tenant created after Close = %v, want ErrClosed", err)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("newSession calls = %d, want 1 (only the pre-Close warm)", got)
+	}
+	// The post-shutdown tenant is served but not registered. Shutdown has already
+	// torn down every registered Minter and will not run again, so registering it
+	// would leak it and count a tenant the daemon never ran. Close still leaves
+	// the tenants that did run in place, so metrics report the run.
+	snap := tn.MetricsSnapshot()
+	if n, _ := snap["tenants"].(int); n != 1 {
+		t.Errorf("tenants = %v, want 1 after Close (alice ran; bob never did)", snap["tenants"])
+	}
+	if _, ok := snap["per_tenant"].(map[string]any)["alice"]; !ok {
+		t.Error("per_tenant lost alice, whose run metrics shutdown should still report")
+	}
+}

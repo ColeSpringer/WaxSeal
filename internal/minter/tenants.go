@@ -35,6 +35,9 @@ type Tenants struct {
 	mu      sync.Mutex
 	keys    map[string]string  // API key to tenant label; only labels appear in logs and metrics
 	minters map[string]*Minter // tenant label to lazily created Minter
+	// closed marks the registry terminal, so a Minter created lazily after
+	// shutdown is born closed rather than able to launch into a pool that is gone.
+	closed bool
 }
 
 const defaultTenant = "default"
@@ -98,16 +101,30 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 		return nil, "", err
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	m, ok := t.minters[label]
-	if !ok {
-		m = NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
-		m.launch = func(ctx context.Context) (minterSession, error) {
-			return t.newSession(ctx, t.video)
-		}
-		t.minters[label] = m
-		t.log.Info("tenants: tenant minter created", "tenant", label)
+	if m, ok := t.minters[label]; ok {
+		t.mu.Unlock()
+		return m, label, nil
 	}
+	if t.closed {
+		t.mu.Unlock()
+		// A request that outlives the shutdown drain still resolves its key, so it
+		// gets its usual 502 or 503 rather than a spurious 401. What it gets is a
+		// Minter that cannot launch against a pool that is gone, built and closed
+		// here rather than registered: shutdown has already torn down every
+		// registered Minter and will not run again, so registering this one would
+		// leak it, log a tenant created after the daemon stopped, and inflate the
+		// tenant count /metrics reports for the run.
+		m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
+		m.Close() // Close owns the terminal flag; there is no session to tear down.
+		return m, label, nil
+	}
+	m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
+	m.launch = func(ctx context.Context) (minterSession, error) {
+		return t.newSession(ctx, t.video)
+	}
+	t.minters[label] = m
+	t.mu.Unlock()
+	t.log.Info("tenants: tenant minter created", "tenant", label)
 	return m, label, nil
 }
 
@@ -182,9 +199,11 @@ func (t *Tenants) AggregateMetricsSnapshot() map[string]any {
 }
 
 // Close tears down every tenant Minter (disposing each context) and the shared
-// browser.
+// browser, and makes the registry terminal. t.minters is left populated so
+// MetricsSnapshot still reports what the daemon did before it stopped.
 func (t *Tenants) Close() {
 	t.mu.Lock()
+	t.closed = true
 	ms := make([]*Minter, 0, len(t.minters))
 	for _, m := range t.minters {
 		ms = append(ms, m)

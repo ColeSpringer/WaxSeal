@@ -275,7 +275,19 @@ go run ./cmd/waxseal server --tenant-keys "alice=KEYA,bob=KEYB"
 curl -s localhost:4416/get_pot -H "X-API-Key: KEYA" -d '{"content_binding":"<id>"}'
 ```
 
-Keys travel in `X-API-Key`, `Authorization: Bearer <key>`, or `?key=<key>`.
+Keys travel in `X-API-Key`, `Authorization: Bearer <key>`, or `?key=<key>`, and
+are read in that order: the first source carrying a value wins, so a request may
+present its key wherever is convenient. The `Bearer` scheme is matched case
+insensitively, as RFC 7235 requires, and an `Authorization` header naming another
+scheme or carrying no credentials falls through to `?key=` rather than resolving
+to an empty key.
+
+One consequence is worth naming for anyone upgrading: a `Bearer` header spelled
+in any case now takes precedence over `?key=`, where previously only the exact
+spelling `Bearer ` did. A deployment that sends a lowercase `authorization:
+bearer` header for something other than WaxSeal, and relies on `?key=` for the
+tenant key, has to move that key to `X-API-Key`, which outranks both.
+
 Prefer a header. `?key=<key>` puts the key in the request line, which reverse
 proxies and container runtimes write to their access logs, so a health check
 polling every few seconds leaves the key in those logs for the life of the
@@ -309,10 +321,31 @@ object carrying lifetime counters (`mints`, `crashes`, `player_contexts`,
 `separation_waits` for requests held back to keep a mint and an establishment
 apart, `unproven_rejections` for contexts refused because the session could not
 prove full-length streaming, the five `degradation_reports_*` dispositions above,
-and so on) plus current state. Detail fields are always present so the schema
-stays stable across retirement, crash, and recycle; a field that does not apply
-is `null` or `""` rather than omitted. For example `last_browser_proof_age_secs`
-is `null` until the first proof, which reserves `0` for "just proved", and
+and so on) plus current state.
+
+Four counters are worth knowing exactly:
+
+- `player_context_failures` counts real failed attempts against the browser and
+  nothing else.
+- `player_context_negative_cache_hits` counts requests refused from the
+  negative cache without touching the browser. They are counted apart because one
+  caller looping on a single unplayable video can drive this by six orders of
+  magnitude while every real request succeeds, which would bury the failure rate.
+- `probe_failures` counts the `/ping` responses reporting `probe-failed`, one for
+  one, so it lines up with the alert below. `crashes` also counts CDP-event
+  deaths, so the two together separate probe-detected loss from the rest.
+- `probe_busy` counts the `/ping` responses reporting `busy`. Those are benign
+  and stay HTTP 200, which is exactly why they are counted: without this, a
+  daemon answering `busy` on every probe looks the same as a healthy one.
+- `cache_entries` reports **servable** entries: current generation, not yet
+  expired, which is what a token request would actually be served from. A
+  consumer degradation report drops that generation's cached tokens, so it takes
+  `cache_entries` for the tenant to 0.
+
+Detail fields are always present so the schema stays stable across retirement,
+crash, and recycle; a field that does not apply is `null` or `""` rather than
+omitted. For example `last_browser_proof_age_secs` is `null` until the first
+proof, which reserves `0` for "just proved", and
 `streaming_seconds_until_recycle` appears only when time-based recycling is
 enabled (`--streaming-max-age` > 0). The redacted view is
 `{"redacted":true,"aggregate":{...}}`: the same counters summed across tenants,
@@ -368,7 +401,11 @@ Profiles live under `$HOME` so snap-confined Chromium can open them and so share
 hosts keep each daemon's profiles private.
 
 The `crashes` metric counts unexpected browser loss from Chromium events or a
-failed health probe, not retirement from age, a report, or operation retries.
+failed health probe, not retirement from age, a report, or operation retries. A
+probe failure is confirmed by a second probe before the session is retired, so a
+single transient CDP hiccup no longer destroys a warm generation; only the
+confirmed loss counts. `probe_failures` is the probe-only view of the same
+events.
 `--report-debounce` (default `5m`) throttles all report-driven recycles for a
 tenant across generations, not just repeats of one generation. Bursts of up to 4
 recycles are allowed before the limit bites, enough for a consumer whose
@@ -380,11 +417,13 @@ basis may lower it.
 Health checks use `/ping`, which after authentication returns HTTP 200 with
 `ok:true` or `ok:false` and an always-present `reason`: `ok`, `no-session`
 (benign, since a `POST /report` retires the session and re-establishment is lazy,
-so `ok` briefly reads `false`), or `probe-failed` (a live session's probe failed,
-logged at `warn`). Alert only on `probe-failed`; a caller that disconnects
-mid-probe is not counted as one. For status-code-only checks (k8s, `curl -f`,
-HAProxy), `?strict=true` maps `probe-failed` to **503** while `no-session` and
-healthy stay **200**, and `waxseal ping --strict` does the same from the CLI, so
+so `ok` briefly reads `false`), `busy` (benign: a probe failed twice but a
+request held the page, so nothing was retired and the next probe re-checks once
+that request finishes), or `probe-failed` (a live session's probe failed twice
+and the session was retired, logged at `warn`). Alert only on `probe-failed`; a
+caller that disconnects mid-probe is not counted as one. For status-code-only
+checks (k8s, `curl -f`, HAProxy), `?strict=true` maps `probe-failed` to **503**
+while `no-session`, `busy`, and healthy stay **200**, and `waxseal ping --strict` does the same from the CLI, so
 liveness probes do not fail during the benign re-establishment window. A bare
 `?strict` also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`,
 `banana`) returns **400** rather than quietly running non-strict, so a typo in a
@@ -415,15 +454,18 @@ debounce, bind address, headful mode, and metrics access.
 
 ```sh
 go test ./...                              # offline unit tests; no browser or network
+(cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs WAXSEAL_URL/WAXSEAL_KEY
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js
 ```
 
-`go test ./...` is fully offline and deterministic: no browser, no network. The
-committed browser bundle means normal builds do not need Node. The live CDP tests
-self-skip when no browser is found (`WAXSEAL_CHROME_BIN` picks one,
+`go test ./...` is fully offline and deterministic: no browser, no network. It
+does not reach `provider/`, which is a separate module, so that module's own
+offline tests (also pure `httptest`) need the second line; `make test` runs both.
+The committed browser bundle means normal builds do not need Node. The live CDP
+tests self-skip when no browser is found (`WAXSEAL_CHROME_BIN` picks one,
 `WAXSEAL_REQUIRE_CHROME=1` fails instead of skipping, which CI sets). The `e2e`
 tests live in the nested `provider/` module and must run from that directory,
 since a root-level `go test -tags e2e ./...` silently descends into nothing; they

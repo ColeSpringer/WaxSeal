@@ -577,8 +577,14 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	if got := atomic.LoadInt64(&calls); got != 1 {
 		t.Errorf("session PlayerContext calls = %d, want 1 (second served from negative cache)", got)
 	}
-	if got := m.metrics.PlayerContextFailures.Load(); got != 2 {
-		t.Errorf("player_context_failures = %d, want 2", got)
+	// The two refusals are counted apart: one real attempt against the browser,
+	// one served from the negative cache. A caller looping on one unplayable video
+	// must not be able to move the failure counter an operator alerts on.
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1 (the attempt that reached the browser)", got)
+	}
+	if got := m.metrics.PlayerContextNegativeCacheHits.Load(); got != 1 {
+		t.Errorf("player_context_negative_cache_hits = %d, want 1", got)
 	}
 }
 
@@ -1148,22 +1154,70 @@ func TestMinterHealthLivePing(t *testing.T) {
 	}
 }
 
-// A failed health probe retires the idle session and counts the browser loss.
+// A health probe that fails twice retires the idle session and counts the
+// browser loss.
 func TestMinterHealthDeadPingRetires(t *testing.T) {
-	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	var probes int64
+	m, sessions, smu := newPingMinter(func() error {
+		atomic.AddInt64(&probes, 1)
+		return errors.New("cdp connection closed")
+	})
 	if err := m.Warm(context.Background()); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
 	if _, _, err := m.Health(context.Background()); err == nil {
 		t.Fatal("Health = nil, want the probe error")
 	}
+	if got := atomic.LoadInt64(&probes); got != 2 {
+		t.Errorf("probes = %d, want 2: a failure is confirmed before anything is retired", got)
+	}
 	if got := m.metrics.Crashes.Load(); got != 1 {
 		t.Errorf("crashes = %d, want 1 (an unresponsive /ping counts as browser loss)", got)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 1 {
+		t.Errorf("probe_failures = %d, want 1 (one probe-failed response)", got)
 	}
 	smu.Lock()
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
 		t.Error("failed probe did not retire the idle session")
+	}
+}
+
+// One transient probe failure must not destroy a warm generation. The image's
+// HEALTHCHECK runs `waxseal ping --strict` every 30 seconds, so acting on a
+// single failure would forge a browser-death signal on a healthy daemon.
+func TestMinterHealthTransientPingRecoversOnConfirmation(t *testing.T) {
+	var probes int64
+	m, sessions, smu := newPingMinter(func() error {
+		if atomic.AddInt64(&probes, 1) == 1 {
+			return context.DeadlineExceeded // the failure mode this guards
+		}
+		return nil
+	})
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	snap, live, err := m.Health(context.Background())
+	if err != nil || !live {
+		t.Fatalf("Health = (%v, live=%v), want the recovered session", err, live)
+	}
+	if snap.Generation != 1 {
+		t.Errorf("generation = %d, want 1 (the original session)", snap.Generation)
+	}
+	if got := atomic.LoadInt64(&probes); got != 2 {
+		t.Errorf("probes = %d, want 2 (the failure plus its confirmation)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0", got)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 0 {
+		t.Errorf("probe_failures = %d, want 0", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("a probe that recovered on confirmation retired the session")
 	}
 }
 
@@ -1230,7 +1284,9 @@ func TestMinterRetireCrashCount(t *testing.T) {
 	}
 }
 
-// A failed probe must not retire a session while its page is in use.
+// A confirmed probe failure must not retire a session while its page is in use,
+// and must report the benign busy state rather than probe-failed: nothing was
+// acted on, so three of these must not mark a healthy container unhealthy.
 func TestMinterHealthDeadPingHeldMintMuNoRetire(t *testing.T) {
 	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
 	if err := m.Warm(context.Background()); err != nil {
@@ -1239,8 +1295,14 @@ func TestMinterHealthDeadPingHeldMintMuNoRetire(t *testing.T) {
 	m.mintMu.Lock() // Hold the page lock during the probe.
 	_, _, err := m.Health(context.Background())
 	m.mintMu.Unlock()
-	if err == nil {
-		t.Fatal("Health = nil, want the probe error")
+	if !errors.Is(err, ErrProbeBusy) {
+		t.Fatalf("Health = %v, want ErrProbeBusy", err)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 0 {
+		t.Errorf("probe_failures = %d, want 0 (nothing was retired)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0 (nothing was retired)", got)
 	}
 	smu.Lock()
 	defer smu.Unlock()
@@ -4124,5 +4186,439 @@ func TestWarmSerializesWithRequests(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Warm never returned after mintMu was released")
+	}
+}
+
+// The tests below cover Close as a terminal state. Close does not take mintMu,
+// so a request already past ensure keeps running after the shutdown drain
+// expires. Without the closed flag its ladder calls ensure again and launches,
+// attests, and publishes a fresh session on a Minter nothing will tear down.
+
+// The mechanism item 2 exists for: a request already past ensure, holding a live
+// session, when Close lands. Its operation then fails, it walks its ladder back
+// into ensure, and ensure must refuse instead of launching a second browser onto
+// a Minter nothing will tear down again. Close deliberately does not take mintMu,
+// which is what lets it land in this window.
+func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
+	var launches int64
+	var sessions []*fakeSession
+	var smu sync.Mutex
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		fs := &fakeSession{mint: func(binding string) (browser.MintResult, error) {
+			if binding == "vd" { // the attestation pre-mint, so the session publishes
+				return okMint(binding)
+			}
+			// The request is now past ensure, holding this session. Park it there so
+			// Close lands underneath, then fail the way a torn-down page does.
+			once.Do(func() { close(entered) })
+			<-release
+			return browser.MintResult{}, errors.New("page gone")
+		}}
+		smu.Lock()
+		sessions = append(sessions, fs)
+		smu.Unlock()
+		return fs, nil
+	}
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	genBefore := m.Generation()
+
+	// A binding the pre-mint did not fill, so this really reaches sess.Mint.
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := m.Mint(context.Background(), "gvs", "other-binding")
+		done <- err
+	}()
+	<-entered
+	m.Close()
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Mint across Close = %v, want ErrClosed from the ladder's ensure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight Mint never returned")
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (Close must not let the ladder relaunch)", got)
+	}
+	if got := m.Generation(); got != genBefore {
+		t.Errorf("generation = %d, want %d unchanged", got, genBefore)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (Close abandoned the generation, not this request)", got)
+	}
+	snap := m.MetricsSnapshot()
+	if live, _ := snap["session_live"].(bool); live {
+		t.Error("session_live = true after Close")
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	for i, s := range sessions {
+		if !s.closed.Load() {
+			t.Errorf("session %d was left open by Close", i)
+		}
+	}
+}
+
+// Warm on a closed Minter reports ErrClosed without launching anything.
+func TestWarmAfterCloseDoesNotLaunch(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint}, nil
+	}
+	m.Close()
+	if err := m.Warm(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Warm after Close = %v, want ErrClosed", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 0 {
+		t.Errorf("launches = %d, want 0", got)
+	}
+	if got := m.Generation(); got != 0 {
+		t.Errorf("generation = %d, want 0 (nothing was published)", got)
+	}
+}
+
+// Close landing while a launch is in flight is the only way a session can still
+// reach publication. The publish critical section must discard it rather than
+// leave the pool a browser context nothing will close.
+func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
+	m := newBareMinter(0, 0)
+	launchStarted := make(chan struct{})
+	release := make(chan struct{})
+	launched := &fakeSession{mint: okMint}
+	var launches int64
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		close(launchStarted)
+		<-release
+		return launched, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.Warm(context.Background()) }()
+
+	<-launchStarted
+	m.Close() // Close does not take mintMu, so it lands mid-launch.
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Warm across Close = %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Warm never returned")
+	}
+	if !launched.closed.Load() {
+		t.Error("the session launched across Close was published or leaked, not closed")
+	}
+	if got := m.Generation(); got != 0 {
+		t.Errorf("generation = %d, want 0 (a closed Minter publishes nothing)", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1", got)
+	}
+}
+
+// The tests below cover a generation retired out from under a request by
+// something that is neither a crash nor the request's own ladder. The request
+// must take the replacement without counting an escalation: only one attempt
+// against that generation ever failed, and abandoning it was somebody else's
+// decision. Compare crashUnder above, which retires as a crash and is graded
+// nowhere at all.
+
+// retireUnder retires the current generation the way a non-crash retirer that
+// skips mintMu does. After item 2, Minter.Close is the only one in the tree.
+func retireUnder(m *Minter) { m.retire(m.Generation(), "retired out from under the request", false) }
+
+func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: func(binding string) (browser.MintResult, error) {
+			if binding == "vd" { // the attestation pre-mint, not the request
+				return okMint(binding)
+			}
+			retireUnder(m)
+			return browser.MintResult{}, errDeadPage
+		}}, nil
+	}
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	res, _, err := m.Mint(context.Background(), "gvs", "request-binding")
+	if err != nil {
+		t.Fatalf("Mint: %v, want the replacement to serve it", err)
+	}
+	if res.Token != "t" {
+		t.Errorf("token = %q, want the replacement's", res.Token)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
+	}
+	if got := m.metrics.MintFailures.Load(); got != 1 {
+		t.Errorf("mint_failures = %d, want 1 (one attempt ran against that generation)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (the generation was already abandoned)", got)
+	}
+}
+
+func TestPlayerContextDoesNotEscalateOnAForeignRetirement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			retireUnder(m)
+			return browser.PlayerContext{}, errDeadPage
+		}}, nil
+	}
+	pc, _, err := m.PlayerContext(context.Background(), "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v, want the replacement to serve it", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("empty context; want the replacement's")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1 (one attempt ran against that generation)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (the generation was already abandoned)", got)
+	}
+	if got := m.metrics.PlayerContexts.Load(); got != 1 {
+		t.Errorf("player_contexts = %d, want 1", got)
+	}
+}
+
+// cacheEntries reads the cache_entries gauge the way /metrics does.
+func cacheEntries(t *testing.T, m *Minter) int {
+	t.Helper()
+	v, ok := m.MetricsSnapshot()["cache_entries"].(int)
+	if !ok {
+		t.Fatalf("cache_entries missing from the snapshot or not an int: %#v", m.MetricsSnapshot()["cache_entries"])
+	}
+	return v
+}
+
+// cache_entries reports what cacheGet would serve, not the size of the map: an
+// expired entry no sweep has reached yet, and a stale-generation one, are both
+// unservable. Counting them told an operator the daemon held tokens it would
+// have refused.
+func TestCacheEntriesCountsOnlyServableEntries(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	// The attestation pre-mint caches one token under both scopes.
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries after warm = %d, want 2", got)
+	}
+	m.mu.Lock()
+	m.cache["gvs|expired"] = cachedToken{res: browser.MintResult{Token: "old"}, expiry: time.Now().Add(-time.Second), gen: m.gen}
+	m.cache["gvs|stale-gen"] = cachedToken{res: browser.MintResult{Token: "older"}, expiry: time.Now().Add(time.Hour), gen: m.gen - 1}
+	m.mu.Unlock()
+
+	if got := cacheEntries(t, m); got != 2 {
+		t.Errorf("cache_entries = %d, want 2: neither the expired nor the stale-generation entry is servable", got)
+	}
+	// /metrics is a read path. cacheGet deletes what it rejects; this must not,
+	// or scraping the daemon would change it.
+	m.mu.Lock()
+	n := len(m.cache)
+	m.mu.Unlock()
+	if n != 4 {
+		t.Errorf("len(m.cache) = %d, want 4: a scrape must not sweep the cache", n)
+	}
+}
+
+// A consumer degradation report drops the reported generation's cached tokens.
+// Without this the positive cache keeps handing out the generation the consumer
+// just called degraded, because a report-driven retire leaves m.gen unchanged.
+func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
+	// Attempts, not successes: counting only the successful launches would make
+	// the assertion below unfalsifiable, since nothing increments it once
+	// failLaunch is set.
+	var attempts int64
+	failLaunch := false
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&attempts, 1)
+		if failLaunch {
+			return nil, errors.New("no browser")
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	if _, cached, err := m.Mint(ctx, "gvs", "b"); err != nil || cached {
+		t.Fatalf("first mint: cached=%v err=%v, want a fresh token", cached, err)
+	}
+	if got := cacheEntries(t, m); got != 3 {
+		t.Fatalf("cache_entries = %d, want 3 (two pre-mint scopes plus the request's)", got)
+	}
+
+	if res := m.ReportDegraded(m.Generation(), "vid", "cap"); !res.Retired {
+		t.Fatalf("report = %+v, want an immediate retirement", res)
+	}
+	// The generation is unchanged by a report-driven retire, so this is the drop
+	// and not a generation bump invalidating the entries.
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after the report, want 0", got)
+	}
+
+	// The named tradeoff: with the relaunch failing, this request is refused
+	// rather than served the token the consumer just reported as degraded. Before
+	// the drop, Mint's aged-generation fallback would have handed it over.
+	failLaunch = true
+	if _, cached, err := m.Mint(ctx, "gvs", "b"); err == nil {
+		t.Errorf("mint after a report with a failing relaunch: cached=%v, want a refusal, not the degraded generation's token", cached)
+	}
+	// Two attempts: the warm, and the relaunch this request reached only because
+	// the cache lookup before it missed. Had the report left the tokens in place,
+	// the lookup would have been a hit and ensure would never have been called.
+	if got := atomic.LoadInt64(&attempts); got != 2 {
+		t.Errorf("launch attempts = %d, want 2 (the warm, plus the relaunch the miss forced)", got)
+	}
+}
+
+// The deferred path drops them too. A report that arrives while a browser
+// operation holds mintMu is consumed by the next streaming handoff, which is
+// where refreshStreamingSession retires the suspect generation.
+func TestDeferredReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+	// Released with a defer, matching the other tests on this fixture: a t.Fatalf
+	// below would otherwise strand the parked call inside sess.PlayerContext,
+	// holding this Minter's mintMu for the rest of the run.
+	released := false
+	defer func() {
+		if !released {
+			release()
+			<-done
+		}
+	}()
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries = %d, want 2 (the pre-mint under both scopes)", got)
+	}
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	release()
+	<-done
+	released = true
+
+	// Fail the relaunch so the drop is observable: a successful one publishes a
+	// new generation, which clears the whole cache on its own.
+	m.launch = func(context.Context) (minterSession, error) { return nil, errors.New("no browser") }
+	if _, _, err := m.PlayerContext(context.Background(), "vid"); err == nil {
+		t.Fatal("player-context after the deferred retirement succeeded; want the failed relaunch")
+	}
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after the deferred retirement, want 0", got)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != 1 {
+		t.Errorf("report_driven_recycles = %d, want 1", got)
+	}
+}
+
+// A browser that dies during status-1 confirmation surfaces as
+// ErrStatus2Unconfirmed: the confirm loop's eval errors run out its budget and
+// grade it target-not-buffered. The request must still take the replacement.
+// playerContextDied refuses to consult sessionDied for a status-2 error, so that
+// a status-2 failure on a live session cannot buy a relaunch; when the session is
+// gone there is nothing left to protect, and refusing here would both fail a
+// recoverable request and file a crash under status2_rejections.
+func TestPlayerContextCrashDuringConfirmTakesTheReplacement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			crashUnder(m) // the watcher retires the generation mid-confirm
+			return browser.PlayerContext{}, fmt.Errorf("%w: buffered probe eval error: %v", browser.ErrStatus2Unconfirmed, errDeadPage)
+		}}, nil
+	}
+	pc, _, err := m.PlayerContext(context.Background(), "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v, want the replacement to serve it", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("empty context; want the replacement's")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the dead session plus its replacement)", got)
+	}
+	if got := m.metrics.Status2Rejections.Load(); got != 0 {
+		t.Errorf("status2_rejections = %d, want 0 (a dead page is a crash, not a status-2 refusal)", got)
+	}
+	// A dead page is graded nowhere: the crash is counted by the retirement alone.
+	requireCrashOnlyMetrics(t, m)
+	if got := m.metrics.PlayerContextFailures.Load(); got != 0 {
+		t.Errorf("player_context_failures = %d, want 0 (the dead page's failure is not graded)", got)
+	}
+}
+
+// A pending report can be consumed by a teardown that fired for another reason.
+// The suspect mark is cleared either way, so the drop has to happen there too, or
+// the tokens of a generation a consumer called degraded outlive it.
+func TestReportPendingThenCrashStillDropsTheCachedTokens(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+	defer func() { release(); <-done }()
+
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries = %d, want 2 (the pre-mint under both scopes)", got)
+	}
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	// The crash watcher gets there before the next streaming handoff does. It
+	// retires without mintMu, which is what lets it land while the report is still
+	// pending. m.gen does not move, so the entries stay generation-matched.
+	crashUnder(m)
+	if got := m.Generation(); got != 1 {
+		t.Fatalf("generation = %d, want 1 (a crash retire does not bump it)", got)
+	}
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after a crash consumed the pending report, want 0", got)
+	}
+}
+
+// A teardown with no report against the generation keeps its tokens. A PO token
+// is not invalidated by the browser dying or by the clock, and dropping them
+// would force needless re-mints.
+func TestCrashWithoutAReportKeepsTheCachedTokens(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries after warm = %d, want 2", got)
+	}
+	crashUnder(m)
+	if got := cacheEntries(t, m); got != 2 {
+		t.Errorf("cache_entries = %d after an unreported crash, want 2 (the tokens are still good)", got)
 	}
 }

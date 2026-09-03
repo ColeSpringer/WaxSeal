@@ -419,7 +419,8 @@ func TestConfirmBudgets(t *testing.T) {
 
 // TestSeekTarget covers the length-aware confirmation target. Unknown or invalid
 // lengths use the full-length target; known lengths clamp the target so the
-// tolerance window stays within the video.
+// tolerance window stays within the video, and the zero floor keeps a video
+// shorter than verifyEndTol from asking for a negative seek.
 func TestSeekTarget(t *testing.T) {
 	for _, tt := range []struct {
 		length int
@@ -427,7 +428,10 @@ func TestSeekTarget(t *testing.T) {
 	}{
 		{0, fullLengthTargetSecs},   // unknown length uses the full-length target
 		{-5, fullLengthTargetSecs},  // guard: a bogus negative length is treated as unknown
-		{1, 1 - verifyEndTol},       // tiny videos fall well below the cap (caller treats as cap-safe)
+		{1, 0},                      // below verifyEndTol: the floor is why this is 0, not -2
+		{2, 0},                      // still below verifyEndTol
+		{3, 0},                      // length == verifyEndTol: the last floored length
+		{4, 1},                      // first length the subtraction survives on its own
 		{70, 70 - verifyEndTol},     // at the cap
 		{73, 73 - verifyEndTol},     // top of the residual band is 70
 		{74, 74 - verifyEndTol},     // first verifiable length is 71, past the cap
@@ -437,6 +441,13 @@ func TestSeekTarget(t *testing.T) {
 	} {
 		if got := seekTarget(tt.length); got != tt.want {
 			t.Errorf("seekTarget(%d) = %d, want %d", tt.length, got, tt.want)
+		}
+	}
+	// The clamp is the point: no length may ever produce a negative seek target,
+	// whatever verifyEndTol or previewCapSecs become.
+	for l := -5; l < 200; l++ {
+		if got := seekTarget(l); got < 0 {
+			t.Fatalf("seekTarget(%d) = %d, want >= 0", l, got)
 		}
 	}
 	// The unknown-length target must never produce a negative seek.
@@ -453,8 +464,13 @@ func TestClassifyBand(t *testing.T) {
 		length int
 		want   confirmBand
 	}{
-		{0, bandVerify},  // unknown length verifies at the full-length target
-		{1, bandCapSafe}, // tiny
+		{0, bandVerify}, // unknown length verifies at the full-length target
+		// The three lengths seekTarget's zero floor fires for. They are cap-safe on
+		// the first branch, which never consults the target, so these rows pin that
+		// the floor stays unreachable from here rather than exercising it.
+		{1, bandCapSafe},
+		{2, bandCapSafe},
+		{3, bandCapSafe},
 		{previewCapSecs - 1, bandCapSafe},
 		{previewCapSecs, bandCapSafe},                   // at the cap is still cap-safe
 		{previewCapSecs + 1, bandResidual},              // 71: first over-cap length
@@ -524,6 +540,25 @@ func TestReduceStreamingURL(t *testing.T) {
 			name: "junk that fails to parse",
 			in:   "%",
 			want: "<unparseable>",
+		},
+		{
+			// url.Parse takes this happily as a relative path, so only the host
+			// check keeps it from being echoed straight back into a log line.
+			name: "parses, but is not a URL",
+			in:   "not a url at all",
+			want: "<unparseable>",
+		},
+		{
+			name: "relative path",
+			in:   "/videoplayback?id=o-ShortIdHere",
+			want: "<unparseable>",
+		},
+		{
+			// An absent URL is absent, not unparseable: established_url must not
+			// claim there was one.
+			name: "empty",
+			in:   "",
+			want: "",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

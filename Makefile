@@ -32,7 +32,7 @@ help:
 	@echo "  fmt-check         fail if any file needs gofmt (covers provider/ too)"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
-	@echo "  verify-assets     rebuild the bundle, fail if it differs from the committed bytes"
+	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
 	@echo "  release           build Linux/macOS amd64+arm64 binaries into $(DIST)/"
 	@echo "  docker-build      build the runtime image (VERSION=x.y.z to tag a release)"
 	@echo "  docker-push       publish to $(REGISTRY) (PUSH_LATEST=1 also moves :latest)"
@@ -58,18 +58,39 @@ test: fmt-check
 # internal/browser.
 jsbundle-browser: $(BROWSER_BUNDLE_OUT)
 
+# WAXSEAL_BUNDLE_OUT is passed explicitly, not left to the script's default, so
+# an exported value in the caller's environment cannot silently redirect the
+# build while the echo below reports the untouched committed file's size.
 $(BROWSER_BUNDLE_OUT): build/js/build-browser.mjs build/js/browser_entrypoint.js build/js/package.json build/js/package-lock.json
-	cd build/js && npm ci --no-audit --no-fund --silent && node build-browser.mjs
+	cd build/js && npm ci --no-audit --no-fund --silent \
+	  && WAXSEAL_BUNDLE_OUT="$(CURDIR)/$@" node build-browser.mjs
 	@echo "built $@ ($$(wc -c < $@) bytes)"
 
-# verify-assets rebuilds the embedded bundle and fails if it differs from the
-# committed bytes (reproducibility check for CI).
+# verify-assets rebuilds the embedded bundle into a scratch directory and fails if
+# it differs from the checked-in file (reproducibility check for CI). It never
+# touches that file, so a failed `npm ci` leaves a working tree behind rather than
+# one `go build` cannot compile.
+#
+# It compares against the working tree, not the git index, so it also runs from a
+# source tarball and checks the bytes go:embed actually reads. On a clean checkout
+# those are the committed bytes, which is the case CI runs; locally it reports
+# whether the file you are about to build with reproduces from source.
+#
+# It cannot delegate to jsbundle-browser: that rule writes to the committed path,
+# so the npm line is spelled out here with its own output. Building and comparing
+# are separate steps on purpose, so a build failure reports itself instead of
+# being misreported as a bundle that differs.
 verify-assets:
-	rm -f $(BROWSER_BUNDLE_OUT)
-	$(MAKE) jsbundle-browser
-	@git diff --exit-code -- $(BROWSER_BUNDLE_OUT) \
-	  && echo "OK: rebuilt bundle reproduces the committed bytes" \
-	  || { echo "ERROR: rebuilt bundle differs from the committed bytes"; exit 1; }
+	@tmp=$$(mktemp -d) || exit 1; \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  ( cd build/js && npm ci --no-audit --no-fund --silent \
+	      && WAXSEAL_BUNDLE_OUT="$$tmp/bundle.js" node build-browser.mjs ) \
+	    || { echo "ERROR: could not rebuild the bundle (npm ci or esbuild failed)"; exit 1; }; \
+	  if cmp -s "$$tmp/bundle.js" $(BROWSER_BUNDLE_OUT); then \
+	    echo "OK: $(BROWSER_BUNDLE_OUT) reproduces from source"; \
+	  else \
+	    echo "ERROR: $(BROWSER_BUNDLE_OUT) differs from a fresh build"; exit 1; \
+	  fi
 
 # release builds the CLI/daemon for Linux and macOS (amd64 and arm64) into dist/.
 # Windows is excluded: it compiles, but the CDP pipe transport does not run there.

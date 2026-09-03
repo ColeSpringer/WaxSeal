@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/colespringer/waxseal/server"
 )
 
 // hasScheme reports whether s carries a URL scheme. Unlike
@@ -42,9 +44,9 @@ func newPingCmd() *cobra.Command {
 	f.StringVar(&p.addr, "addr", "127.0.0.1:4416", "server address to connect to")
 	f.StringVar(&p.key, "key", "", "tenant API key (required if the server is multi-tenant)")
 	f.BoolVar(&p.strict, "strict", false,
-		"treat the no-session window as healthy and fail only on probe failure\n"+
-			"(sends ?strict=true). Use this for container or systemd liveness\n"+
-			"checks while sessions are re-established lazily.")
+		"treat the benign no-session and busy windows as healthy and fail only\n"+
+			"on probe failure (sends ?strict=true). Use this for container or\n"+
+			"systemd liveness checks while sessions are re-established lazily.")
 	return c
 }
 
@@ -104,17 +106,19 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	// Health semantics:
 	//   default: require a live session (ok:true), so no-session means not ready.
-	//   strict: accept no-session as healthy, but still fail on probe-failed.
+	//   strict: accept the benign reasons as healthy, but still fail on probe-failed.
 	//
 	// Do not trust HTTP 200 alone in strict mode. Older daemons ignore ?strict and
 	// can return 200 with {"ok":false}; non-WaxSeal endpoints can do the same.
 	healthy := body.OK
 	if p.strict {
-		healthy = body.OK || body.Reason == "no-session"
+		// server.BenignPingReason is the daemon's own strict-200 policy, so the
+		// probe and the daemon cannot disagree about what counts as unhealthy.
+		healthy = body.OK || server.BenignPingReason(body.Reason)
 	}
 	if resp.StatusCode != http.StatusOK || !healthy {
-		// reason distinguishes the benign no-session window from a real probe
-		// failure; older servers omit it.
+		// reason distinguishes the benign windows (no-session, busy) from a real
+		// probe failure; older servers omit it.
 		if body.Reason != "" {
 			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s", resp.StatusCode, body.OK, body.Reason)
 		}

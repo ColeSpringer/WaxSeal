@@ -11,7 +11,14 @@ const pkgVersion = (name) =>
 const bgutilsVersion = pkgVersion('bgutils-js');
 const esbuildVersion = pkgVersion('esbuild');
 
-const OUT = '../../internal/browser/bg_browser_bundle.js';
+// Where the bundle is written. WAXSEAL_BUNDLE_OUT lets `make verify-assets`
+// rebuild into a scratch directory instead of over the checked-in file. It must
+// be absolute: this script runs with cwd build/js, which is what the fallback
+// below is relative to. Both make rules pass it explicitly, so an exported value
+// cannot redirect them; the fallback only serves a direct `node
+// build-browser.mjs`. Nothing in the emitted bytes depends on this, so the output
+// is reproducible either way.
+const OUT = process.env.WAXSEAL_BUNDLE_OUT || '../../internal/browser/bg_browser_bundle.js';
 
 const result = await build({
   entryPoints: ['browser_entrypoint.js'],

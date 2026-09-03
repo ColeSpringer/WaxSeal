@@ -2080,13 +2080,17 @@ func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int
 // seekTarget chooses the per-request confirm target for a known video length.
 // Unknown or invalid lengths use the normal full-length target. Known lengths are
 // clamped so target+fullLengthTolSecs stays within the video; targets at or below
-// previewCapSecs are handled by the cap-safe and residual bands.
+// previewCapSecs are handled by the cap-safe and residual bands. The result is
+// floored at zero so no length can ever ask for a negative seek. That floor moves
+// no band boundary: classifyBand only compares the target against previewCapSecs,
+// and the clamp fires only below length 3, which its cap-safe branch already
+// claims.
 func seekTarget(length int) int {
 	if length <= 0 {
 		return fullLengthTargetSecs
 	}
 	if target := length - verifyEndTol; target < fullLengthTargetSecs {
-		return target
+		return max(target, 0)
 	}
 	return fullLengthTargetSecs
 }
@@ -2143,15 +2147,24 @@ func bufferedReachesEnd(length int, bufferedEnd float64) bool {
 var reducedStreamingURLParams = [...]string{"id", "expire", "spc"}
 
 // reduceStreamingURL reduces a SABR streaming URL to the fields safe to put in a
-// log line: host, path, and the id, expire, and spc query parameters. It never
-// returns a signature, PoT, n, or lsig, so a logged line cannot be replayed as a
-// working media URL. A URL that fails to parse returns a fixed placeholder rather
-// than echoing the unparseable input, which net/url's own parse error otherwise
-// would (it embeds the original string), and which could itself be a partial
-// signed URL.
+// log line: host, path, and the id, expire, and spc query parameters. What keeps a
+// signature, PoT, n, or lsig out of a log line is that allowlist, so a logged line
+// cannot be replayed as a working media URL.
+//
+// Anything that is not an absolute URL returns a fixed placeholder rather than
+// being echoed. url.Parse alone is not that guard: it accepts almost any string as
+// a relative path, so the host check is what rejects input this was never given.
+// Echoing it would defeat the allowlist, both because a partial signed URL is
+// still a signed URL and because net/url's own parse error embeds the original
+// string. The empty string is reported as empty instead: every call site logs a
+// URL field (established_url twice, final_url once), and a placeholder in one
+// would claim a URL existed when none did.
 func reduceStreamingURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
 	u, err := url.Parse(rawURL)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return "<unparseable>"
 	}
 	q := u.Query()

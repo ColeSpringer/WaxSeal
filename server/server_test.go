@@ -101,23 +101,49 @@ func TestMetricsKeyCollision(t *testing.T) {
 	}
 }
 
+// TestAPIKeyExtraction pins where a tenant key may be presented and which source
+// wins. The cases that matter beyond the happy path are the ones where a header
+// carries no usable key: it has to fall through to ?key= instead of resolving to
+// the empty key, which a keyed daemon would 401.
 func TestAPIKeyExtraction(t *testing.T) {
-	header := httptest.NewRequest(http.MethodGet, "/", nil)
-	header.Header.Set("X-API-Key", "H")
-	if got := apiKey(header); got != "H" {
-		t.Errorf("X-API-Key = %q, want H", got)
-	}
-	bearer := httptest.NewRequest(http.MethodGet, "/", nil)
-	bearer.Header.Set("Authorization", "Bearer B")
-	if got := apiKey(bearer); got != "B" {
-		t.Errorf("Bearer = %q, want B", got)
-	}
-	query := httptest.NewRequest(http.MethodGet, "/?key=Q", nil)
-	if got := apiKey(query); got != "Q" {
-		t.Errorf("query key = %q, want Q", got)
-	}
-	if got := apiKey(httptest.NewRequest(http.MethodGet, "/", nil)); got != "" {
-		t.Errorf("no key = %q, want empty", got)
+	for _, tt := range []struct {
+		name  string
+		auth  string // Authorization header, sent only when non-empty
+		key   string // X-API-Key header, sent only when non-empty
+		query string // request target
+		want  string
+	}{
+		{name: "X-API-Key", key: "H", query: "/", want: "H"},
+		{name: "bearer", auth: "Bearer B", query: "/", want: "B"},
+		{name: "query", query: "/?key=Q", want: "Q"},
+		{name: "nothing", query: "/", want: ""},
+
+		// Precedence, most preferred source first.
+		{name: "header beats bearer", key: "H", auth: "Bearer B", query: "/?key=Q", want: "H"},
+		{name: "bearer beats query", auth: "Bearer B", query: "/?key=Q", want: "B"},
+
+		// RFC 7235 makes the scheme case insensitive.
+		{name: "lowercase scheme", auth: "bearer B", query: "/", want: "B"},
+		{name: "mixed-case scheme", auth: "BeArEr B", query: "/?key=Q", want: "B"},
+
+		// A Bearer header with nothing usable in it defers to ?key=.
+		{name: "empty bearer falls through", auth: "Bearer ", query: "/?key=Q", want: "Q"},
+		{name: "whitespace bearer falls through", auth: "Bearer    \t  ", query: "/?key=Q", want: "Q"},
+		{name: "another scheme falls through", auth: "Basic dXNlcjpwdw==", query: "/?key=Q", want: "Q"},
+		{name: "scheme with no space falls through", auth: "Bearer", query: "/?key=Q", want: "Q"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, tt.query, nil)
+			if tt.key != "" {
+				r.Header.Set("X-API-Key", tt.key)
+			}
+			if tt.auth != "" {
+				r.Header.Set("Authorization", tt.auth)
+			}
+			if got := apiKey(r); got != tt.want {
+				t.Errorf("apiKey() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -695,7 +721,11 @@ type fakePlayerSession struct {
 	// mintExpiresAt, when non-zero, is the attested expiry Mint reports. The
 	// zero default keeps the response layer's now+6h sentinel exercised.
 	mintExpiresAt time.Time
-	closed        atomic.Bool
+	// pcGate, when set, runs at the top of PlayerContext. A test uses it to keep a
+	// request parked inside the minter, which is the only way to hold the page
+	// lock the way a real in-flight request does.
+	pcGate func(ctx context.Context)
+	closed atomic.Bool
 }
 
 func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintResult, error) {
@@ -709,6 +739,9 @@ func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintRes
 	return browser.MintResult{Kind: "integrity", Lifetime: 3600, ExpiresAt: f.mintExpiresAt}, nil
 }
 func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browser.PlayerContext, error) {
+	if f.pcGate != nil {
+		f.pcGate(ctx)
+	}
 	if f.pcBlocks {
 		<-ctx.Done()
 		return browser.PlayerContext{}, ctx.Err()
@@ -1160,6 +1193,80 @@ func TestPingReason(t *testing.T) {
 				t.Errorf("probe-failed: ok=%v reason=%v, want false/probe-failed", resp["ok"], resp["reason"])
 			}
 		})
+	}
+}
+
+// TestBenignPingReason pins which /ping reasons stay healthy under ?strict=true.
+// Both the handler's status code and `waxseal ping --strict` read this, so a
+// reason added on one side and not the other is how the image's HEALTHCHECK
+// starts failing on a healthy daemon.
+func TestBenignPingReason(t *testing.T) {
+	for _, r := range []string{PingReasonNoSession, PingReasonBusy} {
+		if !BenignPingReason(r) {
+			t.Errorf("BenignPingReason(%q) = false, want true", r)
+		}
+	}
+	// "ok" arrives with ok:true, which the caller has already accepted. A
+	// probe-failed, or a reason-less body from a pre-strict daemon, must still
+	// read as unhealthy.
+	for _, r := range []string{PingReasonOK, PingReasonProbeFailed, "", "banana"} {
+		if BenignPingReason(r) {
+			t.Errorf("BenignPingReason(%q) = true, want false", r)
+		}
+	}
+}
+
+// A probe failure that cannot take the page from a running request is reported
+// as busy, not probe-failed: nothing was retired, so the failure says as much
+// about contention as about the browser. It stays 200 even under ?strict=true,
+// for the same reason no-session does. Three of these in a row would otherwise
+// mark a healthy container unhealthy while it was simply busy.
+func TestPingBusyStaysHealthyUnderStrict(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	sess := &fakePlayerSession{
+		abrURL:  "https://r/x",
+		vd:      "vd",
+		pingErr: errors.New("cdp connection closed"),
+		pcGate: func(ctx context.Context) {
+			once.Do(func() { close(entered) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		},
+	}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	// Park a /player-context inside the minter so it holds the page lock, the way
+	// a real request does while /ping runs.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+		r.Header.Set("X-API-Key", "K")
+		s.routes().ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-entered
+	defer func() { close(release); <-done }()
+
+	r := httptest.NewRequest(http.MethodGet, "/ping?strict=true", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (busy is benign, even under strict)", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["reason"] != "busy" {
+		t.Errorf("reason = %v, want busy", resp["reason"])
+	}
+	if resp["ok"] != false {
+		t.Errorf("ok = %v, want false", resp["ok"])
 	}
 }
 

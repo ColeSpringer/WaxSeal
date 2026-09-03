@@ -151,11 +151,18 @@ func playerContexts(t *testing.T, base string) int64 {
 	return readMetrics(t, base).counter(t, "player_contexts")
 }
 
-// escalationMetrics contains the counters used to detect an unnecessary relaunch.
-// Values are summed so the test does not depend on the cold daemon's tenant label.
-// GenerationKnown is false when the daemon served the redacted aggregate:
-// generation is per-tenant state, so redaction drops it. Attestations survives
-// redaction and rises on the same relaunch, so the check does not go blind.
+// escalationMetrics contains the counters used together to detect an unnecessary
+// relaunch. Values are summed so the test does not depend on the cold daemon's
+// tenant label. GenerationKnown is false when the daemon served the redacted
+// aggregate: generation is per-tenant state, so redaction drops it. Attestations
+// survives redaction and rises on the same relaunch, so the check does not go
+// blind.
+//
+// Attestations and Generation are the relaunch detectors. Escalations is
+// narrower: it counts a request abandoning a generation it was still using, and
+// a request handed the replacement after somebody else retired its generation
+// relaunches without one. Reading it alone as "the ladder relaunched" would
+// under-report.
 type escalationMetrics struct {
 	Generation            int64
 	GenerationKnown       bool

@@ -218,15 +218,30 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// apiKey extracts the tenant key from the header (preferred) or a query param.
+// apiKey extracts the tenant key, preferring X-API-Key, then an Authorization
+// Bearer header, then the key query parameter. Each source is skipped when it
+// carries nothing, so a request may present the key in whichever one it can.
 func apiKey(r *http.Request) string {
 	if k := r.Header.Get("X-API-Key"); k != "" {
 		return k
 	}
-	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(a, "Bearer "))
+	if k := bearerKey(r.Header.Get("Authorization")); k != "" {
+		return k
 	}
 	return r.URL.Query().Get("key")
+}
+
+// bearerKey returns the credentials from an RFC 7235 "Bearer" Authorization
+// header, or "" when the header names another scheme or carries no value. The
+// scheme is matched case insensitively, as RFC 7235 requires, and a header with
+// no usable credentials falls through to the next source rather than resolving to
+// the empty key, which would have 401ed a request whose ?key= was fine.
+func bearerKey(a string) string {
+	scheme, rest, ok := strings.Cut(a, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(rest)
 }
 
 // tenant resolves the request's Minter. It writes a 401 response and returns
@@ -428,10 +443,10 @@ func strictPing(r *http.Request) (strict, ok bool) {
 }
 
 // handlePing probes an existing tenant session without launching Chromium,
-// attesting, or minting. A failed probe may retire the session. After
+// attesting, or minting. A probe that fails twice may retire the session. After
 // authentication, the handler reports health in a stable body. The reason field
-// distinguishes no-session from probe-failed; ?strict=true maps only probe
-// failures to HTTP 503.
+// distinguishes the two benign states, no-session and busy, from probe-failed;
+// ?strict=true maps only probe-failed to HTTP 503.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
@@ -447,7 +462,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap, live, err := m.Health(r.Context())
-	reason := "ok"
+	reason := PingReasonOK
 	status := http.StatusOK
 	if err != nil {
 		// Check the caller first. A mid-probe disconnect is not a server condition, so
@@ -457,18 +472,31 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 			s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
 			return
 		}
-		reason = "probe-failed"
-		if errors.Is(err, minter.ErrNoSession) {
+		reason = PingReasonProbeFailed
+		switch {
+		case errors.Is(err, minter.ErrNoSession):
 			// A report can retire the session before the next streaming request
 			// lazily creates a replacement. Treat that gap as expected.
-			reason = "no-session"
-		} else {
+			reason = PingReasonNoSession
+		case errors.Is(err, minter.ErrProbeBusy):
+			// A confirmed probe failure that could not take the page from a running
+			// request. It says as much about contention as about the browser, and
+			// nothing was retired, so it stays 200 under strict for the same reason
+			// no-session does: three of these must not mark a healthy container
+			// unhealthy. The next probe re-checks once the request finishes.
+			reason = PingReasonBusy
+			// Benign, but not free: probe_busy counts it, since a daemon that keeps
+			// answering busy is otherwise indistinguishable from a healthy one.
+			s.log.Debug("ping probe could not act: the session is busy", "tenant", label, "err", err)
+		default:
 			// Probe failures should be visible in logs even when callers do not poll
 			// /ping. Strict mode also exposes them through the status code.
 			s.log.Warn("ping probe failed", "tenant", label, "err", err)
-			if strict {
-				status = http.StatusServiceUnavailable
-			}
+		}
+		// Deciding the status code from the reason, off the same predicate the CLI
+		// reads, keeps the strict policy in one place instead of once per branch.
+		if strict && !BenignPingReason(reason) {
+			status = http.StatusServiceUnavailable
 		}
 	}
 	// Browser proof describes playback in the daemon. A consumer report can still
@@ -707,6 +735,32 @@ const (
 	// CodeNotFound indicates an unknown path or endpoint.
 	CodeNotFound = "not-found"
 )
+
+// The /ping reason values. The always-present reason field carries exactly one
+// of these, and only PingReasonProbeFailed maps to 503 under ?strict=true.
+const (
+	// PingReasonOK means a live session answered the probe.
+	PingReasonOK = "ok"
+	// PingReasonNoSession means no session is attested: a report retires one and
+	// re-establishment is lazy. Benign.
+	PingReasonNoSession = "no-session"
+	// PingReasonBusy means a probe failed twice while a request held the page, so
+	// nothing was retired and the next probe re-checks. Benign.
+	PingReasonBusy = "busy"
+	// PingReasonProbeFailed means a live session's probe failed twice and the
+	// session was retired.
+	PingReasonProbeFailed = "probe-failed"
+)
+
+// BenignPingReason reports whether a not-ok /ping reason describes a state that
+// is expected on a working daemon. /ping keeps these at HTTP 200 even under
+// ?strict=true, and `waxseal ping --strict` calls this rather than keeping its
+// own list, because --strict deliberately does not trust the status code alone: a
+// pre-strict daemon answers a real probe failure with 200. One definition means a
+// liveness probe and the daemon cannot disagree about what counts as unhealthy.
+func BenignPingReason(reason string) bool {
+	return reason == PingReasonNoSession || reason == PingReasonBusy
+}
 
 // errEnvelope is the JSON error response shared by the API endpoints.
 type errEnvelope struct {

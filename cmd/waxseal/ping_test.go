@@ -126,6 +126,19 @@ func TestPingCLIStrict(t *testing.T) {
 		t.Errorf("no-session strict: %v, want success (benign window)", err)
 	}
 
+	// Benign busy (HTTP 200, ok:false): a probe failed twice but a request held the
+	// page, so nothing was retired. --strict must treat it as healthy, or the
+	// image's HEALTHCHECK marks a busy but healthy container unhealthy after three
+	// probes. Non-strict still reports not-ready: there is no confirmed live
+	// session.
+	status, payload = http.StatusOK, `{"ok":false,"reason":"busy"}`
+	if err := run(false); err == nil {
+		t.Error("busy non-strict: want error (no confirmed live session)")
+	}
+	if err := run(true); err != nil {
+		t.Errorf("busy strict: %v, want success (benign window)", err)
+	}
+
 	// Real probe failure: a strict-aware daemon maps it to 503; both modes fail.
 	status, payload = http.StatusServiceUnavailable, `{"ok":false,"reason":"probe-failed","error":"cdp closed"}`
 	if err := run(true); err == nil {

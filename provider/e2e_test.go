@@ -522,13 +522,29 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 		t.Errorf("player_context_failures did not increase from %d to %d", before.PlayerContextFailures, after.PlayerContextFailures)
 	}
 
-	// A repeat request should be served from the negative cache.
+	// A repeat request should be served from the negative cache. Both counters are
+	// read from one scrape on each side of that single call, so the window they
+	// describe is the repeat and nothing else. Reusing the earlier snapshot for
+	// player_context_failures instead would straddle the assertions above and
+	// blame the counter split for any unrelated traffic on a shared daemon.
+	beforeRepeat := readMetrics(t, base)
+	negBefore := beforeRepeat.counter(t, "player_context_negative_cache_hits")
+	pcfBefore := beforeRepeat.counter(t, "player_context_failures")
+
 	_, err2, elapsed2 := call(deadID, 10*time.Second)
 	requireUnavailable(t, err2)
 	if elapsed2 > 2*time.Second {
 		t.Errorf("negative-cache repeat took %v, want near-instant", elapsed2)
 	}
 	t.Logf("dead id repeat (negative cache) in %v", elapsed2)
+
+	afterRepeat := readMetrics(t, base)
+	if negAfter := afterRepeat.counter(t, "player_context_negative_cache_hits"); negAfter <= negBefore {
+		t.Errorf("player_context_negative_cache_hits did not increase from %d to %d", negBefore, negAfter)
+	}
+	if pcfAfter := afterRepeat.counter(t, "player_context_failures"); pcfAfter != pcfBefore {
+		t.Errorf("player_context_failures moved from %d to %d across a negative-cache hit; the split exists to stop that", pcfBefore, pcfAfter)
+	}
 
 	// A valid ID immediately afterward must still establish.
 	pc, err3, _ := call(bbbVideoID, 90*time.Second)

@@ -24,9 +24,14 @@ jobs:
           cache: true
       - run: go build ./...
       # gofmt covers this whole checkout by path, including the nested
-      # provider/ module, whose own job below only builds and vets it.
+      # provider/ module, which the job below builds, vets, and tests on its own.
       - run: make fmt-check
       - run: go vet ./...
+      # Windows compiles but does not run: the CDP pipe transport needs Unix fd
+      # inheritance. The cross matrix is linux and darwin, so proc_windows.go in
+      # internal/browser and internal/cdp is otherwise built nowhere. Vetting for
+      # windows is what keeps those two files from silently rotting.
+      - run: GOOS=windows go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
       # guaranteed present, not incidental to the ubuntu-latest image. From the
@@ -46,7 +51,9 @@ jobs:
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
 
-  # Build and vet the nested consumer-adapter module separately.
+  # Build, vet, and test the nested consumer-adapter module separately. Its
+  # untagged tests are pure httptest: no browser, no network, so they belong in
+  # every run. The -tags e2e files need both, so they are only type-checked here.
   provider:
     runs-on: ubuntu-latest
     steps:
@@ -55,8 +62,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          # This job builds in provider/, but setup-go runs at the repo root, so
+          # its default cache key would ignore provider/go.sum entirely.
+          cache-dependency-path: |
+            go.sum
+            provider/go.sum
       - working-directory: provider
-        run: go build ./... && go vet ./...
+        run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test -race ./...
 
   # Cross-compile the pure Go CLI and daemon for the supported targets. Each
   # binary drives an external Chromium at runtime. Windows is excluded: it

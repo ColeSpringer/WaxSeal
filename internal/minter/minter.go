@@ -38,8 +38,13 @@ type Minter struct {
 	// logic can run without a browser.
 	launch func(ctx context.Context) (minterSession, error)
 
-	mu         sync.Mutex
-	sess       minterSession
+	mu   sync.Mutex
+	sess minterSession
+	// closed marks the Minter terminal. Close sets it, and ensure refuses to
+	// launch once it is set, so a request that outlives the shutdown drain and
+	// walks its relaunch ladder cannot publish a fresh session onto a Minter that
+	// nothing will tear down again.
+	closed     bool
 	gen        uint64 // bumps on each (re)attest; invalidates older cache entries
 	attestedAt time.Time
 	// grantExpiresAt is when the tokens of the current generation expire. Every
@@ -145,7 +150,7 @@ type negEntry struct {
 }
 
 // minterMetrics contains process-lifetime counters. Failure counters count
-// attempts, not requests. PlayerContextFailures also counts negative-cache hits.
+// attempts, not requests; the exceptions say so on their own field.
 type minterMetrics struct {
 	Attestations   atomic.Int64
 	LaunchFailures atomic.Int64
@@ -161,9 +166,31 @@ type minterMetrics struct {
 	CacheEvictions atomic.Int64 // positive-cache entries evicted at capacity
 	// Crashes counts unexpected browser loss detected by CDP or a health probe.
 	// Intentional session retirement does not count.
-	Crashes               atomic.Int64
+	Crashes atomic.Int64
+	// ProbeFailures counts /ping responses reporting probe-failed: a probe that
+	// failed twice against a session no request was holding. It is one per such
+	// response, which is what lines it up with the alert operators are told to
+	// set, so it counts even in the rare interleaving where the retirement it
+	// then attempts finds the generation already gone. It separates
+	// probe-detected loss from the CDP-event deaths Crashes also counts. A probe
+	// that recovered on confirmation, or that could not take mintMu, is not one.
+	// Once per request.
+	ProbeFailures atomic.Int64
+	// ProbeBusy counts /ping responses reporting busy: a probe that failed twice
+	// while a request held the page, so nothing was retired. It is benign and
+	// stays HTTP 200, which is exactly why it needs a counter: without one a
+	// daemon that reports busy every time is indistinguishable from a healthy one.
+	// Once per request.
+	ProbeBusy             atomic.Int64
 	PlayerContexts        atomic.Int64
-	PlayerContextFailures atomic.Int64 // failed attempts and negative-cache hits
+	PlayerContextFailures atomic.Int64 // per failed attempt (see minterMetrics doc)
+	// PlayerContextNegativeCacheHits counts requests refused from the negative
+	// cache without touching the browser. These are kept out of
+	// PlayerContextFailures because one caller looping on a single unplayable
+	// video can drive this counter by six orders of magnitude while every real
+	// request succeeds, which would bury the failure rate an operator alerts on.
+	// Once per request.
+	PlayerContextNegativeCacheHits atomic.Int64
 	// Status2Rejections counts refused requests where a player context could not
 	// be confirmed beyond the status-2 cap. Attempts are counted by
 	// PlayerContextFailures; this counter is once per request.
@@ -264,6 +291,18 @@ var selfTestMintRetryDelay = 1 * time.Second
 // exported so callers (e.g. server /ping) can distinguish the benign no-session
 // state from a real probe failure.
 var ErrNoSession = errors.New("waxseal: no attested session")
+
+// ErrProbeBusy reports that a /ping probe failed while a request held the page,
+// so the failure could not be acted on and says as much about contention as
+// about the browser. It is exported so a caller can tell that benign state apart
+// from a confirmed probe failure.
+var ErrProbeBusy = errors.New("waxseal: ping probe failed while the session was busy")
+
+// ErrClosed reports that the Minter has been closed and will not launch another
+// session. Only a request still running past the server's shutdown drain can see
+// it, which is why it maps to the same wire errors an unavailable browser does
+// rather than getting one of its own.
+var ErrClosed = errors.New("waxseal: minter closed")
 
 // ErrUnproven reports that the browser session could not prove full-length
 // streaming, so no context was handed out. A context that would be the session's
@@ -545,17 +584,25 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 	// A second failure on the same generation, past the cool-down, with this
 	// failure streak's relaunch still unspent (recordProofFailure just claimed
 	// it): relaunch once and prove the fresh session.
-	m.metrics.Escalations.Add(1)
+	// Escalations counts abandoning a generation this request was still using, so
+	// it is gated on retire actually closing one, matching both ladders. A
+	// generation retired out from under this proof is not this request's to
+	// abandon; the relaunch below still runs, because the request still needs a
+	// session it can prove.
 	if deadline {
 		// ctx's own deadline is what ended this proof, so this request has no
 		// budget left to launch and prove a fresh session. Retire the generation
 		// and let the next request's ensure relaunch instead; do not launch here.
 		// This request is refused, so it is counted like the branches above.
 		m.metrics.UnprovenRejections.Add(1)
-		m.retire(gen, "proof timed out twice; relaunching on the next request", false)
+		if m.retire(gen, "proof timed out twice; relaunching on the next request", false) {
+			m.metrics.Escalations.Add(1)
+		}
 		return sess, gen, ctx.Err()
 	}
-	m.retire(gen, "proof failed twice; relaunching", false)
+	if m.retire(gen, "proof failed twice; relaunching", false) {
+		m.metrics.Escalations.Add(1)
+	}
 	newSess, newGen, err := m.ensure(ctx)
 	if err != nil {
 		// A failed launch is already counted by launch_failures inside ensure, so unproven_rejections is deliberately not incremented here.
@@ -837,12 +884,17 @@ func (m *Minter) recycleCauseLocked() string {
 func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 	for {
 		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, 0, ErrClosed
+		}
 		// This path bypasses retire, so it must also clear the suspect mark.
 		if cause := m.recycleCauseLocked(); cause != "" {
 			old, gen, age := m.sess, m.gen, time.Since(m.attestedAt)
 			m.sess = nil
 			cancel := m.watchCancel
 			m.watchCancel = nil
+			m.dropReportedGenerationLocked(gen)
 			m.reportSuspectGen = 0
 			m.reportSuspectVideoID = ""
 			// A recycle is not a crash. Recording it keeps a request that was
@@ -913,6 +965,19 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 			m.mu.Unlock()
 			m.metrics.LaunchFailures.Add(1)
 			return nil, 0, err
+		}
+		if m.closed {
+			// Close landed while this launch was in flight, which is the only way a
+			// session could still reach publication. Discard it rather than hand the
+			// pool a browser context nothing will close. The waiters just released by
+			// close(ch) loop back and take the check at the top.
+			m.mu.Unlock()
+			// Say so: this launch attested (and may have pre-minted) and then
+			// produced nothing, which otherwise leaves an unexplained gap between the
+			// counters and the session log during shutdown.
+			m.log.Info("minter: discarding a session that finished launching after Close", "preminted", preminted)
+			sess.Close()
+			return nil, 0, ErrClosed
 		}
 		m.sess = sess
 		m.gen++
@@ -985,6 +1050,7 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	m.sess = nil
 	cancel := m.watchCancel
 	m.watchCancel = nil
+	m.dropReportedGenerationLocked(gen)
 	m.reportSuspectGen = 0
 	m.reportSuspectVideoID = ""
 	m.retiredGen, m.retiredCrash = gen, isCrash
@@ -1209,6 +1275,12 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		// and still generation-matched, because a failed launch publishes no new
 		// generation and so never clears the cache. Without this the entry is
 		// unreachable for the rest of its life while every request 502s.
+		//
+		// One sequence deliberately finds nothing here: a consumer degradation
+		// report drops its generation's tokens, so a report followed by a failing
+		// relaunch is a hard failure rather than another serving of the token that
+		// was just called degraded. That is fail-closed on purpose, and ReportBurst
+		// plus the debounce bound how often a consumer can ask for it.
 		if ctx.Err() == nil {
 			if r, ok := m.cacheGet(key); ok {
 				m.metrics.CacheHits.Add(1)
@@ -1263,8 +1335,17 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		// already retired and graded nowhere: it goes straight to the replacement.
 		if !m.sessionDied(sess, gen, "mint", err) {
 			m.metrics.MintFailures.Add(1)
-			m.metrics.Escalations.Add(1)
-			m.retire(gen, "mint failed twice; relaunching", false)
+			// Escalation means abandoning a generation this request was still using,
+			// so retire's own report of whether it closed one is the honest gate: a
+			// generation somebody else already retired is not this request's to
+			// abandon, and only one attempt against it ever failed. After
+			// Minter.Close became terminal, Close is the only non-crash retirer left
+			// that skips mintMu, so today this is a shutdown-window accounting fix.
+			// The gate is what keeps the accounting honest if an off-request recycle
+			// is ever added.
+			if m.retire(gen, "mint failed twice; relaunching", false) {
+				m.metrics.Escalations.Add(1)
+			}
 		}
 		res, gen, err = m.mintOnReplacement(ctx, binding)
 		if err != nil {
@@ -1307,7 +1388,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// A known-unplayable video fails before mintMu and the session, so a consumer
 	// retrying a 502 (or a malicious caller) cannot force repeated relaunches.
 	if err := m.negCacheGet(videoID); err != nil {
-		m.metrics.PlayerContextFailures.Add(1)
+		m.metrics.PlayerContextNegativeCacheHits.Add(1)
 		return browser.PlayerContext{}, 0, err
 	}
 
@@ -1349,29 +1430,37 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, gen, err
 	}
 
-	// level 1: transient failure, one in-place retry, no re-attest.
-	m.log.Warn("minter: player-context failed; retrying on same session", "gen", gen, "err", err)
-	if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
-		return browser.PlayerContext{}, gen, err
-	}
-	pc, err = sess.PlayerContext(ctx, videoID)
-	m.markPlayback()
-	if err == nil {
-		m.metrics.PlayerContexts.Add(1)
-		m.markEstablished()
-		return pc, gen, nil
-	}
-	if m.playerContextDied(ctx, sess, gen, err) {
-		return m.playerContextOnReplacement(ctx, videoID)
-	}
-	if m.playerContextStop(ctx, videoID, err) {
-		return browser.PlayerContext{}, gen, err
+	// level 1: transient failure, one in-place retry, no re-attest. A generation
+	// retired out from under this request skips it: the retry would first sleep
+	// out the whole mintSeparation in waitBeforeEstablish, holding mintMu, and
+	// then call a page that is already closed. A death has already taken the
+	// replacement above, so what reaches this skip is a deliberate retirement.
+	if !m.isSuperseded(sess, gen) {
+		m.log.Warn("minter: player-context failed; retrying on same session", "gen", gen, "err", err)
+		if err := m.waitBeforeEstablish(ctx, "player-context"); err != nil {
+			return browser.PlayerContext{}, gen, err
+		}
+		pc, err = sess.PlayerContext(ctx, videoID)
+		m.markPlayback()
+		if err == nil {
+			m.metrics.PlayerContexts.Add(1)
+			m.markEstablished()
+			return pc, gen, nil
+		}
+		if m.playerContextDied(ctx, sess, gen, err) {
+			return m.playerContextOnReplacement(ctx, videoID)
+		}
+		if m.playerContextStop(ctx, videoID, err) {
+			return browser.PlayerContext{}, gen, err
+		}
 	}
 
 	// Status-2 confirmation failures are timing related, not evidence of a dead
 	// session. After the single in-place retry, refuse the request without
-	// relaunching; a relaunch under load tends to worsen this condition.
-	// playerContextStop has already counted both failed attempts.
+	// relaunching; a relaunch under load tends to worsen this condition. That
+	// holds when the retry was skipped too: a superseded generation is still no
+	// reason to relaunch on a status-2 failure. playerContextStop has already
+	// counted every attempt that ran.
 	if errors.Is(err, browser.ErrStatus2Unconfirmed) {
 		m.metrics.Status2Rejections.Add(1)
 		return browser.PlayerContext{}, gen, err
@@ -1381,14 +1470,18 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// After the in-place retry, return the error without relaunching. Relaunch holds
 	// mintMu and cannot fix a video whose player response is structurally missing
 	// data. The next request can retry, and the video is not negative-cached.
-	// playerContextStop has already counted both failed attempts.
+	// playerContextStop has already counted every attempt that ran.
 	if errors.Is(err, browser.ErrIncompleteContext) {
 		return browser.PlayerContext{}, gen, err
 	}
 
-	// level 2: escalate to a relaunch and re-attest on a fresh session.
-	m.metrics.Escalations.Add(1)
-	m.retire(gen, "player-context failed twice; relaunching", false)
+	// level 2: escalate to a relaunch and re-attest on a fresh session. retire
+	// reports whether this request is the one that abandoned the generation, and
+	// only that is an escalation: a generation somebody else already retired is
+	// not this request's to abandon, and only one attempt against it ever failed.
+	if m.retire(gen, "player-context failed twice; relaunching", false) {
+		m.metrics.Escalations.Add(1)
+	}
 	return m.playerContextOnReplacement(ctx, videoID)
 }
 
@@ -1437,12 +1530,24 @@ func (m *Minter) playerContextOnReplacement(ctx context.Context, videoID string)
 
 // playerContextDied reports whether the ladder should hand this attempt the
 // replacement session. A caller that has gone away is not owed one, and neither
-// is a status-2 confirmation failure: that is timing related rather than
-// evidence of a dead page, it is refused without a relaunch by design, and
-// letting it reach the death path would both pay for the relaunch the design
-// forbids and skip the refusal below that counts status2_rejections.
+// is a status-2 confirmation failure against a session that is still live: that
+// is timing related rather than evidence of a dead page, it is refused without a
+// relaunch by design, and letting it reach the death path would both pay for the
+// relaunch the design forbids and skip the refusal that counts status2_rejections.
+//
+// The live qualifier is load-bearing. A browser that dies mid-confirm surfaces as
+// ErrStatus2Unconfirmed too, because the confirm loop retries its eval errors
+// until the budget expires and then grades the probe target-not-buffered. Once
+// the session is gone there is no live session for the carve-out to protect, so
+// sessionDied decides, and it still answers no for a deliberate retirement of
+// this generation. Without the qualifier a crash during confirmation is refused
+// instead of served from the replacement, and is filed under
+// player_context_failures and status2_rejections rather than as the crash it is.
 func (m *Minter) playerContextDied(ctx context.Context, sess minterSession, gen uint64, err error) bool {
-	if ctx.Err() != nil || errors.Is(err, browser.ErrStatus2Unconfirmed) {
+	if ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, browser.ErrStatus2Unconfirmed) && !m.isSuperseded(sess, gen) {
 		return false
 	}
 	return m.sessionDied(sess, gen, "player-context", err)
@@ -1487,6 +1592,9 @@ func (m *Minter) negCacheGet(videoID string) error {
 func (m *Minter) negCachePut(videoID string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed { // see cachePutLocked: Close leaves both caches empty
+		return
+	}
 	now := time.Now()
 	// Only a new key can force eviction; refreshing an existing entry must not drop
 	// another, matching cachePut.
@@ -1526,6 +1634,56 @@ func (m *Minter) cacheGet(key string) (browser.MintResult, bool) {
 	return c.res, true
 }
 
+// servableCacheEntriesLocked counts the entries cacheGet would hand out at now:
+// current generation, not yet expired. len(m.cache) also counts expired entries
+// that no sweep has reached, which reports tokens the daemon would refuse to
+// serve. The caller must hold m.mu.
+//
+// It counts without deleting, unlike cacheGet. /metrics is a read path, and a
+// scrape that evicted entries would make observing the daemon change it.
+// minterCacheMax is 1024 and m.mu is already held, so the walk costs nothing next
+// to the full-map eviction sweep cachePutLocked already does.
+//
+// One consequence worth knowing when reading a snapshot: cachePutLocked evicts
+// against len(m.cache), so cache_entries can sit below the count that drives
+// cache_evictions. Reporting the raw length instead would make the two agree by
+// making this one describe tokens the daemon would refuse to serve, which is the
+// inaccuracy the gauge exists to remove.
+func (m *Minter) servableCacheEntriesLocked(now time.Time) int {
+	n := 0
+	for _, c := range m.cache {
+		if c.gen == m.gen && !now.After(c.expiry) {
+			n++
+		}
+	}
+	return n
+}
+
+// dropReportedGenerationLocked removes cached tokens minted by gen when gen is
+// the generation a consumer reported as degraded. A report-driven retirement
+// leaves m.gen unchanged, so without this the cache keeps handing out the
+// generation the consumer complained about. Filtering on gen rather than clearing
+// the map means a relaunch that has already published cannot lose its pre-mint to
+// a report that arrived first. The caller must hold m.mu.
+//
+// It is called from every path that clears a suspect mark, not only the two that
+// retire because of the report. A pending report can also be consumed by an
+// age-or-grant recycle or by a crash landing first, and the tokens of a
+// generation a consumer called degraded must not outlive it whichever teardown
+// gets there. A teardown of a generation with no report against it keeps its
+// tokens: a PO token is not invalidated by the browser dying or by the clock, and
+// dropping them there would force needless re-mints.
+func (m *Minter) dropReportedGenerationLocked(gen uint64) {
+	if m.reportSuspectGen != gen {
+		return
+	}
+	for k, c := range m.cache {
+		if c.gen == gen {
+			delete(m.cache, k)
+		}
+	}
+}
+
 func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1537,6 +1695,14 @@ func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
 // publishes the session.
 func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) {
 	if gen != m.gen { // session was recycled mid-mint; don't cache a stale-gen token.
+		return
+	}
+	// Close does not bump m.gen, so the generation check alone would let a request
+	// still running past the shutdown drain write token material back into a
+	// Minter that Close just emptied, and Tenants keeps closed Minters around for
+	// metrics. Close promises to leave both caches empty; this is what keeps that
+	// true.
+	if m.closed {
 		return
 	}
 	ttl := time.Duration(res.Lifetime) * time.Second
@@ -1698,13 +1864,18 @@ func (m *Minter) sessionDied(sess minterSession, gen uint64, what string, err er
 
 // Health probes the existing session and returns a consistent snapshot tied to
 // one generation, plus whether a live session was found. It does not call ensure,
-// so it cannot launch, attest, or recycle an expired session. On probe failure it
-// retires the session only when mintMu is available, which prevents /ping from
-// closing a session that is in use.
+// so it cannot launch, attest, or recycle an expired session.
 //
-// If another goroutine replaces the session during the probe, Health retries
+// A failed probe is confirmed by a second probe before anything is retired, and
+// even a confirmed failure retires only when mintMu is available: a request
+// holding the page is reported as ErrProbeBusy, which prevents /ping from
+// closing a session that is in use and from marking a busy daemon unhealthy.
+//
+// If another goroutine replaces the session during either probe, Health retries
 // against the current session. When the session keeps being replaced across both
-// attempts, Health reports no-session rather than a stale probe failure.
+// attempts, Health reports no-session rather than a stale probe failure. So one
+// /ping issues at most four bounded round trips, two attempts of two, which is
+// what to size a health check's timeout against: 4*pingProbeTimeout.
 func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		m.mu.Lock()
@@ -1714,9 +1885,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 			return failHealth(gen, ErrNoSession)
 		}
 
-		pctx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
-		err := sess.Ping(pctx)
-		cancel()
+		err := m.probe(ctx, sess)
 		if err == nil {
 			// A ping can succeed against a session that was already replaced
 			// mid-probe. That result describes a stale generation, so retry the
@@ -1740,11 +1909,51 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 		if m.isSuperseded(sess, gen) {
 			continue
 		}
-		if m.mintMu.TryLock() {
-			m.retire(gen, "ping probe failed: "+err.Error(), true)
-			m.mintMu.Unlock()
+		// Confirm before acting. The image's HEALTHCHECK runs `waxseal ping
+		// --strict` every 30 seconds, so one transient failure retiring a warm
+		// generation would destroy a healthy session and forge a browser-death
+		// signal. The failure mode this guards is a timeout, and a fresh
+		// pingProbeTimeout window is the whole remedy. There is no delay between
+		// the two: Session.Ping is a page.Eval("() => true"), which returns in
+		// microseconds on a closed CDP connection, so a browser that really died
+		// confirms instantly and the guard costs a dead session nothing.
+		cerr := m.probe(ctx, sess)
+		if ctx.Err() != nil {
+			return failHealth(gen, ctx.Err())
 		}
-		return failHealth(gen, err)
+		if m.isSuperseded(sess, gen) {
+			continue
+		}
+		if cerr == nil {
+			m.log.Warn("minter: ping probe recovered on confirmation; keeping the session", "gen", gen, "err", err)
+			return m.healthSnapshot(sess, gen), true, nil
+		}
+		if !m.mintMu.TryLock() {
+			// A request holds the page, so this failure cannot be acted on and says
+			// as much about contention as about the browser. Report it as busy: the
+			// next probe re-checks once the request finishes, and a browser that
+			// really died is retired by the crash watcher on CDP connection loss,
+			// which needs no lock. Reporting probe-failed here instead would mark a
+			// container unhealthy after three probes with no session ever retired.
+			//
+			// Busy is bounded, which is what makes leaving it at HTTP 200 safe:
+			// every mintMu holder runs under a caller context, and the daemon's own
+			// requestProcessTimeout bounds the request ones, so the lock is released
+			// and the next probe acts. ProbeBusy is what makes a daemon that keeps
+			// reporting it visible anyway.
+			m.metrics.ProbeBusy.Add(1)
+			// Report the live session's real state alongside the busy reason. The
+			// zero-valued snapshot failHealth builds would say attest "" and
+			// browser_proof_established false about a session that is neither.
+			return m.healthSnapshot(sess, gen), false, fmt.Errorf("%w: %v", ErrProbeBusy, cerr)
+		}
+		// Two missed CDP round trips against a session nobody else is using: the
+		// page is gone. isCrash is what lets a concurrent request take the
+		// replacement free of charge (see sessionDied).
+		m.metrics.ProbeFailures.Add(1)
+		m.retire(gen, "ping probe failed twice: "+cerr.Error(), true)
+		m.mintMu.Unlock()
+		return failHealth(gen, cerr)
 	}
 	// Reached when the session was superseded on every attempt: report a soft
 	// no-session rather than a stale failure. Re-read the current generation (gen
@@ -1753,6 +1962,14 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 	gen := m.gen
 	m.mu.Unlock()
 	return failHealth(gen, ErrNoSession)
+}
+
+// probe runs one bounded CDP round trip against sess. Health calls it twice
+// before acting on a failure, so both probes get the same budget.
+func (m *Minter) probe(ctx context.Context, sess minterSession) error {
+	pctx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
+	defer cancel()
+	return sess.Ping(pctx)
 }
 
 // healthSnapshot builds a HealthSnapshot for the probed (sess, gen). It reads the
@@ -1862,10 +2079,13 @@ var lifetimeCounterKeys = []string{
 	"escalations",
 	"player_contexts",
 	"player_context_failures",
+	"player_context_negative_cache_hits",
 	"status2_rejections",
 	"separation_waits",
 	"unproven_rejections",
 	"crashes",
+	"probe_failures",
+	"probe_busy",
 	"cache_hits",
 	"cache_misses",
 	"cache_evictions",
@@ -1889,10 +2109,13 @@ func (m *Minter) counterValues() map[string]int64 {
 		"escalations":                           m.metrics.Escalations.Load(),
 		"player_contexts":                       m.metrics.PlayerContexts.Load(),
 		"player_context_failures":               m.metrics.PlayerContextFailures.Load(),
+		"player_context_negative_cache_hits":    m.metrics.PlayerContextNegativeCacheHits.Load(),
 		"status2_rejections":                    m.metrics.Status2Rejections.Load(),
 		"separation_waits":                      m.metrics.SeparationWaits.Load(),
 		"unproven_rejections":                   m.metrics.UnprovenRejections.Load(),
 		"crashes":                               m.metrics.Crashes.Load(),
+		"probe_failures":                        m.metrics.ProbeFailures.Load(),
+		"probe_busy":                            m.metrics.ProbeBusy.Load(),
 		"cache_hits":                            m.metrics.CacheHits.Load(),
 		"cache_misses":                          m.metrics.CacheMisses.Load(),
 		"cache_evictions":                       m.metrics.CacheEvictions.Load(),
@@ -1944,7 +2167,7 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 			recycleSecs = 0
 		}
 	}
-	cacheN := len(m.cache)
+	cacheN := m.servableCacheEntriesLocked(time.Now())
 	m.mu.Unlock()
 
 	// Read the session's proof state outside m.mu, as healthSnapshot does. The
@@ -1984,9 +2207,13 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 	return out
 }
 
-// Close tears down the live session.
+// Close tears down the live session and makes the Minter terminal: ensure will
+// not launch again, so a request still in flight cannot walk its relaunch ladder
+// into a browser nobody will close. It deliberately does not take mintMu, so it
+// never waits on an in-flight browser call.
 func (m *Minter) Close() {
 	m.mu.Lock()
+	m.closed = true
 	s := m.sess
 	m.sess = nil
 	cancel := m.watchCancel
