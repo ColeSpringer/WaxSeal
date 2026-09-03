@@ -1,9 +1,11 @@
 name: Release
 
-# Fires when a version tag is pushed. `gh release create vX.Y.Z` (which creates
-# and pushes the tag) is enough to trigger this; the jobs below attach the
-# binaries and publish the image. VERSION strips the leading `v` so it matches
-# the image tag and the -X main.version stamp (v1.2.3 -> 1.2.3).
+# Fires when a version tag is pushed. The normal flow is to write the notes by
+# hand into a draft (`gh release create vX.Y.Z --draft --notes-file ...`), which
+# reserves the tag without creating it, and then publish: publishing is what
+# pushes the tag and triggers this workflow, whose jobs attach the binaries and
+# publish the image. VERSION strips the leading `v` so it matches the image tag
+# and the -X main.version stamp (v1.2.3 -> 1.2.3).
 on:
   push:
     tags:
@@ -11,12 +13,13 @@ on:
 
 jobs:
   # Build the version-stamped Linux and macOS binaries and attach them, plus a
-  # SHA256SUMS manifest, to the release for the tag. If no release exists yet
-  # for the tag, one is created as a draft with an empty body, so a human
+  # SHA256SUMS manifest, to the release for the tag. Normally the release is
+  # already there, published by hand with written notes, and it keeps its body
+  # and just gains the assets. Only if none exists (a tag pushed straight with
+  # `git push`) is one created here, as a draft with an empty body, so a human
   # writes the notes and publishes it; this workflow never publishes a release
-  # on its own. An existing release (for example one created by hand with
-  # written notes) keeps its body and just gains the assets. The binaries
-  # embed the committed JS bundle but need a system Chromium at runtime.
+  # on its own. The binaries embed the committed JS bundle but need a system
+  # Chromium at runtime.
   binaries:
     runs-on: ubuntu-latest
     permissions:
@@ -36,8 +39,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --draft --notes "" --verify-tag || true
+          # The create has to be guarded rather than run unconditionally behind
+          # `|| true`. A draft release does not own its tag, so the API accepts
+          # a second draft carrying a tag name another release already uses, and
+          # `gh release create --draft` therefore succeeds against an existing
+          # release instead of failing. Unguarded, it left an empty duplicate
+          # draft beside the real v1.2.0. The pre-1.2.0 spelling of this step
+          # was not --draft, so the create did fail and `|| true` was enough.
+          #
+          # The count comes from `gh release list` rather than `gh release
+          # view`: list reports drafts as well as published releases, so a
+          # re-run of this job cannot pile a second draft onto one it created
+          # earlier. Nothing here swallows a failure any more, since a create
+          # that fails leaves the upload below nowhere to put the assets.
+          existing=$(gh release list --limit 100 --json tagName \
+            --jq '[.[] | select(.tagName == env.GITHUB_REF_NAME)] | length')
+          if [ "$existing" -eq 0 ]; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --draft --notes "" --verify-tag
+          fi
           gh release upload "$GITHUB_REF_NAME" \
             dist/waxseal-* dist/SHA256SUMS.txt --clobber
 
