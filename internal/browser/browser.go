@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/colespringer/waxseal/internal/botguard"
@@ -422,12 +423,14 @@ type browserInstance struct {
 // teardown closes the browser (group-killing the process), then removes the
 // profile and releases its lock. The bounded browser close prevents a stalled CDP
 // connection from blocking recovery. teardown is idempotent and accepts partially
-// initialized instances.
-func (i *browserInstance) teardown() {
+// initialized instances. It reports whether this call ran the teardown, so a
+// caller that acts on a loss can tell a loss it found from one already handled.
+func (i *browserInstance) teardown() (ran bool) {
 	if i == nil {
-		return
+		return false
 	}
 	i.teardownOnce.Do(func() {
+		ran = true
 		if i.browser != nil {
 			tctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
 			_ = i.browser.Context(tctx).Close()
@@ -438,6 +441,7 @@ func (i *browserInstance) teardown() {
 			i.onTeardown()
 		}
 	})
+	return ran
 }
 
 // launchInstance launches Chromium and groups its resources for teardown.
@@ -461,6 +465,15 @@ type Pool struct {
 
 	// Tests replace newInstance to exercise recovery without launching Chromium.
 	newInstance func() (*browserInstance, error)
+	// ping is one bounded CDP round trip against inst. Tests replace it to
+	// exercise Health's policy without Chromium.
+	ping func(ctx context.Context, inst *browserInstance) error
+
+	// probeFailures counts browsers Health confirmed unresponsive and tore down.
+	// relaunchFailures counts relaunch attempts, from any caller, whose launch
+	// failed; a refusal by the backoff is not one.
+	probeFailures    atomic.Int64
+	relaunchFailures atomic.Int64
 
 	mu             sync.Mutex
 	cur            *browserInstance
@@ -476,7 +489,7 @@ func LaunchPool(opts Options) (*Pool, error) {
 	if err := validateLaunchOptions(opts); err != nil {
 		return nil, err
 	}
-	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(opts) }}
+	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(opts) }, ping: pingInstance}
 	inst, err := p.newInstance()
 	if err != nil {
 		return nil, err
@@ -507,8 +520,10 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 	// cannot hang the request past its deadline.
 	incog, err := inst.browser.Context(ctx).Incognito()
 	if err != nil {
-		// Relaunch only when the context error came from a dead browser.
-		if browserAlive(inst.browser) {
+		// Relaunch only when the context error came from a dead browser. The probe
+		// gets a fresh context: ctx may be what just expired, and judging the
+		// browser by it would relaunch a healthy one.
+		if p.ping(context.Background(), inst) == nil {
 			return nil, fmt.Errorf("waxseal: new browser context: %w", err)
 		}
 		p.opts.Logger.Warn("waxseal: pooled chromium is unreachable; relaunching", "err", err)
@@ -540,13 +555,124 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 	return s, nil
 }
 
-// browserAlive reports whether the browser answers a CDP Version request within
-// aliveProbeTimeout.
-func browserAlive(b *cdp.Browser) bool {
-	actx, cancel := context.WithTimeout(context.Background(), aliveProbeTimeout)
+// pingInstance is the production Pool.ping: one Browser.getVersion round trip
+// bounded by aliveProbeTimeout under ctx, the browser-level Session.Ping.
+func pingInstance(ctx context.Context, inst *browserInstance) error {
+	pctx, cancel := context.WithTimeout(ctx, aliveProbeTimeout)
 	defer cancel()
-	_, err := b.Context(actx).Version()
-	return err == nil
+	_, err := inst.browser.Context(pctx).Version()
+	return err
+}
+
+// Recovery reports what Health had to do to reach a running browser.
+type Recovery int
+
+const (
+	// RecoveryNone means the current browser answered the probe.
+	RecoveryNone Recovery = iota
+	// RecoveryRelaunched means the browser had exited and a replacement was
+	// launched, by this probe or by a concurrent caller.
+	RecoveryRelaunched
+	// RecoveryTornDown means the browser missed two probes, so this probe tore
+	// it down and launched a replacement.
+	RecoveryTornDown
+)
+
+func (r Recovery) String() string {
+	switch r {
+	case RecoveryNone:
+		return "none"
+	case RecoveryRelaunched:
+		return "relaunched"
+	case RecoveryTornDown:
+		return "torn-down"
+	}
+	return fmt.Sprintf("recovery(%d)", int(r))
+}
+
+// Health is the browser check behind /ping. It reports nil when a running
+// Chromium answers a bounded CDP round trip, and what it had to do to get one.
+//
+// A connection Chromium has already torn down is a known death: no
+// confirmation, and a replacement is launched at once, since a probe that
+// answered for a browser that used to run would keep a daemon healthy with no
+// browser at all. Any other failure is confirmed by a second probe with a fresh
+// timeout before anything happens, the same guard Minter.Health applies to a
+// session. A browser that misses both is torn down, counted, and replaced, so
+// the next request finds a browser instead of stalling on the wedged one for
+// its whole budget. Concurrent probes that confirm the same wedge tear it down
+// once: the one that did reports the teardown, the rest the relaunch.
+//
+// The launch handshake is itself a Browser.getVersion, so a replacement has
+// answered a round trip by the time it is current. A relaunch the crash-loop
+// backoff refuses, or one whose launch fails, fails the probe with that error;
+// the next probe tries again. Cancellation says nothing about the browser and
+// is returned as is.
+func (p *Pool) Health(ctx context.Context) (Recovery, error) {
+	if p == nil {
+		return RecoveryNone, errPoolClosed
+	}
+	inst, err := p.acquire()
+	if err != nil {
+		return RecoveryNone, err
+	}
+	err = p.ping(ctx, inst)
+	switch {
+	case err == nil:
+		return RecoveryNone, nil
+	case errors.Is(err, cdp.ErrConnClosed):
+		return p.replace(RecoveryRelaunched, inst, err)
+	case ctx.Err() != nil:
+		return RecoveryNone, ctx.Err()
+	}
+	cerr := p.ping(ctx, inst)
+	switch {
+	case cerr == nil:
+		p.opts.Logger.Warn("waxseal: pooled chromium probe recovered on confirmation; keeping the browser", "err", err)
+		return RecoveryNone, nil
+	case errors.Is(cerr, cdp.ErrConnClosed):
+		return p.replace(RecoveryRelaunched, inst, cerr)
+	case ctx.Err() != nil:
+		return RecoveryNone, ctx.Err()
+	}
+	// teardown reports whether this probe was the one to act, so concurrent
+	// confirmations count one loss and only one of them reports the teardown.
+	rec := RecoveryRelaunched
+	if inst.teardown() {
+		rec = RecoveryTornDown
+		p.probeFailures.Add(1)
+		p.opts.Logger.Warn("waxseal: pooled chromium missed two probes; torn down for relaunch", "err", cerr)
+	}
+	return p.replace(rec, inst, cerr)
+}
+
+// replace launches a replacement for stale, or adopts one a concurrent caller
+// launched, and reports rec on success. cause is what the probe saw, for the log.
+func (p *Pool) replace(rec Recovery, stale *browserInstance, cause error) (Recovery, error) {
+	p.opts.Logger.Warn("waxseal: pooled chromium is gone; relaunching for the probe", "recovery", rec, "err", cause)
+	if _, err := p.relaunch(stale); err != nil {
+		return RecoveryNone, err
+	}
+	return rec, nil
+}
+
+// ProbeFailures counts the browsers Health confirmed unresponsive and tore down,
+// one per browser lost rather than one per probe.
+func (p *Pool) ProbeFailures() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.probeFailures.Load()
+}
+
+// RelaunchFailures counts relaunch attempts, from any caller, whose launch
+// failed. Together with a failing probe it says the daemon has no browser and
+// cannot get one.
+func (p *Pool) RelaunchFailures() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.relaunchFailures.Load()
 }
 
 // relaunch replaces stale with a new browser instance. Concurrent callers that
@@ -601,6 +727,7 @@ func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
 		close(ch)
 		if lerr != nil {
 			p.mu.Unlock()
+			p.relaunchFailures.Add(1)
 			return nil, fmt.Errorf("waxseal: relaunch chromium: %w", lerr)
 		}
 		if p.closed {

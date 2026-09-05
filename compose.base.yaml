@@ -52,4 +52,6 @@ services:
     #       tmpfs: { mode: 01777 }
     #
     # Multi-tenant: consumers send X-API-Key: <key>. Uncomment and set your keys.
+    # The image's healthcheck needs no change: a keyed daemon answers its keyless
+    # probe with the shared browser's liveness.
     # command: ["server", "--host", "0.0.0.0", "--tenant-keys", "alice=KEYA,bob=KEYB"]

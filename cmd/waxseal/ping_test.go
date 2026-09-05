@@ -199,3 +199,98 @@ func TestPingSendsKeyAsHeader(t *testing.T) {
 		t.Errorf("raw query %q contains the key", gotRawQuery)
 	}
 }
+
+// TestPingCLIDaemonProbe covers the body a keyed daemon returns to a probe that
+// sends no key: the shared browser's liveness rather than a tenant's session.
+// That is what the image's HEALTHCHECK receives once the daemon is keyed, so
+// both modes must read it, and the output must say what was checked instead of
+// printing an empty attest.
+func TestPingCLIDaemonProbe(t *testing.T) {
+	var status int
+	var payload string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	run := func(strict bool) (string, error) {
+		c := newPingCmd()
+		args := []string{"--addr", addr}
+		if strict {
+			args = append(args, "--strict")
+		}
+		c.SetArgs(args)
+		var out strings.Builder
+		c.SetOut(&out)
+		c.SetErr(io.Discard)
+		err := c.Execute()
+		return out.String(), err
+	}
+
+	// Browser answered: healthy in both modes, and the output names the probe.
+	status, payload = http.StatusOK, `{"ok":true,"probe":"daemon","reason":"ok"}`
+	for _, strict := range []bool{false, true} {
+		out, err := run(strict)
+		if err != nil {
+			t.Errorf("alive strict=%v: %v, want success", strict, err)
+		}
+		if out != "ok (probe=daemon)\n" {
+			t.Errorf("alive strict=%v: output = %q, want %q", strict, out, "ok (probe=daemon)\n")
+		}
+	}
+
+	// Browser had exited and the probe relaunched it: healthy, and the output
+	// says so, since that is the one place a relaunch shows outside the daemon log.
+	status, payload = http.StatusOK, `{"ok":true,"probe":"daemon","reason":"ok","browser_relaunched":true}`
+	for _, strict := range []bool{false, true} {
+		out, err := run(strict)
+		if err != nil {
+			t.Errorf("relaunched strict=%v: %v, want success", strict, err)
+		}
+		if out != "ok (probe=daemon, browser relaunched)\n" {
+			t.Errorf("relaunched strict=%v: output = %q, want %q", strict, out, "ok (probe=daemon, browser relaunched)\n")
+		}
+	}
+	// The same note on a tenant probe's benign window.
+	status, payload = http.StatusOK, `{"ok":false,"probe":"tenant","reason":"no-session","browser_relaunched":true}`
+	if out, err := run(true); err != nil || out != "ok (reason=no-session, browser relaunched)\n" {
+		t.Errorf("no-session with relaunch, strict: out=%q err=%v, want %q", out, err, "ok (reason=no-session, browser relaunched)\n")
+	}
+
+	// Browser confirmed unresponsive: a failure in both modes.
+	status, payload = http.StatusServiceUnavailable, `{"ok":false,"probe":"daemon","reason":"probe-failed","error":"cdp: Browser.getVersion: context deadline exceeded"}`
+	if _, err := run(true); err == nil {
+		t.Error("probe-failed strict (503): want error")
+	}
+	status, payload = http.StatusOK, `{"ok":false,"probe":"daemon","reason":"probe-failed","error":"cdp: Browser.getVersion: context deadline exceeded"}`
+	if _, err := run(false); err == nil {
+		t.Error("probe-failed non-strict: want error")
+	}
+}
+
+// TestPingCLIEmptyKeyIsUsageError pins that `--key ""` is refused. A compose
+// file that passes `--key ${SOME_VAR}` with the variable unset would otherwise
+// send no header, and on a keyed daemon that quietly turns the tenant probe the
+// operator configured into the daemon-level one, which stays healthy while the
+// tenant it meant to watch is never checked.
+func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the daemon was probed despite the empty --key")
+	}))
+	defer srv.Close()
+	c := newPingCmd()
+	c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", ""})
+	c.SetOut(io.Discard)
+	c.SetErr(io.Discard)
+	err := c.Execute()
+	var ue *usageError
+	if !errors.As(err, &ue) {
+		t.Fatalf("ping --key \"\" = %v, want a usage error", err)
+	}
+	if !strings.Contains(err.Error(), "--key") {
+		t.Errorf("usage error %q does not name --key", err)
+	}
+}

@@ -1,5 +1,5 @@
-// GENERATED - do not edit. Source: build/js/browser_entrypoint.js and bgutils-js@4.0.2.
-// Rebuild: make jsbundle-browser (esbuild@0.28.1).
+// GENERATED - do not edit. Source: build/js/browser_entrypoint.js and bgutils-js@4.0.3.
+// Rebuild: make jsbundle-browser (esbuild@0.28.2).
 (() => {
   var __defProp = Object.defineProperty;
   var __typeError = (msg) => {

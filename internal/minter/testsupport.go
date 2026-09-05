@@ -31,6 +31,13 @@ func (t *Tenants) InjectSessionForTest(ctx context.Context, apiKey string, sess 
 	return m, nil
 }
 
+// SetBrowserProberForTest replaces the browser check behind BrowserHealth and
+// the browser counters in the metrics views, so tests in dependent packages can
+// drive a /ping through every browser outcome, and assert what it counted,
+// without launching Chromium. Call it before the registry serves any request;
+// the field is not guarded. Production code must not call it.
+func (t *Tenants) SetBrowserProberForTest(p BrowserProber) { t.prober = p }
+
 // ExpireStreamingDeadlineForTest moves the current session's streaming deadline
 // into the past, forcing the next streaming handoff to recycle without sleeping.
 // If streaming-age recycling is disabled, it enables a test interval so the

@@ -95,7 +95,7 @@ with `waxseal doctor --stop-after-load` on an isolated network.
 | `GET`, `POST` | `/player-context` | Return an attested streaming context |
 | `GET` | `/session` | Export the attested guest identity and cookies |
 | `POST` | `/report` | Report a degraded stream and recycle its session |
-| `GET` | `/ping` | Check the current session without minting |
+| `GET` | `/ping` | Health of the tenant's session, or of the shared browser when a keyed daemon gets no key |
 | `GET` | `/metrics` | Operational counters; keyed daemons redact tenant detail |
 
 Tokens and exported identities are bound to the minting host's egress IP, so the
@@ -292,6 +292,11 @@ Prefer a header. `?key=<key>` puts the key in the request line, which reverse
 proxies and container runtimes write to their access logs, so a health check
 polling every few seconds leaves the key in those logs for the life of the
 deployment. `waxseal ping --key` and the `client` package both send the header.
+A liveness check needs no key at all: a keyed daemon answers a keyless `/ping`
+with the shared browser's health rather than `401` (see
+[Operations](#operations)), which is what the image's `HEALTHCHECK` relies on.
+An empty `--key` is a usage error rather than "no key", so a probe whose key
+variable is unset fails loudly instead of quietly checking the browser alone.
 `--tenant-keys` takes comma-separated `label=key` entries or bare keys (which get
 generated labels); labels and keys must be non-empty and unique, and an invalid
 set stops startup before Chromium launches. A keyless daemon on a non-loopback
@@ -316,14 +321,15 @@ every tenant key) or `--metrics-public` does, keeping minting keys separate from
 metrics access. When both are set, `--metrics-public` wins. Both are ignored on a
 keyless daemon.
 
-The full view is `{"tenants":N,"per_tenant":{"<label>":{...}}}`, each tenant
-object carrying lifetime counters (`mints`, `crashes`, `player_contexts`,
+The full view is `{"tenants":N,"per_tenant":{"<label>":{...}},...}` plus the
+two daemon-wide browser counters below, each tenant object carrying lifetime
+counters (`mints`, `crashes`, `player_contexts`,
 `separation_waits` for requests held back to keep a mint and an establishment
 apart, `unproven_rejections` for contexts refused because the session could not
 prove full-length streaming, the five `degradation_reports_*` dispositions above,
 and so on) plus current state.
 
-Four counters are worth knowing exactly:
+These counters are worth knowing exactly:
 
 - `player_context_failures` counts real failed attempts against the browser and
   nothing else.
@@ -331,12 +337,26 @@ Four counters are worth knowing exactly:
   negative cache without touching the browser. They are counted apart because one
   caller looping on a single unplayable video can drive this by six orders of
   magnitude while every real request succeeds, which would bury the failure rate.
-- `probe_failures` counts the `/ping` responses reporting `probe-failed`, one for
-  one, so it lines up with the alert below. `crashes` also counts CDP-event
-  deaths, so the two together separate probe-detected loss from the rest.
-- `probe_busy` counts the `/ping` responses reporting `busy`. Those are benign
-  and stay HTTP 200, which is exactly why they are counted: without this, a
-  daemon answering `busy` on every probe looks the same as a healthy one.
+- `probe_failures` counts the sessions a tenant-level `/ping` confirmed
+  unresponsive and retired, one per session. `crashes` also counts CDP-event
+  deaths, so the two together separate probe-detected loss from the rest. A
+  browser the probe tears down (below) retires every tenant's session on it,
+  which each tenant counts as a crash: the sessions were already unusable on a
+  wedged browser, and the teardown is what lets them come back.
+- `probe_busy` counts the tenant probes that confirmed a page failure but found
+  the page held by a request, so nothing was retired at the session level. It is
+  benign, which is exactly why it is counted: without this, a daemon answering
+  `busy` on every probe looks the same as a healthy one. The browser check that
+  follows such a probe can still find the browser itself wedged, in which case
+  the response reads `probe-failed` while this counter has moved.
+- `browser_probe_failures` counts the browsers a `/ping` confirmed unresponsive
+  and tore down, whether the daemon-level probe found it or a tenant-level probe
+  escalated to it, one per browser lost rather than one per probe.
+- `browser_relaunch_failures` counts the relaunch attempts, from a probe or a
+  request, whose launch failed. Together with a failing probe it says the daemon
+  has no browser and cannot get one. Both browser counters describe the shared
+  Chromium, not a tenant, so they sit at the top level of both views instead of
+  among the summed counters.
 - `cache_entries` reports **servable** entries: current generation, not yet
   expired, which is what a token request would actually be served from. A
   consumer degradation report drops that generation's cached tokens, so it takes
@@ -348,15 +368,17 @@ omitted. For example `last_browser_proof_age_secs` is `null` until the first
 proof, which reserves `0` for "just proved", and
 `streaming_seconds_until_recycle` appears only when time-based recycling is
 enabled (`--streaming-max-age` > 0). The redacted view is
-`{"redacted":true,"aggregate":{...}}`: the same counters summed across tenants,
-with no labels and no tenant count.
+`{"redacted":true,"aggregate":{...},...}`: the same counters summed across
+tenants, with no labels and no tenant count, plus the two daemon-wide browser
+counters at top level.
 
 ### Errors
 
 Recognized endpoints and unknown paths return
 `{"error":"<message>","code":"<machine-readable-code>"}`. `video-unavailable`
-adds a `details` field with the playability status. `/ping` never uses this
-envelope; it reports health directly (see [Operations](#operations)).
+adds a `details` field with the playability status. `/ping` health bodies do
+not use this envelope; they report health directly (see
+[Operations](#operations)). Only its `400` and `401` rejections do.
 
 | Code | HTTP | Meaning |
 |---|---:|---|
@@ -414,22 +436,58 @@ succession; past the burst, the budget refills at one recycle per interval. This
 is deliberate anti-storm behavior; workloads that recycle faster on a sustained
 basis may lower it.
 
-Health checks use `/ping`, which after authentication returns HTTP 200 with
-`ok:true` or `ok:false` and an always-present `reason`: `ok`, `no-session`
-(benign, since a `POST /report` retires the session and re-establishment is lazy,
-so `ok` briefly reads `false`), `busy` (benign: a probe failed twice but a
-request held the page, so nothing was retired and the next probe re-checks once
-that request finishes), or `probe-failed` (a live session's probe failed twice
-and the session was retired, logged at `warn`). Alert only on `probe-failed`; a
-caller that disconnects mid-probe is not counted as one. For status-code-only
-checks (k8s, `curl -f`, HAProxy), `?strict=true` maps `probe-failed` to **503**
-while `no-session`, `busy`, and healthy stay **200**, and `waxseal ping --strict` does the same from the CLI, so
-liveness probes do not fail during the benign re-establishment window. A bare
-`?strict` also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`,
-`banana`) returns **400** rather than quietly running non-strict, so a typo in a
-probe is visible. The image's `HEALTHCHECK` runs `waxseal ping --strict` for
-exactly that reason; multi-tenant deployments must add `--key <key>` to it, which
-sends the key as a header and keeps it out of access logs.
+Health checks use `/ping`. With a tenant key, or on a keyless daemon where the
+empty key selects the one tenant, it probes that tenant's session and returns
+HTTP 200 with `ok:true` or `ok:false`, `probe:"tenant"`, and an always-present
+`reason`: `ok`, `no-session` (benign, since a `POST /report` retires the session
+and re-establishment is lazy, so `ok` briefly reads `false`), `busy` (benign: a
+probe failed twice but a request held the page, so nothing was retired and the
+next probe re-checks once that request finishes), or `probe-failed` (this probe
+confirmed a loss, logged at `warn`).
+
+Whenever no page answered, the daemon also checks the shared Chromium, because
+a wedged browser looks the same from a retired page, a page in use, or no page
+at all, and the next request would otherwise stall on it for its whole budget
+before the pool noticed. A browser that answers leaves the tenant reason
+standing. One that had exited is relaunched on the spot, the tenant reason
+stands, and the body says `browser_relaunched:true`. One that misses two probes
+is torn down and replaced, counted in `browser_probe_failures`, and reported as
+`probe-failed` with the browser's error after the tenant's, since the loss is
+the probe's finding even though it was remedied. One that cannot be replaced is
+`probe-failed` too, with the launch error. A page that answered has already
+proved the browser, so a healthy probe costs one round trip.
+
+On a keyed daemon, a `/ping` that presents no key is answered at daemon scope
+instead of with `401`. The body says `probe:"daemon"` and carries only `ok`,
+`reason`, `browser_relaunched`, and on failure `error`: the browser check above
+on its own, with `ok` meaning a running Chromium answered, possibly after a
+relaunch. That is less than the redacted `/metrics` already serves anyone,
+which is why the probe needs neither a key nor a loopback source: an
+orchestrator's probe arrives from the node, and a port published through
+Docker's proxy arrives from the bridge address, so the source says nothing
+about who is asking. A caller cannot make a healthy browser fail the check, so
+the teardown and relaunch it can lead to happen only to a browser that is
+wedged or gone, and the pool single-flights and backs off relaunches on its
+own. A key that is present but wrong is still `401`, so a typo in a probe's
+`--key` fails the probe instead of quietly downgrading it to the daemon-level
+answer.
+
+Alert only on `probe-failed`; a caller that disconnects mid-probe is not counted
+as one. For status-code-only checks (k8s, `curl -f`, HAProxy), `?strict=true`
+maps `probe-failed` to **503** while `no-session`, `busy`, and healthy stay
+**200**, and `waxseal ping --strict` does the same from the CLI, so liveness
+probes do not fail during the benign re-establishment window. A bare `?strict`
+also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`, `banana`)
+returns **400** rather than quietly running non-strict, so a typo in a probe is
+visible. Size a probe's timeout for the worst case: up to four session round
+trips and a session teardown, two browser round trips and a browser teardown,
+each bounded at 5 seconds, plus a relaunch, which normally takes a second or two
+and is bounded by the 60 second launch handshake; the image's `HEALTHCHECK`
+allows 110. The image runs `waxseal ping --strict` with no key, which checks
+the browser on a keyed daemon and the one tenant's session plus the browser on
+a keyless one, and it keeps working once the daemon is keyed. Add `--key <key>`
+to also probe that tenant's session; the CLI sends the key as a header and keeps
+it out of access logs.
 
 Headless Chromium reports a `HeadlessChrome` token in `navigator.userAgent` and
 in its brand list, so WaxSeal installs a user-agent override that substitutes

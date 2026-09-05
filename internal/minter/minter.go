@@ -1874,8 +1874,10 @@ func (m *Minter) sessionDied(sess minterSession, gen uint64, what string, err er
 // If another goroutine replaces the session during either probe, Health retries
 // against the current session. When the session keeps being replaced across both
 // attempts, Health reports no-session rather than a stale probe failure. So one
-// /ping issues at most four bounded round trips, two attempts of two, which is
-// what to size a health check's timeout against: 4*pingProbeTimeout.
+// call issues at most four bounded round trips, two attempts of two, plus the
+// bounded teardown of a retired session. It is not the whole of a /ping: the
+// server follows any answer but ok with the browser check, which the handler
+// sizes.
 func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		m.mu.Lock()

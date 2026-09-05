@@ -60,7 +60,10 @@ CMD ["server", "--host", "0.0.0.0"]
 # Use the built-in health probe instead of curl. The start period covers browser
 # warm-up, and the timeout covers a lazy attestation. --strict fails only on a
 # probe failure: a `POST /report` retires the session and re-establishment is lazy,
-# and that benign window must not mark the container unhealthy. Multi-tenant
-# deployments must add `--key <key>`.
+# and that benign window must not mark the container unhealthy. The probe sends
+# no key on purpose. A keyed daemon (--tenant-keys) answers a keyless /ping with
+# the shared browser's health, relaunching a browser that has exited, so this
+# works unchanged once the daemon is keyed. Add `--key <key>` to also probe that
+# tenant's session; the browser is checked either way.
 HEALTHCHECK --interval=30s --timeout=110s --start-period=120s --retries=3 \
   CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416", "--strict"]

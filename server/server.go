@@ -136,7 +136,8 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 // routes registers method-specific handlers and path-only 405 fallbacks.
 // ServeMux routes HEAD requests to GET handlers. For /session and /player-context
 // that would run browser-backed work, so explicit HEAD patterns reject them with
-// 405. HEAD /ping and /metrics stay on the GET handlers because they are cheap.
+// 405. HEAD /ping and /metrics stay on the GET handlers: /metrics is cheap, and
+// /ping is a bounded probe with no navigation that some balancers issue as HEAD.
 // Add the same HEAD gate for any future browser-backed GET endpoint. Because
 // authentication runs in endpoint handlers, unsupported methods are rejected before
 // tenant lookup.
@@ -442,12 +443,40 @@ func strictPing(r *http.Request) (strict, ok bool) {
 	return b, true
 }
 
-// handlePing probes an existing tenant session without launching Chromium,
-// attesting, or minting. A probe that fails twice may retire the session. After
-// authentication, the handler reports health in a stable body. The reason field
-// distinguishes the two benign states, no-session and busy, from probe-failed;
-// ?strict=true maps only probe-failed to HTTP 503.
+// strictPingUsage is the 400 message for a ?strict value strictPing cannot read.
+const strictPingUsage = `strict must be a boolean ("true", "false", "1", "0"), a bare ?strict, or omitted`
+
+// errBrowserTornDown is the probe error for a browser this probe found wedged.
+// The pool has already replaced it by the time the probe reports.
+var errBrowserTornDown = errors.New("the shared browser missed two probes and was torn down and relaunched")
+
+// handlePing is the health probe. It never attests or mints. Its scope depends
+// on the key: a tenant key, or no key on a keyless daemon, probes that
+// tenant's session; no key on a keyed daemon probes the shared browser (see
+// handleDaemonPing). A tenant probe whose page did not answer is followed by
+// the browser check as well, so a wedged Chromium is found and replaced by the
+// probe rather than by the next request stalling on it.
+//
+// The body reports health directly rather than through the error envelope,
+// with an always-present reason. no-session and busy are benign windows;
+// probe-failed means this probe confirmed a loss, a session retired or a browser
+// torn down or unreplaceable, and is the only reason ?strict=true maps to 503.
+// A probe runs on the raw request context: every step is bounded on its own
+// (four session round trips of pingProbeTimeout, a session teardown, two
+// browser round trips, a browser teardown, and a launch handshake), so the only
+// early exit is the caller leaving, which writes nothing.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	// A keyed daemon answers a probe that presents no key at daemon scope: the
+	// shared browser's liveness, which belongs to no tenant. That is what the
+	// image's HEALTHCHECK sends, and it mirrors /metrics, which serves a keyed
+	// daemon's redacted aggregate without a key. A key that is present is always
+	// resolved, so a typo in a probe still fails it with 401 instead of hiding
+	// behind the daemon-level answer. A keyless daemon has one tenant, which the
+	// empty key selects, so it keeps the tenant-level probe.
+	if s.tenants.Keyed() && apiKey(r) == "" {
+		s.handleDaemonPing(w, r)
+		return
+	}
 	m, label, ok := s.tenant(w, r)
 	if !ok {
 		return
@@ -458,45 +487,28 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	// so it gets the same shape.
 	strict, ok := strictPing(r)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `strict must be a boolean ("true", "false", "1", "0"), a bare ?strict, or omitted`)
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
 		return
 	}
 	snap, live, err := m.Health(r.Context())
-	reason := PingReasonOK
-	status := http.StatusOK
+	reason, relaunched := PingReasonOK, false
 	if err != nil {
-		// Check the caller first. A mid-probe disconnect is not a server condition, so
-		// write no body even if the probe also returned no-session. /ping uses the raw
-		// request context, which makes this check unambiguous.
-		if clientGone(r) {
-			s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
+		if s.pingAbandoned(r, "tenant", label) {
 			return
 		}
-		reason = PingReasonProbeFailed
-		switch {
-		case errors.Is(err, minter.ErrNoSession):
-			// A report can retire the session before the next streaming request
-			// lazily creates a replacement. Treat that gap as expected.
-			reason = PingReasonNoSession
-		case errors.Is(err, minter.ErrProbeBusy):
-			// A confirmed probe failure that could not take the page from a running
-			// request. It says as much about contention as about the browser, and
-			// nothing was retired, so it stays 200 under strict for the same reason
-			// no-session does: three of these must not mark a healthy container
-			// unhealthy. The next probe re-checks once the request finishes.
-			reason = PingReasonBusy
-			// Benign, but not free: probe_busy counts it, since a daemon that keeps
-			// answering busy is otherwise indistinguishable from a healthy one.
-			s.log.Debug("ping probe could not act: the session is busy", "tenant", label, "err", err)
-		default:
-			// Probe failures should be visible in logs even when callers do not poll
-			// /ping. Strict mode also exposes them through the status code.
-			s.log.Warn("ping probe failed", "tenant", label, "err", err)
-		}
-		// Deciding the status code from the reason, off the same predicate the CLI
-		// reads, keeps the strict policy in one place instead of once per branch.
-		if strict && !BenignPingReason(reason) {
-			status = http.StatusServiceUnavailable
+		reason = tenantPingReason(err)
+		s.logPing(reason, err, "tenant", label)
+		// No page answered, whichever the reason, and the browser itself may be
+		// what hung: a retired page, a page in use, and no page at all look the
+		// same from a wedged Chromium, and the next request would stall on it for
+		// its whole budget before the pool noticed. So the browser check follows.
+		// A browser that answers leaves the tenant reason standing: the page's
+		// failure was the page's own, or contention, which is what busy means. A
+		// page that answered has already proved the browser, which is why the
+		// healthy path never gets here.
+		reason, err, relaunched = s.checkBrowser(r.Context(), reason, err, "tenant", label)
+		if s.pingAbandoned(r, "tenant", label) {
+			return
 		}
 	}
 	// Browser proof describes playback in the daemon. A consumer report can still
@@ -505,20 +517,132 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	// browser-detection health signal. In failure responses these values are
 	// zero-valued, except generation, which carries the last-known generation so
 	// /ping stays consistent with /metrics.
-	body := map[string]any{
+	writePing(w, strict, reason, err, map[string]any{
 		"ok":                         live,
+		"probe":                      PingProbeTenant,
 		"tenant":                     label,
-		"reason":                     reason,
 		"attest":                     snap.AttestKind,
 		"generation":                 snap.Generation,
 		"navigator_webdriver":        snap.Identity.Webdriver,
 		"browser_proof_established":  snap.BrowserProofEstablished,
 		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
 		"streaming_suspect":          snap.StreamingSuspect,
+		"browser_relaunched":         relaunched,
+	})
+}
+
+// handleDaemonPing answers a keyless probe on a keyed daemon with the shared
+// browser's health. The body carries only whether the daemon has a running
+// browser and, if not, why, which is less than the redacted /metrics already
+// serves anyone. There is no loopback gate: an orchestrator's probe arrives
+// from the node, not loopback, and a port published through Docker's proxy
+// arrives from the bridge address, so the source address says nothing about
+// who is asking. A caller cannot make a healthy browser fail the check, so the
+// teardown and relaunch it can lead to happen only to a browser that is wedged
+// or gone, and the pool single-flights and backs off relaunches on its own.
+func (s *Server) handleDaemonPing(w http.ResponseWriter, r *http.Request) {
+	strict, ok := strictPing(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
+		return
 	}
+	reason, err, relaunched := s.checkBrowser(r.Context(), PingReasonOK, nil) // it names the browser itself
+	if err != nil && s.pingAbandoned(r, "probe", PingProbeDaemon) {
+		return
+	}
+	writePing(w, strict, reason, err, map[string]any{
+		"ok":                 err == nil,
+		"probe":              PingProbeDaemon,
+		"browser_relaunched": relaunched,
+	})
+}
+
+// tenantPingReason maps a Minter.Health error to the reason a tenant probe
+// reports: the two benign windows, or probe-failed for a retired session.
+func tenantPingReason(err error) string {
+	switch {
+	case errors.Is(err, minter.ErrNoSession):
+		// A report can retire the session before the next streaming request
+		// lazily creates a replacement. Treat that gap as expected.
+		return PingReasonNoSession
+	case errors.Is(err, minter.ErrProbeBusy):
+		// A confirmed probe failure that could not take the page from a running
+		// request. It says as much about contention as about the browser, and
+		// nothing was retired, so it stays 200 under strict for the same reason
+		// no-session does: three of these must not mark a healthy container
+		// unhealthy. The next probe re-checks once the request finishes.
+		return PingReasonBusy
+	}
+	return PingReasonProbeFailed
+}
+
+// checkBrowser runs the browser check and folds its outcome into a probe's
+// reason and error so far (a tenant probe's, or ok and nil for a daemon-level
+// probe). A browser that answered leaves them. One that had exited and was
+// relaunched leaves them too and reports the relaunch, since the death was
+// already handled and the daemon has a browser again. One this probe found
+// wedged, or one that could not be replaced, is a loss this probe found: the
+// reason becomes probe-failed, logged at warn with the browser named so the loss
+// is not read as one tenant's, and the error says what happened to the browser
+// after whatever the tenant probe said. Cancellation is returned as is, unlogged,
+// for the caller's abandoned-request check.
+func (s *Server) checkBrowser(ctx context.Context, reason string, err error, attrs ...any) (string, error, bool) {
+	rec, berr := s.tenants.BrowserHealth(ctx)
+	if ctx.Err() != nil {
+		return reason, ctx.Err(), false
+	}
+	relaunched := rec != browser.RecoveryNone
+	switch {
+	case berr != nil:
+		berr = fmt.Errorf("no browser answers and none could be launched: %w", berr)
+	case rec == browser.RecoveryTornDown:
+		berr = errBrowserTornDown
+	default:
+		return reason, err, relaunched
+	}
+	s.logPing(PingReasonProbeFailed, berr, append(attrs, "probe", PingProbeDaemon)...)
 	if err != nil {
-		// /ping bypasses the error envelope, so strip the internal prefix (and clamp)
-		// here too, matching writeErrDetails and the CLI.
+		berr = fmt.Errorf("%v; %w", err, berr)
+	}
+	return PingReasonProbeFailed, berr, relaunched
+}
+
+// pingAbandoned reports whether the caller has gone away, logging it at debug.
+// A probe runs on the raw request context, so a disconnect is the only way it
+// ends early, and nothing is written for one: the response would go nowhere,
+// and a disconnect is not a server condition.
+func (s *Server) pingAbandoned(r *http.Request, attrs ...any) bool {
+	if !clientGone(r) {
+		return false
+	}
+	s.log.Debug("request abandoned by client", append(attrs, "err", r.Context().Err())...)
+	return true
+}
+
+// logPing records a probe outcome. A loss is logged at warn so it is visible
+// even when nobody reads the body; the busy window at debug, since probe_busy
+// already counts it and it is benign.
+func (s *Server) logPing(reason string, err error, attrs ...any) {
+	switch reason {
+	case PingReasonProbeFailed:
+		s.log.Warn("ping probe failed", append(attrs, "err", err)...)
+	case PingReasonBusy:
+		s.log.Debug("ping probe could not act: the session is busy", append(attrs, "err", err)...)
+	}
+}
+
+// writePing writes a health body. The status comes from the same predicate the
+// CLI reads (healthy is ok, or a benign reason), so the strict policy lives in
+// one place: 503 only for a failed probe whose reason is not benign, and only
+// when asked. /ping bypasses the error envelope, so the error text gets the same
+// prefix stripping and clamp.
+func writePing(w http.ResponseWriter, strict bool, reason string, err error, body map[string]any) {
+	status := http.StatusOK
+	if strict && err != nil && !BenignPingReason(reason) {
+		status = http.StatusServiceUnavailable
+	}
+	body["reason"] = reason
+	if err != nil {
 		body["error"] = presentErr(err.Error())
 	}
 	writeJSON(w, status, body)
@@ -736,8 +860,21 @@ const (
 	CodeNotFound = "not-found"
 )
 
-// The /ping reason values. The always-present reason field carries exactly one
-// of these, and only PingReasonProbeFailed maps to 503 under ?strict=true.
+// The /ping probe values. The probe field, present on every health body, says
+// what the daemon checked: a tenant's session (a keyed request, or any request
+// on a keyless daemon) or the shared browser (a keyless request on a keyed
+// daemon). The 400 and 401 rejections use the error envelope instead.
+const (
+	// PingProbeTenant means the body describes one tenant's attested session.
+	PingProbeTenant = "tenant"
+	// PingProbeDaemon means the body describes the shared Chromium's liveness
+	// and nothing about any tenant.
+	PingProbeDaemon = "daemon"
+)
+
+// The /ping reason values. The reason field, present on every health body,
+// carries exactly one of these, and only PingReasonProbeFailed maps to 503 under
+// ?strict=true.
 const (
 	// PingReasonOK means a live session answered the probe.
 	PingReasonOK = "ok"
@@ -747,8 +884,10 @@ const (
 	// PingReasonBusy means a probe failed twice while a request held the page, so
 	// nothing was retired and the next probe re-checks. Benign.
 	PingReasonBusy = "busy"
-	// PingReasonProbeFailed means a live session's probe failed twice and the
-	// session was retired.
+	// PingReasonProbeFailed means this probe confirmed a loss: a live session's
+	// probe failed twice and the session was retired, or the shared browser
+	// missed two probes and was torn down, or no browser answers and none could
+	// be launched.
 	PingReasonProbeFailed = "probe-failed"
 )
 

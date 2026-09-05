@@ -42,7 +42,10 @@ func newPingCmd() *cobra.Command {
 	}
 	f := c.Flags()
 	f.StringVar(&p.addr, "addr", "127.0.0.1:4416", "server address to connect to")
-	f.StringVar(&p.key, "key", "", "tenant API key (required if the server is multi-tenant)")
+	f.StringVar(&p.key, "key", "",
+		"tenant API key: probe that tenant's session. Without it a keyed daemon\n"+
+			"answers with the shared browser's liveness instead, which is what a\n"+
+			"container health check needs; a keyless daemon probes its one tenant.")
 	f.BoolVar(&p.strict, "strict", false,
 		"treat the benign no-session and busy windows as healthy and fail only\n"+
 			"on probe failure (sends ?strict=true). Use this for container or\n"+
@@ -51,6 +54,14 @@ func newPingCmd() *cobra.Command {
 }
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
+	// An empty --key is a usage error rather than "no key". A compose file that
+	// passes `--key ${VAR}` with the variable unset would otherwise send no
+	// header, and on a keyed daemon that turns the tenant probe the operator
+	// configured into the daemon-level one without a word: healthy, while the
+	// tenant it meant to watch is never checked.
+	if cmd.Flags().Changed("key") && p.key == "" {
+		return &usageError{msg: "--key is empty: pass the tenant key, or omit --key to probe the daemon's browser"}
+	}
 	q := url.Values{}
 	if p.strict {
 		q.Set("strict", "true")
@@ -99,13 +110,16 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	}
 	defer resp.Body.Close()
 	var body struct {
-		OK     bool   `json:"ok"`
-		Attest string `json:"attest"`
-		Reason string `json:"reason"`
+		OK         bool   `json:"ok"`
+		Probe      string `json:"probe"` // what the daemon checked; absent from older daemons
+		Attest     string `json:"attest"`
+		Reason     string `json:"reason"`
+		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	// Health semantics:
-	//   default: require a live session (ok:true), so no-session means not ready.
+	//   default: require a live session or browser (ok:true), so the benign
+	//   no-session window reads as not ready.
 	//   strict: accept the benign reasons as healthy, but still fail on probe-failed.
 	//
 	// Do not trust HTTP 200 alone in strict mode. Older daemons ignore ?strict and
@@ -124,10 +138,19 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		}
 		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
 	}
-	if !body.OK { // strict mode, benign no-session: healthy but no live attestation
-		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s)\n", body.Reason)
-		return nil
+	// A relaunch is worth a word in the health log: the probe found the browser
+	// gone and replaced it, which otherwise shows only in the daemon's own log.
+	detail := ""
+	if body.Relaunched {
+		detail = ", browser relaunched"
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s)\n", body.Attest)
+	switch {
+	case !body.OK: // strict mode, a benign window: healthy but nothing live to describe
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s%s)\n", body.Reason, detail)
+	case body.Probe == server.PingProbeDaemon: // a keyed daemon probed without a key: no session, so no attest
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (probe=%s%s)\n", body.Probe, detail)
+	default:
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s%s)\n", body.Attest, detail)
+	}
 	return nil
 }

@@ -235,3 +235,81 @@ func TestTenantsCloseIsTerminal(t *testing.T) {
 		t.Error("per_tenant lost alice, whose run metrics shutdown should still report")
 	}
 }
+
+// fakeProber is a BrowserProber with fixed answers, for the seam tests.
+type fakeProber struct {
+	rec       browser.Recovery
+	err       error
+	probes    int64
+	relaunchs int64
+}
+
+func (f *fakeProber) Health(context.Context) (browser.Recovery, error) { return f.rec, f.err }
+func (f *fakeProber) ProbeFailures() int64                             { return f.probes }
+func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunchs }
+
+// A registry built without a pool has no browser to lose: the check answers
+// and the counters read zero, so handler tests need no pool to run a probe.
+func TestTenantsBrowserHealthWithoutPool(t *testing.T) {
+	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	rec, err := tn.BrowserHealth(context.Background())
+	if err != nil || rec != browser.RecoveryNone {
+		t.Errorf("BrowserHealth with no pool = (%v, %v), want (RecoveryNone, nil)", rec, err)
+	}
+	if got := tn.BrowserProbeFailures(); got != 0 {
+		t.Errorf("BrowserProbeFailures with no pool = %d, want 0", got)
+	}
+	if got := tn.BrowserRelaunchFailures(); got != 0 {
+		t.Errorf("BrowserRelaunchFailures with no pool = %d, want 0", got)
+	}
+}
+
+// Dependent packages install a prober to drive a probe through every browser
+// outcome without Chromium; the registry forwards the check and the counters
+// to it, so a handler test can assert that a response moved a counter.
+func TestTenantsBrowserProberSeam(t *testing.T) {
+	tn := NewTenants(nil, "v", nil, browser.Options{}, 0, 0, 0)
+	want := errors.New("waxseal: relaunch chromium: exec: no such file")
+	tn.SetBrowserProberForTest(&fakeProber{rec: browser.RecoveryTornDown, err: want, probes: 3, relaunchs: 2})
+	if rec, err := tn.BrowserHealth(context.Background()); !errors.Is(err, want) || rec != browser.RecoveryTornDown {
+		t.Errorf("BrowserHealth = (%v, %v), want the installed prober's answer", rec, err)
+	}
+	if got := tn.BrowserProbeFailures(); got != 3 {
+		t.Errorf("BrowserProbeFailures = %d, want 3", got)
+	}
+	if got := tn.BrowserRelaunchFailures(); got != 2 {
+		t.Errorf("BrowserRelaunchFailures = %d, want 2", got)
+	}
+}
+
+// Both /metrics views carry the daemon-wide browser counters at top level. They
+// count browsers lost and launches failed, not per-tenant events, so they are
+// not among the summed aggregate counters and appear in the redacted view as
+// themselves.
+func TestTenantsMetricsCarryBrowserCounters(t *testing.T) {
+	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunchs: 2})
+	full, redacted := tn.MetricsSnapshot(), tn.AggregateMetricsSnapshot()
+	want := map[string]int64{"browser_probe_failures": 3, "browser_relaunch_failures": 2}
+	for name, snap := range map[string]map[string]any{"full": full, "redacted": redacted} {
+		for k, w := range want {
+			v, ok := snap[k]
+			if !ok {
+				t.Errorf("%s view lacks %s", name, k)
+				continue
+			}
+			if v != w {
+				t.Errorf("%s view %s = %v (%T), want int64 %d", name, k, v, v, w)
+			}
+		}
+	}
+	agg, ok := redacted["aggregate"].(map[string]int64)
+	if !ok {
+		t.Fatalf("aggregate is %T, want map[string]int64", redacted["aggregate"])
+	}
+	for k := range want {
+		if _, summed := agg[k]; summed {
+			t.Errorf("%s is listed under aggregate, where every key is a per-tenant sum", k)
+		}
+	}
+}
