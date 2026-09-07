@@ -560,6 +560,10 @@ continuous streaming to watch `streaming_seconds_until_recycle`), and a
 **cache-exhaustion loop** (`POST /get_pot` 1000+ times with distinct
 `content_binding` values to exercise cache eviction).
 
+Work cut from a change is tracked in [docs/deferred-work.md](docs/deferred-work.md),
+and what WaxSeal wants from the sibling repos it depends on in
+[docs/upstream-requests.md](docs/upstream-requests.md).
+
 ## License
 
 MIT. Implemented independently. The GPL-3.0 bgutil project is a behavioral and
