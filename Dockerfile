@@ -7,7 +7,7 @@
 # capabilities and disable privilege escalation.
 
 # build
-FROM golang:1.26-bookworm AS build
+FROM golang:1.26-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 # The RUNs below mount Go's module and build caches so rebuilds reuse them. The
@@ -26,17 +26,19 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /out/waxseal ./cmd/waxseal
 
 # runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # Chromium renders WebGL with its own bundled SwiftShader because --disable-gpu is
-# set, so the system Mesa/LLVM software-GL stack is never loaded at runtime.
-# chromium-common declares those packages as a dependency, so force-purge them after
-# the install to drop 218 MB (1.09 GB with them, 872 MB without). The daemon never
-# runs apt again, so the unmet-dependency note this leaves in the dpkg database has
-# no runtime effect.
+# set (unconditional in internal/cdp/launch.go), so the Mesa/LLVM stack chromium
+# pulls in is never loaded. Force-purging it drops 272 MB (1.15 GB with it, 878 MB
+# without); the dangling dlopen targets and the dpkg unmet-dependency note this
+# leaves behind have no runtime effect. Recheck these names on a base-image bump:
+# they are release specific (bookworm had libllvm15, no mesa-libgallium), and dpkg
+# --purge exits 0 with only a warning for a package that is not installed, so a
+# stale list silently stops saving anything.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
- && dpkg --purge --force-depends libgl1-mesa-dri libllvm15 libz3-4 \
+ && dpkg --purge --force-depends libgl1-mesa-dri mesa-libgallium libllvm19 libz3-4 \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with a writable HOME (the browser profile lives under $HOME).
