@@ -27,11 +27,6 @@ jobs:
       # provider/ module, which the job below builds, vets, and tests on its own.
       - run: make fmt-check
       - run: go vet ./...
-      # Windows compiles but does not run: the CDP pipe transport needs Unix fd
-      # inheritance. The cross matrix is linux and darwin, so proc_windows.go in
-      # internal/browser and internal/cdp is otherwise built nowhere. Vetting for
-      # windows is what keeps those two files from silently rotting.
-      - run: GOOS=windows go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
       # guaranteed present, not incidental to the ubuntu-latest image. From the
@@ -70,15 +65,63 @@ jobs:
       - working-directory: provider
         run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test -race ./...
 
+  # The Windows transport (named pipes, handle inheritance, the job object, the
+  # exclusive-open profile lock) has no Unix equivalent, and the dev box is WSL,
+  # so this job is the only thing that runs it. The live tests need a browser,
+  # which setup-chrome only has for amd64. -race is windows/amd64 only, so the
+  # flag is a matrix value; hardcoded, the Arm leg would refuse to run at all.
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            live: true
+            race: "-race"
+          - runner: windows-11-arm
+            live: false
+            race: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            provider/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ${{ matrix.race }} ./...
+      - name: provider offline tests
+        working-directory: provider
+        run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test ${{ matrix.race }} ./...
+      - id: setup-chrome
+        if: matrix.live
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        with:
+          chrome-version: stable
+      # The one check that the io-pipes transport actually drives a real browser
+      # on this platform. WAXSEAL_REQUIRE_CHROME makes a missing browser a failure
+      # rather than a skip, so the coverage cannot be lost quietly.
+      - name: CDP live tests (real Chrome, io-pipes transport)
+        if: matrix.live
+        env:
+          WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          WAXSEAL_REQUIRE_CHROME: "1"
+        run: go test -race -tags live ./internal/cdp
+
   # Cross-compile the pure Go CLI and daemon for the supported targets. Each
-  # binary drives an external Chromium at runtime. Windows is excluded: it
-  # compiles, but the CDP pipe transport does not run there.
+  # binary drives an external Chromium or Chrome at runtime. The windows job
+  # above builds, vets, and tests those binaries natively; this matrix is the
+  # cross-compilation check.
   cross:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, darwin]
+        goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,12 +157,27 @@ jobs:
   # makes that hold: the page comes from a loopback server the command runs itself,
   # so nothing outside the container is reachable and a red build here means the
   # image is broken.
+  #
+  # Both architectures build on their own native runner. Going through `make
+  # docker-build` exercises the release's own path, and `--pull=never` keeps the
+  # probe on the image that build just produced.
   docker:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: DOCKER_BUILDKIT=1 docker build -t waxseal:ci .
+      - run: make docker-build VERSION=ci
       - name: the built image can start a renderer and complete a navigation
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker run --rm --network none --shm-size=1gb --entrypoint waxseal waxseal:ci \
+          docker run --rm --network none --shm-size=1gb --pull=never \
+            --entrypoint waxseal "ghcr.io/colespringer/waxseal:ci-$ARCH" \
             doctor --stop-after-load

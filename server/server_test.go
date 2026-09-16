@@ -749,7 +749,16 @@ func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browse
 	if f.pcErr != nil {
 		return browser.PlayerContext{}, f.pcErr
 	}
-	return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
+	return browser.PlayerContext{
+		PlayabilityStatus:     "OK",
+		ServerAbrStreamingURL: f.abrURL,
+		VisitorData:           f.vd,
+		ChannelID:             "UCfake",
+		Description:           "a fake description",
+		Thumbnails:            []browser.Thumbnail{{URL: "https://i.ytimg.com/vi/x/default.jpg", Width: 120, Height: 90}},
+		IsLiveContent:         true,
+		PublishDate:           "2015-04-10",
+	}, nil
 }
 func (f *fakePlayerSession) EnsureEstablished(ctx context.Context) error {
 	if f.establishBlocks {
@@ -806,6 +815,27 @@ func TestPlayerContextEchoesGeneration(t *testing.T) {
 	}
 	if resp["session_generation"] != float64(1) {
 		t.Errorf("session_generation = %v, want 1", resp["session_generation"])
+	}
+	// The metadata fields are embedded the same way, so a nested "player_context"
+	// object would show up here as a missing top-level key.
+	for key, want := range map[string]any{
+		"channel_id":      "UCfake",
+		"description":     "a fake description",
+		"is_live_content": true,
+		"is_live_now":     false,
+		"is_upcoming":     false,
+		"publish_date":    "2015-04-10",
+	} {
+		if resp[key] != want {
+			t.Errorf("%s = %v, want %v (embedded fields must stay top-level)", key, resp[key], want)
+		}
+	}
+	thumbs, ok := resp["thumbnails"].([]any)
+	if !ok || len(thumbs) != 1 {
+		t.Fatalf("thumbnails = %v, want one rung", resp["thumbnails"])
+	}
+	if rung := thumbs[0].(map[string]any); rung["url"] == "" || rung["width"] != float64(120) {
+		t.Errorf("thumbnail rung = %v, want the fake ladder entry", rung)
 	}
 }
 

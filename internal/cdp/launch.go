@@ -2,10 +2,8 @@ package cdp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"sort"
 	"time"
@@ -17,6 +15,8 @@ const defaultLaunchTimeout = 60 * time.Second
 
 // waitDelay bounds how long cmd.Wait blocks on the stderr-copy goroutine after the
 // process has exited, so a lingering child holding fd 2 cannot block the reaper.
+// It doubles as waitExited's budget: it is the longest a reap can legitimately
+// take once the process itself is gone.
 const waitDelay = 5 * time.Second
 
 // SpawnOptions configures Spawn.
@@ -80,9 +80,6 @@ func BuildArgs(profileDir string, headful bool) []string {
 // closes the pipes, so failed starts do not leave the launched process running.
 // The caller owns Browser.Close.
 func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*Browser, error) {
-	if !platformSupported {
-		return nil, errors.New("cdp: pipe transport unsupported on Windows")
-	}
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -94,49 +91,56 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 		stderrMax = defaultStderrMax
 	}
 
-	// Pipe A: parent writes commands -> child reads fd 3.
-	// Pipe B: child writes fd 4 -> parent reads responses/events.
-	aR, aW, err := os.Pipe()
+	// The command pipe carries commands from this process to Chromium; the event
+	// pipe carries responses and events back. How each pair is built, and how
+	// Chromium is told where to find its ends, is the one platform difference in
+	// this package: Unix passes fd 3 and fd 4, Windows passes two inherited handle
+	// values in the argv. Both are the guard's business.
+	cmdPipe, err := newPipePair(pipeParentWrites, false)
 	if err != nil {
 		return nil, fmt.Errorf("cdp: command pipe: %w", err)
 	}
-	bR, bW, err := os.Pipe()
+	evtPipe, err := newPipePair(pipeParentReads, false)
 	if err != nil {
-		_ = aR.Close()
-		_ = aW.Close()
+		cmdPipe.close()
 		return nil, fmt.Errorf("cdp: event pipe: %w", err)
 	}
 
 	cmd := exec.Command(bin, args...)
-	cmd.ExtraFiles = []*os.File{aR, bW} // child fd 3 = aR, fd 4 = bW
 	stderr := &ringBuffer{max: stderrMax}
 	cmd.Stderr = stderr
 	// Stderr uses a ringBuffer, so os/exec copies from a pipe in a goroutine that
 	// Wait joins. If a Chromium helper inherits fd 2 and outlives the main process,
 	// that pipe can stay open after the parent exits. WaitDelay bounds the join.
 	cmd.WaitDelay = waitDelay
-	setSysProcAttr(cmd)
+	guard := newProcGuard(opts.Logger)
+	guard.attach(cmd, cmdPipe, evtPipe)
 
 	if err := cmd.Start(); err != nil {
-		_ = aR.Close()
-		_ = aW.Close()
-		_ = bR.Close()
-		_ = bW.Close()
+		cmdPipe.close()
+		evtPipe.close()
+		guard.release()
 		return nil, fmt.Errorf("cdp: start chromium: %w", err)
 	}
+	guard.started(cmd)
 	// Close the parent's copies of the child-side ends. A lingering child-side
 	// write end would keep the event pipe from ever reaching EOF on Chromium exit.
-	_ = aR.Close()
-	_ = bW.Close()
+	// Both ends stayed referenced until here so os.NewFile's finalizer could not
+	// close a descriptor Chromium was about to inherit.
+	cmdPipe.closeChild()
+	evtPipe.closeChild()
 
-	c := newConn(cmd, aW, bR, opts.Logger)
+	c := newConn(cmd, cmdPipe.parent, evtPipe.parent, opts.Logger)
+	c.guard = guard
 	go c.readLoop()
 	go func() {
 		// Reap the process and signal exit even if the read loop has not yet seen
 		// EOF (e.g. the process was group-killed). Record the reap before tearing
-		// down so killProcessGroup never signals a PID the OS may have recycled.
+		// down so killProcess never signals a PID the OS may have recycled.
 		_ = cmd.Wait()
 		c.procExited.Store(true)
+		guard.release()
+		close(c.exited)
 		c.teardown(fmt.Errorf("%w: process exited", ErrConnClosed))
 	}()
 
@@ -145,6 +149,15 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 	defer cancel()
 	if _, err := b.Context(hctx).Version(); err != nil {
 		c.forceClose(fmt.Errorf("version handshake: %w", err))
+		// Wait for the reap before reporting the failure. The caller removes the
+		// profile directory on the next line, and a Chromium that has been killed
+		// but not yet reaped still holds it open. ctx is deliberately not used:
+		// an expired caller deadline is one of the reasons the handshake fails, and
+		// it must not turn this wait into a no-op.
+		if !c.waitExited(context.Background()) {
+			opts.Logger.Warn("cdp: chromium was not reaped after a failed handshake; the profile may not remove cleanly",
+				"budget", waitDelay, "pid", c.pid())
+		}
 		return nil, fmt.Errorf("cdp: launch handshake: %w (stderr tail: %q)", err, tail(stderr.String(), 600))
 	}
 	return b, nil

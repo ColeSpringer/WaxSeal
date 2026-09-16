@@ -145,6 +145,16 @@ func TestPlayerContext(t *testing.T) {
 			"visitor_data":             "VD",
 			"client_version":           "2.0",
 			"session_generation":       3,
+			"channel_id":               "UCabc",
+			"description":              "line one\nline two",
+			"is_live_content":          true,
+			"is_live_now":              false,
+			"is_upcoming":              false,
+			"publish_date":             "2015-04-10T00:00:00-07:00",
+			"thumbnails": []map[string]any{
+				{"url": "https://i.ytimg.com/vi/VID/default.jpg", "width": 120, "height": 90},
+				{"url": "https://i.ytimg.com/vi/VID/maxresdefault.jpg", "width": 1280, "height": 720},
+			},
 			"audio_formats": []map[string]any{
 				{"itag": 251, "lmt": "1719185012384481", "mime_type": "audio/webm", "bitrate": 130000, "content_length": 1234, "audio_quality": "AUDIO_QUALITY_MEDIUM"},
 			},
@@ -171,6 +181,20 @@ func TestPlayerContext(t *testing.T) {
 	}
 	if len(pc.AudioFormats) != 1 || pc.AudioFormats[0].Itag != 251 || pc.AudioFormats[0].MimeType != "audio/webm" {
 		t.Errorf("audio formats = %+v", pc.AudioFormats)
+	}
+	if pc.ChannelID != "UCabc" || pc.Description != "line one\nline two" {
+		t.Errorf("channel_id = %q, description = %q", pc.ChannelID, pc.Description)
+	}
+	if !pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
+		t.Errorf("live flags = %v/%v/%v, want true/false/false", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+	}
+	if pc.PublishDate != "2015-04-10T00:00:00-07:00" {
+		t.Errorf("publish_date = %q", pc.PublishDate)
+	}
+	// The ladder arrives in the server's order and is not re-sorted by the client.
+	if len(pc.Thumbnails) != 2 || pc.Thumbnails[0].Width != 120 || pc.Thumbnails[1].Height != 720 ||
+		pc.Thumbnails[1].URL != "https://i.ytimg.com/vi/VID/maxresdefault.jpg" {
+		t.Errorf("thumbnails = %+v", pc.Thumbnails)
 	}
 }
 

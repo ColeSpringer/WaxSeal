@@ -555,3 +555,58 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 		t.Errorf("good id playability_status = %q, want OK", pc.PlayabilityStatus)
 	}
 }
+
+// TestPlayerContextMetadataLive checks that the metadata WaxTap asked for
+// arrives from a real player response, not just from the wire structs. The
+// landing page is the watch page, so the player's own /player response is a WEB
+// response and carries a microformat; the publish-date assertion still hedges,
+// because a response without one is legal and leaves the field empty.
+func TestPlayerContextMetadataLive(t *testing.T) {
+	base := startColdDaemon(t)
+	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	pc, err := c.PlayerContext(ctx, bbbVideoID)
+	if err != nil {
+		t.Fatalf("PlayerContext(%s): %v", bbbVideoID, err)
+	}
+
+	if !strings.HasPrefix(pc.ChannelID, "UC") {
+		t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
+	}
+	if pc.Description == "" {
+		t.Error("description is empty; videoDetails.shortDescription was not read")
+	}
+	if len(pc.Thumbnails) == 0 {
+		t.Error("thumbnails is empty; the ladder was not read")
+	}
+	for i, th := range pc.Thumbnails {
+		if th.URL == "" {
+			t.Errorf("thumbnails[%d] has no url", i)
+		}
+		if th.Width <= 0 || th.Height <= 0 {
+			t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+		}
+	}
+	// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
+	if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
+		t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+	}
+	switch {
+	case pc.PublishDate == "":
+		t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
+	default:
+		if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
+			if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
+				t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
+			} else {
+				t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+			}
+		} else {
+			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+		}
+	}
+	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d",
+		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails))
+}

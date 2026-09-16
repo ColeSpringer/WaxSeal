@@ -12,14 +12,15 @@ on:
       - 'v*'
 
 jobs:
-  # Build the version-stamped Linux and macOS binaries and attach them, plus a
-  # SHA256SUMS manifest, to the release for the tag. Normally the release is
+  # Build the version-stamped Linux, macOS, and Windows binaries and attach them,
+  # plus a SHA256SUMS manifest, to the release for the tag. Normally the release is
   # already there, published by hand with written notes, and it keeps its body
   # and just gains the assets. Only if none exists (a tag pushed straight with
   # `git push`) is one created here, as a draft with an empty body, so a human
   # writes the notes and publishes it; this workflow never publishes a release
   # on its own. The binaries embed the committed JS bundle but need a system
-  # Chromium at runtime.
+  # Chromium or Chrome at runtime. RELEASE_PLATFORMS in the Makefile is the list;
+  # the cross job in ci.yml compiles the same set on every push.
   binaries:
     runs-on: ubuntu-latest
     permissions:
@@ -61,27 +62,25 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             dist/waxseal-* dist/SHA256SUMS.txt --clobber
 
-  # Build and push the runtime image (VERSION and, for a stable release,
-  # latest) to GHCR with the built-in token. This does not reuse `make
-  # docker-push`: that target's login and scope checks are written for a
-  # human's gh OAuth token, which the Actions GITHUB_TOKEN is not, and `make
-  # docker-build` has no such checks. Bypassing `make docker-push` also
-  # bypasses its `PUSH_LATEST` guard (Makefile), so the push step below
-  # reimplements that gate directly: `:latest` moves only when the tag's
-  # version has no semver prerelease suffix, so a release candidate such as
-  # v1.2.0-rc1 is pushed under its own tag but never repoints the public
-  # `:latest`. Single platform (linux/amd64), matching the manual release; add
-  # buildx for multi-arch later.
+  # One per-architecture tag per platform, each built and smoke-tested on its own
+  # native runner; the `manifest` job assembles the plain VERSION tag from them.
+  # `make docker-push` is not reused because its gh OAuth scope check rejects the
+  # Actions token, but `make docker-build` is, so the tagging lives in one place.
   #
-  # The same image smoke test the CI workflow runs sits between the build and
-  # the first push. CI never sees a tag push, and this build resolves
-  # `apt-get install chromium` fresh, so without the probe here a release
-  # could publish an image that no run of any workflow ever started.
-  # `--pull=never` on the probe keeps it honest: the image under test can only
-  # be the one `make docker-build` just produced, never a same-tagged image
-  # pulled back down from GHCR now that this job is logged in.
+  # The smoke test matters here and not only in CI: CI never sees a tag push, and
+  # this build resolves `apt-get install chromium` fresh, so without it a release
+  # could publish an image no workflow ever started. `--pull=never` keeps the
+  # probe on the local build now that this job is logged in to GHCR.
   image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
       packages: write
     steps:
@@ -99,15 +98,46 @@ jobs:
       - name: build the image
         run: make docker-build VERSION="$VERSION"
       - name: the built image can start a renderer and complete a navigation
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           docker run --rm --network none --shm-size=1gb --pull=never \
-            --entrypoint waxseal "ghcr.io/colespringer/waxseal:$VERSION" \
+            --entrypoint waxseal "ghcr.io/colespringer/waxseal:$VERSION-$ARCH" \
             doctor --stop-after-load
-      - name: push
+      - name: push the per-arch tag
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker push "ghcr.io/colespringer/waxseal:$VERSION-$ARCH"
+
+  # Assemble the plain VERSION tag from the per-arch tags, and move :latest for a
+  # stable release. The prerelease gate lives here because this is the job that
+  # owns :latest: it moves only when the tag's version has no semver prerelease
+  # suffix, so a release candidate such as v1.2.0-rc1 is published under its own
+  # tag but never repoints the public `:latest`. `make docker-manifest` inspects
+  # what it published and fails unless every architecture is present, so a
+  # half-assembled manifest cannot pass as multi-arch.
+  manifest:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: compute VERSION
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: assemble the multi-arch tag
         run: |
-          docker push "ghcr.io/colespringer/waxseal:$VERSION"
           # Build metadata after + can contain hyphens and is not a prerelease; strip it first.
           case "${VERSION%%+*}" in
-            *-*) echo "prerelease $VERSION; :latest not moved" ;;
-            *)   docker push "ghcr.io/colespringer/waxseal:latest" ;;
+            *-*) push_latest=0; echo "prerelease $VERSION; :latest will not be moved" ;;
+            *)   push_latest=1 ;;
           esac
+          # docker-manifest itself would run make's docker-login, which checks a
+          # human's gh OAuth scopes and would reject the Actions token. This job
+          # has already logged in, so it calls the already-authenticated variant.
+          make docker-manifest-authed VERSION="$VERSION" PUSH_LATEST="$push_latest"

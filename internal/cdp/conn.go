@@ -1,12 +1,14 @@
 // Package cdp is a small standard-library Chrome DevTools Protocol client. It
-// drives Chromium over --remote-debugging-pipe: Chromium reads commands on fd 3,
-// writes responses and events on fd 4, and frames messages as NUL-delimited JSON.
-// The package preserves the request JSON and Chromium argv that WaxSeal's browser
-// fingerprint depends on.
+// drives Chromium over --remote-debugging-pipe, framing messages as NUL-delimited
+// JSON. The package preserves the request JSON and Chromium argv that WaxSeal's
+// browser fingerprint depends on.
 //
-// The package must not import internal/browser. Linux (and other Unix) is the
-// supported runtime target; Windows compiles but Spawn returns an error because
-// exec.Cmd.ExtraFiles cannot pass the pipe fds there.
+// Two transports, one protocol. Unix passes an anonymous pair as the child's fd 3
+// and fd 4, where --remote-debugging-pipe looks by convention; Windows has no such
+// convention and no pollable anonymous pipe, so the pair is two overlapped named
+// pipes named in the argv. Everything above the pipe is identical.
+//
+// The package must not import internal/browser.
 package cdp
 
 import (
@@ -108,9 +110,21 @@ type subscription struct {
 // loop, the pending-response map, and the event router.
 type Conn struct {
 	cmd   *exec.Cmd
-	wpipe *os.File // parent writes commands here (child fd 3)
-	rpipe *os.File // parent reads responses/events here (child fd 4)
+	wpipe *os.File // parent writes commands here; the child reads them
+	rpipe *os.File // parent reads responses and events here; the child writes them
 	log   *slog.Logger
+
+	// guard owns the platform's process-lifetime mechanism (a Unix process group,
+	// a Windows job object). It is nil for a Conn a test built directly, so every
+	// use goes through killProcess.
+	guard *procGuard
+
+	// exited is closed by the reaper once cmd.Wait has returned. Callers that
+	// remove the profile directory right after teardown wait on it so they are not
+	// racing files Chromium still has open. Only Spawn starts that reaper, so on a
+	// Conn built without a process the channel is never closed; that is why
+	// waitExited keys off cmd rather than off this channel.
+	exited chan struct{}
 
 	// procExited is set by the reaper once cmd.Wait has returned. After that the OS
 	// may recycle the PID, so the process group must no longer be signaled.
@@ -133,6 +147,10 @@ type Conn struct {
 	nextSub int
 
 	closeBrowserOnce sync.Once
+
+	// warnDeadlineOnce keeps a pipe that refuses write deadlines to one log line
+	// rather than one per frame.
+	warnDeadlineOnce sync.Once
 }
 
 // newConn initializes the channels used by Conn. Tests should use it too; a
@@ -144,6 +162,7 @@ func newConn(cmd *exec.Cmd, wpipe, rpipe *os.File, log *slog.Logger) *Conn {
 		rpipe:    rpipe,
 		log:      log,
 		closeCh:  make(chan struct{}),
+		exited:   make(chan struct{}),
 		pending:  make(map[int64]chan rpcResult),
 		writeSem: make(chan struct{}, 1),
 	}
@@ -373,7 +392,15 @@ func (c *Conn) write(ctx context.Context, data []byte) error {
 		return c.closeErr
 	default:
 	}
-	_ = c.wpipe.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if derr := c.wpipe.SetWriteDeadline(time.Now().Add(writeTimeout)); derr != nil {
+		// A pipe that cannot take a deadline leaves the write unbounded, so the
+		// 10 s stall guard is silently gone. That should be impossible (Windows
+		// proves the association when it builds the pair, and Unix pipes are always
+		// pollable), which is exactly why it is worth one line if it ever happens.
+		c.warnDeadlineOnce.Do(func() {
+			c.log.Warn("cdp: command pipe does not support write deadlines; the write-stall guard is inactive", "err", derr)
+		})
+	}
 	if _, err := c.wpipe.Write(data); err != nil {
 		werr := fmt.Errorf("cdp: write: %w", err)
 		c.forceClose(werr)
@@ -408,8 +435,12 @@ func (c *Conn) unsubscribe(s *subscription) {
 	c.subMu.Unlock()
 }
 
-// closePipes closes the parent ends, which lets Chromium read EOF on fd 3 and
-// exit, and unblocks the read loop and cmd.Wait.
+// closePipes closes the parent ends, which lets Chromium read EOF on its command
+// pipe and exit, and unblocks the read loop and cmd.Wait. Both platforms rely on
+// Close waking a parked reader: on Unix the poller does it, and on Windows the
+// parent ends are overlapped files the runtime registered with IOCP, so Close
+// cancels the pending overlapped read rather than leaving the goroutine stuck
+// until data arrives.
 func (c *Conn) closePipes() {
 	if c.wpipe != nil {
 		_ = c.wpipe.Close()
@@ -419,15 +450,16 @@ func (c *Conn) closePipes() {
 	}
 }
 
-// killProcessGroup SIGKILLs Chromium's process group, unless the process has
-// already been reaped. Once cmd.Wait has returned, the OS may have recycled the
-// PID, so signaling -pid could hit an unrelated process group; and when the
-// process is already gone there is nothing left to kill.
-func (c *Conn) killProcessGroup() {
-	if c.procExited.Load() {
+// killProcess terminates Chromium the way this platform does it (a SIGKILL to the
+// process group on Unix, a job-object termination on Windows), unless the process
+// has already been reaped. Once cmd.Wait has returned, the OS may have recycled
+// the PID, so a kill by pid could hit an unrelated process; and when the process
+// is already gone there is nothing left to kill.
+func (c *Conn) killProcess() {
+	if c.procExited.Load() || c.guard == nil {
 		return
 	}
-	killGroup(c.cmd)
+	c.guard.kill(c.cmd)
 }
 
 // forceClose terminates the process group, then tears down (which closes the pipes
@@ -435,7 +467,7 @@ func (c *Conn) killProcessGroup() {
 // the handshake-timeout, write-stall, oversized-frame, and browser-close paths.
 // teardown keeps the sequence idempotent.
 func (c *Conn) forceClose(err error) {
-	c.killProcessGroup()
+	c.killProcess()
 	c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))
 }
 

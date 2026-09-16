@@ -79,20 +79,23 @@ func TestConnTeardownClosesPipes(t *testing.T) {
 // it reads outgoing requests from reqR and writes responses to respW.
 func newPipeConn(t *testing.T) (c *Conn, reqR *os.File, respW *os.File) {
 	t.Helper()
-	// Conn reads responses/events from rR (we write rW); Conn writes requests to wW
-	// (we read wR).
-	rR, rW, err := os.Pipe()
+	// Both pairs are built through the transport's own constructor so these tests
+	// run over the real thing on each platform, and both ask for a pollable child
+	// end: here the test stands in for Chromium, and it needs deadlines on the end
+	// Chromium would otherwise read and write synchronously.
+	resp, err := newPipePair(pipeParentReads, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wR, wW, err := os.Pipe()
+	req, err := newPipePair(pipeParentWrites, true)
 	if err != nil {
+		resp.close()
 		t.Fatal(err)
 	}
-	c = newConn(nil, wW, rR, slog.New(slog.DiscardHandler))
+	c = newConn(nil, req.parent, resp.parent, slog.New(slog.DiscardHandler))
 	go c.readLoop()
-	t.Cleanup(func() { _ = rR.Close(); _ = rW.Close(); _ = wR.Close(); _ = wW.Close() })
-	return c, wR, rW
+	t.Cleanup(func() { req.close(); resp.close() })
+	return c, req.child, resp.child
 }
 
 // readRequestID reads one NUL-delimited request frame and returns its id.

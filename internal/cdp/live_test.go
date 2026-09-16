@@ -1,4 +1,4 @@
-//go:build unix && live
+//go:build live
 
 package cdp
 
@@ -6,10 +6,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/colespringer/waxseal/internal/chromepath"
 )
 
 // These live tests exercise the pipe transport against a real Chromium. They
@@ -23,10 +25,7 @@ func findChrome(t *testing.T) string {
 	if b := os.Getenv("WAXSEAL_CHROME_BIN"); b != "" {
 		return b
 	}
-	for _, p := range []string{
-		"/usr/bin/chromium-browser", "/usr/bin/chromium", "/snap/bin/chromium",
-		"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-	} {
+	for _, p := range chromepath.Candidates() {
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 			return p
 		}
@@ -42,10 +41,14 @@ func findChrome(t *testing.T) string {
 	return ""
 }
 
-// homeTmp returns a $HOME-rooted temp base because snap-confined Chromium cannot
-// open a profile under /tmp.
+// homeTmp returns a base directory for the test profile. On Unix it is rooted at
+// $HOME because snap-confined Chromium cannot open a profile under /tmp; Windows
+// has no such confinement, so the ordinary temp dir is the better neighbour.
 func homeTmp(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		return t.TempDir()
+	}
 	h, err := os.UserHomeDir()
 	if err != nil || h == "" {
 		return t.TempDir()
@@ -69,8 +72,6 @@ func spawnForTest(t *testing.T) *Browser {
 	t.Cleanup(func() { _ = b.Close() })
 	return b
 }
-
-func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
 func TestLiveVersionAndEval(t *testing.T) {
 	b := spawnForTest(t)
@@ -137,7 +138,7 @@ func TestLiveSigkillSelfHeal(t *testing.T) {
 	}
 
 	// Kill Chromium's process group leader and verify the transport notices.
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+	if err := killPID(pid); err != nil {
 		t.Fatalf("SIGKILL %d: %v", pid, err)
 	}
 
@@ -159,7 +160,7 @@ func TestLiveSigkillSelfHeal(t *testing.T) {
 func TestLivePipeEOFTerminatesChrome(t *testing.T) {
 	b := spawnForTest(t)
 	pid := b.PID()
-	if pid <= 0 || !alive(pid) {
+	if pid <= 0 || !processAlive(pid) {
 		t.Fatalf("process not alive before pipe close (pid=%d)", pid)
 	}
 
@@ -167,7 +168,7 @@ func TestLivePipeEOFTerminatesChrome(t *testing.T) {
 	_ = b.conn.wpipe.Close()
 
 	deadline := time.Now().Add(8 * time.Second)
-	for alive(pid) {
+	for processAlive(pid) {
 		if time.Now().After(deadline) {
 			t.Fatalf("Chromium (pid=%d) still alive 8s after command pipe EOF", pid)
 		}
@@ -261,7 +262,7 @@ func TestLiveWaitCrashConnLost(t *testing.T) {
 	go func() { done <- page.WaitCrash(context.Background()) }()
 	time.Sleep(200 * time.Millisecond) // allow WaitCrash to subscribe
 
-	_ = syscall.Kill(b.PID(), syscall.SIGKILL)
+	_ = killPID(b.PID())
 	select {
 	case reason := <-done:
 		if reason == "" {

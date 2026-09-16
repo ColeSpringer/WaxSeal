@@ -42,6 +42,25 @@ follow-up and remove both entries.
   `*client.APIError` with the code; one on the sidecar path sees the
   text.
 
+- **`potoken.PlayerContext` cannot carry the video's metadata.**
+  `/player-context` now returns `channel_id`, `description`, the
+  `thumbnails` ladder, `is_live_content`, `is_live_now`, `is_upcoming`,
+  and `publish_date` beside the title, author, and length, answering
+  WaxTap's own ask for them (its `docs/upstream-requests.md`, 2026-09-06;
+  WaxTap's deferred entry "Fill the web-context `Video`" is the consumer
+  half). `potoken.PlayerContext` has `Title`, `Author`, and
+  `LengthSeconds` only, so `provider.ProvidePlayerContext` maps those
+  three and drops the rest, and a Go consumer that goes through the
+  adapter still builds a `Video` with an empty `ChannelID` and
+  `Description`. Wanted: the seven fields on `potoken.PlayerContext`,
+  with the ladder in the order WaxSeal sends it (the player response's
+  own, smallest first) and the publish date as the raw string, since
+  WaxTap already parses RFC 3339 or `2006-01-02` on its `/player` path.
+  Shipped workaround: WaxTap's sidecar reads the JSON directly, so the
+  sidecar path needs nothing; only the adapter is short. Mapping the
+  fields and pinning them in `provider_test.go` is the WaxSeal-side
+  follow-up in deferred-work.md.
+
 - **`potoken.Session` cannot carry the attested identity's user agent or
   client version.** `/session` exports `user_agent` and `client_version`
   beside `visitor_data` and the cookies so that attestation, token

@@ -22,6 +22,7 @@ import (
 
 	"github.com/colespringer/waxseal/internal/botguard"
 	"github.com/colespringer/waxseal/internal/cdp"
+	"github.com/colespringer/waxseal/internal/chromepath"
 	"github.com/colespringer/waxseal/internal/httpx"
 	"github.com/colespringer/waxseal/internal/innertube"
 )
@@ -36,6 +37,19 @@ const playerContextTimeout = 25 * time.Second
 
 // playerContextPollInterval paces the player-context polling loops.
 const playerContextPollInterval = 300 * time.Millisecond
+
+// identityCaptureTimeout bounds how long captureIdentity polls ytcfg for
+// visitor_data. setupSession's navigation budget is the tighter bound when the
+// client-hint capture and the landing navigation have already spent most of it,
+// which is why captureIdentity clamps to the context's deadline.
+const identityCaptureTimeout = 30 * time.Second
+
+// clientVersionGrace bounds the extra wait for INNERTUBE_CLIENT_VERSION once
+// visitor_data has landed. Both fields come out of the same ytcfg blob and
+// normally appear together, so a few more polls is generous, while waiting the
+// whole capture budget would add 30s to setup on a page that never exposes the
+// version.
+const clientVersionGrace = 2 * time.Second
 
 // Pool recovery timings. The liveness timeout allows for a busy host, while the
 // capped relaunch backoff limits process creation during a crash loop.
@@ -163,16 +177,106 @@ type Identity struct {
 	STS           int    `json:"signature_timestamp"` // from base.js; required or /player returns UNPLAYABLE
 }
 
+// pageDriver is the slice of *cdp.Page a Session drives. Declaring it here
+// rather than exporting a hook lets the in-package tests script a page, so the
+// establish, confirm, proof, and identity-capture loops run offline in
+// milliseconds. Production always holds a cdpPage.
+type pageDriver interface {
+	// Context returns the same page bound to ctx for its CDP calls.
+	Context(ctx context.Context) pageDriver
+	Eval(js string, args ...any) (cdp.EvalResult, error)
+	Cookies(urls []string) ([]*cdp.Cookie, error)
+	Navigate(url string) error
+	WaitLoad() error
+	SetBypassCSP(enabled bool) error
+	SetUserAgentOverride(req *cdp.NetworkSetUserAgentOverride) error
+	WaitCrash(ctx context.Context) string
+}
+
+// cdpPage adapts *cdp.Page to pageDriver. Only Context needs a wrapper: the
+// concrete method returns *cdp.Page, and the interface returns pageDriver.
+type cdpPage struct{ *cdp.Page }
+
+func (p cdpPage) Context(ctx context.Context) pageDriver { return cdpPage{p.Page.Context(ctx)} }
+
+// timing collects the poll intervals and budgets the session's loops use. The
+// production values are in defaultTiming; a test shortens them so a loop that
+// waits on the page runs in milliseconds.
+type timing struct {
+	poll               time.Duration // interval between page polls
+	identityTimeout    time.Duration // whole-capture budget in captureIdentity
+	clientVersionGrace time.Duration // extra wait for INNERTUBE_CLIENT_VERSION after visitor_data lands
+	establishTimeout   time.Duration // load-and-establish budget for one video
+	confirmBudget      time.Duration // per-request seek-and-confirm budget
+	reReadBudget       time.Duration // post-confirm extraction budget
+	probeBudget        time.Duration // session-proof confirm budget
+	stallWindow        time.Duration // maximum time without playback or buffer progress
+	hardTimeout        time.Duration // bounds a whole proveFullLength call
+}
+
+// withDefaults fills any unset field from the production values. The zero value
+// of a duration here would be actively harmful rather than merely wrong: a zero
+// poll makes time.After fire immediately, so a loop reading it spins the CPU
+// instead of pacing. Reading timing through this keeps a Session built outside
+// setupSession, which is every Session a test constructs by hand, safe to drive.
+func (t timing) withDefaults() timing {
+	d := defaultTiming()
+	for _, f := range []struct {
+		dst *time.Duration
+		def time.Duration
+	}{
+		{&t.poll, d.poll},
+		{&t.identityTimeout, d.identityTimeout},
+		{&t.clientVersionGrace, d.clientVersionGrace},
+		{&t.establishTimeout, d.establishTimeout},
+		{&t.confirmBudget, d.confirmBudget},
+		{&t.reReadBudget, d.reReadBudget},
+		{&t.probeBudget, d.probeBudget},
+		{&t.stallWindow, d.stallWindow},
+		{&t.hardTimeout, d.hardTimeout},
+	} {
+		if *f.dst <= 0 {
+			*f.dst = f.def
+		}
+	}
+	return t
+}
+
+// tuning is how every loop reads its intervals and budgets. It never returns a
+// non-positive duration; see timing.withDefaults.
+func (s *Session) tuning() timing { return s.timing.withDefaults() }
+
+// defaultTiming returns the production values. Every field is a named constant
+// so a change is made in one place and read by both the loops and the tests.
+func defaultTiming() timing {
+	return timing{
+		poll:               playerContextPollInterval,
+		identityTimeout:    identityCaptureTimeout,
+		clientVersionGrace: clientVersionGrace,
+		establishTimeout:   playerContextTimeout,
+		confirmBudget:      playerContextConfirmBudget,
+		reReadBudget:       playerContextReReadBudget,
+		probeBudget:        fullLengthProbeBudget,
+		stallWindow:        fullLengthStallWindow,
+		hardTimeout:        fullLengthHardTimeout,
+	}
+}
+
 // Session owns a Chromium page with the browser bundle installed. Its Go HTTP
 // client uses the page's cookies so att/get and GenerateIT share the browser's
 // session and egress IP.
 type Session struct {
 	browser *cdp.Browser
-	page    *cdp.Page
+	page    pageDriver
 	dispose func() // closes the browser from Launch or the context from Pool
 	id      Identity
 	client  *httpx.Client // egresses with the browser's cookies
 	log     *slog.Logger
+
+	// timing holds the intervals and budgets the polling loops read, so an
+	// offline test can run them in milliseconds. Production sessions get
+	// defaultTiming.
+	timing timing
 
 	// landingVideo is the watch video used to initialize the session. Establishment
 	// falls back to DefaultVideo when this video is too short for the proof.
@@ -265,19 +369,10 @@ type profileHandle struct {
 	lock *os.File
 }
 
-// cleanup removes the profile directory before releasing its advisory lock. That
-// order matters because ReapStaleProfiles runs at daemon startup and can race a
-// different process tearing a profile down. Holding the lock until creator.pid is
-// gone keeps the reaper from acting on a half-removed directory. It is safe on a
-// zero-value handle.
-func (h profileHandle) cleanup() {
-	if h.dir != "" {
-		_ = os.RemoveAll(h.dir)
-	}
-	if h.lock != nil {
-		_ = h.lock.Close()
-	}
-}
+// cleanup removes the profile directory and releases its lock. The order is
+// per-platform (see cleanupProfile) because the two systems disagree about
+// whether a locked file can be deleted. It is safe on a zero-value handle.
+func (h profileHandle) cleanup() { cleanupProfile(h) }
 
 // launchChromium starts Chromium over a CDP pipe. The caller must close the
 // returned browser and call profileHandle.cleanup to remove the profile and
@@ -294,7 +389,7 @@ func launchChromium(opts Options) (*cdp.Browser, profileHandle, error) {
 	opts.Logger.Info("waxseal: launching chromium", "bin", bin, "headful", opts.Headful)
 
 	// Snap-confined Chromium can only write a user-data-dir under $HOME, not /tmp.
-	profileDir, err := os.MkdirTemp(homeTmpBase(), profilePrefix)
+	profileDir, err := os.MkdirTemp(profileBase(), profilePrefix)
 	if err != nil {
 		return nil, profileHandle{}, fmt.Errorf("waxseal: temp profile: %w", err)
 	}
@@ -328,7 +423,7 @@ const launchTimeout = 60 * time.Second
 // opts.LandingURL replaces the watch page, and opts.StopAfterLoad returns right
 // after the load event, so a caller can exercise launch and navigation alone.
 func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options, uaCache *uaOverrideCache) (_ *Session, err error) {
-	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID}
+	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID, timing: defaultTiming()}
 
 	// Bind page creation (createTarget/attachToTarget/Page.enable) to the caller's
 	// ctx so an alive-but-unresponsive Chromium cannot hang setup past the deadline.
@@ -336,7 +431,7 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 	if err != nil {
 		return nil, fmt.Errorf("waxseal: new page: %w", err)
 	}
-	s.page = page.Context(ctx)
+	s.page = cdpPage{page}.Context(ctx)
 
 	// Bypass CSP so the injected bundle's new Function(interpreter) can run on the
 	// youtube.com origin (which otherwise forbids unsafe-eval).
@@ -782,21 +877,36 @@ func (p *Pool) Close() {
 	inst.teardown()
 }
 
+// identityCaptureJS reads the ytcfg fields that make up a session identity. It is
+// a package-level constant so the offline page fake can key its scripted results
+// on it the way it keys on the player snippets.
+const identityCaptureJS = `() => {
+	const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : (window.ytcfg || null);
+	const ctxData = c && c.get ? c.get('INNERTUBE_CONTEXT') : null;
+	return JSON.stringify({
+		vd:   (c && c.get && (c.get('VISITOR_DATA') || (ctxData && ctxData.client && ctxData.client.visitorData))) || "",
+		cv:   (c && c.get && c.get('INNERTUBE_CLIENT_VERSION')) || "",
+		key:  (c && c.get && c.get('INNERTUBE_API_KEY')) || "",
+		ua:   navigator.userAgent || "",
+		wd:   navigator.webdriver === true,
+	});
+}`
+
 // captureIdentity polls ytcfg after the SPA boots and records visitor_data, the
 // client version, the API key, navigator.userAgent, and navigator.webdriver.
 func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
-	const js = `() => {
-		const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : (window.ytcfg || null);
-		const ctxData = c && c.get ? c.get('INNERTUBE_CONTEXT') : null;
-		return JSON.stringify({
-			vd:   (c && c.get && (c.get('VISITOR_DATA') || (ctxData && ctxData.client && ctxData.client.visitorData))) || "",
-			cv:   (c && c.get && c.get('INNERTUBE_CLIENT_VERSION')) || "",
-			key:  (c && c.get && c.get('INNERTUBE_API_KEY')) || "",
-			ua:   navigator.userAgent || "",
-			wd:   navigator.webdriver === true,
-		});
-	}`
-	deadline := time.Now().Add(30 * time.Second)
+	// The capture budget is its own, but setupSession shares one navigation budget
+	// across the client-hint capture, the landing navigation, this capture, and the
+	// signature timestamp, so ctx is often the tighter bound. Clamp to it, leaving
+	// two polls of room, so the pinned-version fallback below still has a poll to
+	// fire in instead of the loop dying on a bare context error.
+	tm := s.tuning()
+	deadline := time.Now().Add(tm.identityTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if clamped := ctxDeadline.Add(-2 * tm.poll); clamped.Before(deadline) {
+			deadline = clamped
+		}
+	}
 	var ident struct {
 		VD, CV, Key, UA string
 		WD              bool
@@ -808,17 +918,11 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 	// that never exposes INNERTUBE_CLIENT_VERSION still yields a usable session
 	// instead of failing over one late field.
 	//
-	// clientVersionGrace bounds that extra wait. Both fields come out of the same
-	// ytcfg blob and normally appear together, so a few more polls is generous,
-	// while waiting the whole deadline would add 30s to setup on a page that never
-	// exposes the version, and setupSession's navigation budget covers the
-	// client-hint capture, navigation, this capture, and the signature timestamp
-	// in 45s total.
-	const clientVersionGrace = 2 * time.Second
+	// timing.clientVersionGrace bounds that extra wait.
 	var cvDeadline time.Time // set once visitor_data lands with no client version
 	page := s.page.Context(ctx)
 	for {
-		obj, err := page.Eval(js)
+		obj, err := page.Eval(identityCaptureJS)
 		if err == nil {
 			var raw struct {
 				VD  string `json:"vd"`
@@ -833,7 +937,7 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 					break
 				}
 				if cvDeadline.IsZero() {
-					cvDeadline = time.Now().Add(clientVersionGrace)
+					cvDeadline = time.Now().Add(tm.clientVersionGrace)
 				}
 			}
 		}
@@ -865,7 +969,7 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(tm.poll):
 		}
 	}
 	cookies, err := page.Cookies([]string{"https://www.youtube.com"})
@@ -1428,21 +1532,49 @@ func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, erro
 // with PlayerURL before starting the stream.
 //
 // client.PlayerContext mirrors this wire format without importing the browser
-// package. Keep the JSON tags in sync.
+// package, with one addition: the server embeds this struct and adds
+// session_generation, so the client type carries that field too. Keep the JSON
+// tags of the shared fields in sync.
 type PlayerContext struct {
 	// PlayabilityStatus is playabilityStatus.status, which is "OK" when the video
 	// is streamable. It is distinct from the SABR status-1 protection code embedded
 	// in ServerAbrStreamingURL.
-	PlayabilityStatus            string        `json:"playability_status"`
-	PlayerURL                    string        `json:"player_url"` // base.js URL used to descramble the SABR URL's n parameter
-	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
-	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
-	VisitorData                  string        `json:"visitor_data"`
-	ClientVersion                string        `json:"client_version"`
-	Title                        string        `json:"title"`
-	Author                       string        `json:"author"`
-	LengthSeconds                int           `json:"length_seconds"`
-	AudioFormats                 []AudioFormat `json:"audio_formats"`
+	PlayabilityStatus            string `json:"playability_status"`
+	PlayerURL                    string `json:"player_url"` // base.js URL used to descramble the SABR URL's n parameter
+	ServerAbrStreamingURL        string `json:"server_abr_streaming_url"`
+	VideoPlaybackUstreamerConfig string `json:"video_playback_ustreamer_config"`
+	VisitorData                  string `json:"visitor_data"`
+	ClientVersion                string `json:"client_version"`
+	Title                        string `json:"title"`
+	Author                       string `json:"author"`
+	LengthSeconds                int    `json:"length_seconds"`
+	ChannelID                    string `json:"channel_id"`  // videoDetails.channelId, the "UC..." owner id
+	Description                  string `json:"description"` // videoDetails.shortDescription
+	// Thumbnails is videoDetails.thumbnail.thumbnails in the player response's own
+	// order, which is smallest first. It is not reordered here because consumers
+	// sort it themselves. Never nil on the wire: an empty ladder is [].
+	Thumbnails []Thumbnail `json:"thumbnails"`
+	// IsLiveContent is videoDetails.isLiveContent: true for anything that was ever
+	// a broadcast, including a finished VOD.
+	IsLiveContent bool `json:"is_live_content"`
+	// IsLiveNow is true only while a broadcast is on air. It reads
+	// videoDetails.isLive as well as the microformat, deliberately broader than
+	// WaxTap's /player parse, so a response carrying no microformat still answers.
+	IsLiveNow bool `json:"is_live_now"`
+	// IsUpcoming is videoDetails.isUpcoming: a scheduled premiere or broadcast.
+	IsUpcoming bool `json:"is_upcoming"`
+	// PublishDate is the microformat's publishDate string, RFC 3339 or a bare
+	// 2006-01-02 date. It is empty when the player response carries no microformat.
+	PublishDate  string        `json:"publish_date"`
+	AudioFormats []AudioFormat `json:"audio_formats"`
+}
+
+// Thumbnail is one rung of videoDetails.thumbnail.thumbnails. Width and height
+// are zero when the player response omits them.
+type Thumbnail struct {
+	URL    string `json:"url"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
 }
 
 // AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
@@ -1542,6 +1674,10 @@ const playerContextExtractJS = `(videoId) => {
 		const buffered = (v && v.buffered && v.buffered.length) ? v.buffered.end(v.buffered.length - 1) : 0;
 		if (buffered <= 0) return JSON.stringify(Object.assign({ error: 'pending: session not established (no buffered media yet)' }, evidence));
 		const vd = j.videoDetails;
+		const mf = (j.microformat && j.microformat.playerMicroformatRenderer) || {};
+		const thumbs = ((vd.thumbnail && vd.thumbnail.thumbnails) || [])
+			.filter(function (t) { return t && t.url; })
+			.map(function (t) { return { url: t.url, width: Number(t.width || 0), height: Number(t.height || 0) }; });
 		const urc = (j.playerConfig && j.playerConfig.mediaCommonConfig && j.playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig) || {};
 		const ctxData = (c && c.get) ? c.get('INNERTUBE_CONTEXT') : null;
 		const playerJs = (c && c.get) ? (c.get('PLAYER_JS_URL') || '') : '';
@@ -1568,6 +1704,13 @@ const playerContextExtractJS = `(videoId) => {
 			visitor_data: visitorData,
 			client_version: (c && c.get) ? (c.get('INNERTUBE_CLIENT_VERSION') || '') : '',
 			title: vd.title || '', author: vd.author || '', length_seconds: Number(vd.lengthSeconds || 0),
+			channel_id: vd.channelId || '',
+			description: vd.shortDescription || '',
+			thumbnails: thumbs,
+			is_live_content: vd.isLiveContent === true,
+			is_live_now: vd.isLive === true || !!(mf.liveBroadcastDetails && mf.liveBroadcastDetails.isLiveNow),
+			is_upcoming: vd.isUpcoming === true,
+			publish_date: mf.publishDate || '',
 			audio_formats: audioFormats,
 		});
 	} catch (e) {
@@ -1651,7 +1794,8 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 
 	// Establish the requested video and prove its stream crosses the status-2
 	// preview cap before returning the context.
-	raw, err := s.establishStatus1(ctx, page, videoID, playerContextTimeout, playerContextConfirmBudget)
+	tm := s.tuning()
+	raw, err := s.establishStatus1(ctx, page, videoID, tm.establishTimeout, tm.confirmBudget)
 	if err != nil {
 		return PlayerContext{}, err
 	}
@@ -1669,6 +1813,12 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 	}
 	if err := validatePlayerContext(raw); err != nil {
 		return PlayerContext{}, err
+	}
+	// The ladder is documented as always present, so an absent one serializes as []
+	// rather than null. Unlike the fields validatePlayerContext gates, an empty
+	// description, ladder, or publish date is legal and never incomplete.
+	if raw.Thumbnails == nil {
+		raw.Thumbnails = []Thumbnail{}
 	}
 	return raw.PlayerContext, nil
 }
@@ -1733,29 +1883,38 @@ func (s *Session) revertPlayerContext(ctx context.Context) {
 // established context. Both PlayerContext and VerifyFullLength use this path so
 // the diagnostic probe exercises the same setup as the production endpoint. The
 // caller is responsible for restoring the shared page.
-func (s *Session) establish(ctx context.Context, page *cdp.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+func (s *Session) establish(ctx context.Context, page pageDriver, videoID string, deadline time.Time) (playerContextRaw, error) {
 	// Bind page Evals to the establish deadline. The loops below check the
 	// deadline only between Evals; without this, one Eval retrying after context
 	// loss could exceed the deadline while holding the tenant's mintMu.
 	ectx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	page = page.Context(ectx)
+	tm := s.tuning()
 	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
+	// A single CDP hiccup here is tolerated on the same three-strike rule phase 2
+	// and reReadContext use; a crashed or closed page still fails fast.
+	readyErrs := 0
 	for {
 		ready, err := page.Eval(playerReadyJS)
 		if err != nil {
-			return playerContextRaw{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
-		}
-		if ready.Bool() {
-			break
-		}
-		if time.Now().After(deadline) {
-			return playerContextRaw{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable before deadline")
+			readyErrs++
+			if readyErrs >= 3 || time.Now().After(deadline) {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
+			}
+		} else {
+			readyErrs = 0 // count consecutive errors; a success resets the streak
+			if ready.Bool() {
+				break
+			}
+			if time.Now().After(deadline) {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable before deadline")
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return playerContextRaw{}, ctx.Err()
-		case <-time.After(playerContextPollInterval):
+		case <-time.After(tm.poll):
 		}
 	}
 	loaded, err := page.Eval(playerLoadJS, videoID)
@@ -1769,11 +1928,19 @@ func (s *Session) establish(ctx context.Context, page *cdp.Page, videoID string,
 	// Wait once before the first read so the asynchronous stop and load operations
 	// cannot expose state left by a previous request for the same video.
 	evalErrs := 0
+	lastReason := "" // the page's most recent pending reason, for the deadline message
 	for {
 		select {
 		case <-ctx.Done():
 			return playerContextRaw{}, ctx.Err()
-		case <-time.After(playerContextPollInterval):
+		case <-time.After(tm.poll):
+		}
+		// Check the deadline before the next eval, the way confirmPastCap does.
+		// The Evals are bound to the establish deadline, so a poll that starts past
+		// it fails on the derived context and would report a bare cancellation
+		// instead of what the page was actually waiting for.
+		if time.Now().After(deadline) {
+			return playerContextRaw{}, deadlineError(lastReason)
 		}
 		_, _ = page.Eval(playerDriveJS)
 		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
@@ -1782,6 +1949,13 @@ func (s *Session) establish(ctx context.Context, page *cdp.Page, videoID string,
 			// (persistent errors) instead of spinning to the deadline.
 			evalErrs++
 			if evalErrs >= 3 || time.Now().After(deadline) {
+				// The deadline can still pass inside an eval, and that eval then
+				// fails on the bound context. Report the page's own last reason for
+				// that one case only: any other error is a real extraction failure
+				// and must not be masked, even past the deadline.
+				if errors.Is(evalErr, context.DeadlineExceeded) && time.Now().After(deadline) {
+					return playerContextRaw{}, deadlineError(lastReason)
+				}
 				return playerContextRaw{}, fmt.Errorf("waxseal: player-context extract: %w", evalErr)
 			}
 			continue
@@ -1797,10 +1971,22 @@ func (s *Session) establish(ctx context.Context, page *cdp.Page, videoID string,
 		if raw.Error == "" {
 			return raw, nil // established context captured
 		}
+		lastReason = raw.Error
 		if time.Now().After(deadline) {
-			return playerContextRaw{}, fmt.Errorf("waxseal: player-context: %s", raw.Error)
+			return playerContextRaw{}, deadlineError(lastReason)
 		}
 	}
+}
+
+// deadlineError renders the establish timeout. reason is the page's most recent
+// pending explanation, which is the load-bearing part of the message; an empty
+// one means the page never answered at all, which is worth saying rather than
+// leaving the error bare.
+func deadlineError(reason string) error {
+	if reason == "" {
+		return fmt.Errorf("waxseal: player-context: no player response before the deadline")
+	}
+	return fmt.Errorf("waxseal: player-context: %s", reason)
 }
 
 // The full-length probe seeks beyond the roughly 70-second status-2 preview cap
@@ -2027,7 +2213,8 @@ func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLen
 // The probe seeks and drives playback, so it should be run on demand rather than
 // as a frequent health check.
 func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
-	ctx, cancelHard := context.WithTimeout(ctx, fullLengthHardTimeout)
+	tm := s.tuning()
+	ctx, cancelHard := context.WithTimeout(ctx, tm.hardTimeout)
 	defer cancelHard()
 	page := s.page.Context(ctx)
 	defer s.revertPlayerContext(ctx)
@@ -2042,7 +2229,7 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 		s.probeMu.Unlock()
 	}
 
-	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
+	raw, err := s.establish(ctx, page, videoID, time.Now().Add(tm.establishTimeout))
 	if err != nil {
 		// Establishment failures are reported as probe outcomes unless the caller
 		// canceled the operation or the video is terminally unplayable.
@@ -2072,7 +2259,7 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 
 	// The session proof still requires playback progress beyond the target and a
 	// buffer range that covers it.
-	cp, cerr := s.confirmPastCap(ctx, page, fullLengthTargetSecs, fullLengthTolSecs, establishedURL, time.Now().Add(fullLengthProbeBudget),
+	cp, cerr := s.confirmPastCap(ctx, page, fullLengthTargetSecs, fullLengthTolSecs, establishedURL, time.Now().Add(tm.probeBudget),
 		func(b bufferedSample) bool {
 			return b.Current > float64(fullLengthTargetSecs)+fullLengthTolSecs && b.CoversTarget
 		})
@@ -2104,12 +2291,13 @@ type bufferedSample struct {
 // A failed seek returns OutcomeConfirmUnavailable because the confirm never ran.
 // Only request cancellation is returned as an error; other negative outcomes are
 // encoded in the probe.
-func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int, tol float64, establishedURL string, deadline time.Time, confirmed func(bufferedSample) bool) (FullLengthProbe, error) {
+func (s *Session) confirmPastCap(ctx context.Context, page pageDriver, target int, tol float64, establishedURL string, deadline time.Time, confirmed func(bufferedSample) bool) (FullLengthProbe, error) {
 	// Scope CDP evals to the confirm deadline. The outer ctx still drives
 	// cancellation reporting, keeping caller cancellation distinct from timeout.
 	dctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	page = page.Context(dctx)
+	tm := s.tuning()
 
 	probe := FullLengthProbe{TargetSeconds: target}
 	if seeked, serr := page.Eval(playerSeekJS, target); serr != nil || !seeked.Bool() {
@@ -2119,12 +2307,24 @@ func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int
 			return probe, ctx.Err()
 		}
 		// A failed seek means the page could not run the confirm. Let the caller
-		// relaunch this session instead of classifying it as a capped stream.
+		// relaunch this session instead of classifying it as a capped stream:
+		// seekTo returns at once, so a seek that outlives the whole confirm budget
+		// means Eval's context-loss retry loop or a stalled connection, which is
+		// page trouble rather than status-2 timing.
 		probe.Outcome = OutcomeConfirmUnavailable
-		if serr != nil {
-			probe.Reason = "seek past the cap failed: " + serr.Error()
-		} else {
+		switch {
+		case serr == nil:
+			// The eval ran and the snippet returned false: the page has no seekTo.
 			probe.Reason = "movie_player.seekTo unavailable"
+		case errors.Is(serr, context.DeadlineExceeded) && dctx.Err() != nil:
+			// The Eval is bound to the confirm budget, so a budget expiry surfaces
+			// as that derived context's deadline error, which reads as a generic
+			// cancellation. Name the budget instead. Only a deadline error is
+			// rewritten: a real page failure that happens to land near the deadline
+			// is still reported as itself.
+			probe.Reason = fmt.Sprintf("confirm budget expired during the seek to %ds", target)
+		default:
+			probe.Reason = "seek past the cap failed: " + serr.Error()
 		}
 		return probe, nil
 	}
@@ -2138,7 +2338,7 @@ func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int
 			probe.Outcome = OutcomeCanceled
 			probe.Reason = "probe canceled before reaching the target: " + ctx.Err().Error()
 			return probe, ctx.Err()
-		case <-time.After(playerContextPollInterval):
+		case <-time.After(tm.poll):
 		}
 		// Check the deadline before the next eval so a budget timeout reports the
 		// last observed buffer position instead of a deadline-canceled CDP error.
@@ -2196,7 +2396,7 @@ func (s *Session) confirmPastCap(ctx context.Context, page *cdp.Page, target int
 			lastCurrent = b.Current
 			lastBuffered = b.BufferedEnd
 			lastProgressAt = time.Now()
-		} else if time.Since(lastProgressAt) > fullLengthStallWindow {
+		} else if time.Since(lastProgressAt) > tm.stallWindow {
 			probe.Outcome = OutcomeTargetNotBuffered
 			probe.Reason = fmt.Sprintf("playback and buffering stalled at %.1fs (state %d, buffered end %.1f); never reached the %ds target", b.Current, b.State, b.BufferedEnd, target)
 			return probe, nil
@@ -2324,7 +2524,7 @@ func reduceStreamingURL(rawURL string) string {
 // Unknown length verifies at the full-length target. This fails closed for live,
 // premiere, or otherwise unreadable durations: long content can still confirm,
 // while short unknown-length content is refused and left to the consumer fallback.
-func (s *Session) establishStatus1(ctx context.Context, page *cdp.Page, videoID string, establishBudget, confirmBudget time.Duration) (playerContextRaw, error) {
+func (s *Session) establishStatus1(ctx context.Context, page pageDriver, videoID string, establishBudget, confirmBudget time.Duration) (playerContextRaw, error) {
 	raw, err := s.establish(ctx, page, videoID, time.Now().Add(establishBudget))
 	if err != nil {
 		return playerContextRaw{}, err
@@ -2376,7 +2576,7 @@ func (s *Session) establishStatus1(ctx context.Context, page *cdp.Page, videoID 
 //
 // band identifies which establishStatus1 branch called in, for the diagnostic log
 // line below; it changes no confirm behavior.
-func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID string, target int, establishedURL string, confirmBudget time.Duration, band confirmBand, confirmed func(bufferedSample) bool) (playerContextRaw, error) {
+func (s *Session) confirmAndReRead(ctx context.Context, page pageDriver, videoID string, target int, establishedURL string, confirmBudget time.Duration, band confirmBand, confirmed func(bufferedSample) bool) (playerContextRaw, error) {
 	cp, cerr := s.confirmPastCap(ctx, page, target, fullLengthTolSecs, establishedURL, time.Now().Add(confirmBudget), confirmed)
 	if cerr != nil {
 		return playerContextRaw{}, cerr // canceled
@@ -2384,7 +2584,7 @@ func (s *Session) confirmAndReRead(ctx context.Context, page *cdp.Page, videoID 
 	if err := confirmError(cp); err != nil {
 		return playerContextRaw{}, err
 	}
-	raw, err := s.reReadContext(ctx, page, videoID, time.Now().Add(playerContextReReadBudget))
+	raw, err := s.reReadContext(ctx, page, videoID, time.Now().Add(s.tuning().reReadBudget))
 	if err != nil {
 		return playerContextRaw{}, err
 	}
@@ -2431,10 +2631,11 @@ func confirmError(cp FullLengthProbe) error {
 // video is already loaded and buffered, so a short retry budget is enough for
 // transient CDP errors. A terminal playability transition during this window
 // returns ErrUnplayable for normal negative caching.
-func (s *Session) reReadContext(ctx context.Context, page *cdp.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+func (s *Session) reReadContext(ctx context.Context, page pageDriver, videoID string, deadline time.Time) (playerContextRaw, error) {
 	dctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	page = page.Context(dctx)
+	tm := s.tuning()
 
 	evalErrs := 0
 	for {
@@ -2468,7 +2669,7 @@ func (s *Session) reReadContext(ctx context.Context, page *cdp.Page, videoID str
 		select {
 		case <-ctx.Done():
 			return playerContextRaw{}, ctx.Err()
-		case <-time.After(playerContextPollInterval):
+		case <-time.After(tm.poll):
 		}
 	}
 }
@@ -2491,31 +2692,19 @@ func (s *Session) Close() {
 	})
 }
 
-// DetectChrome resolves a Chromium binary from WAXSEAL_CHROME_BIN or common
-// system paths.
+// DetectChrome resolves a Chromium binary from WAXSEAL_CHROME_BIN or this
+// platform's well-known install locations (internal/chromepath, shared with the
+// cdp package's live tests so the two cannot drift). WAXSEAL_CHROME_BIN remains
+// the escape hatch for any browser, including the ones chromepath deliberately
+// leaves out.
 func DetectChrome() (string, error) {
 	if b := os.Getenv("WAXSEAL_CHROME_BIN"); b != "" {
 		return b, nil
 	}
-	for _, p := range []string{
-		"/usr/bin/chromium-browser",
-		"/usr/bin/chromium",
-		"/snap/bin/chromium",
-		"/usr/bin/google-chrome",
-		"/usr/bin/google-chrome-stable",
-	} {
+	for _, p := range chromepath.Candidates() {
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 			return p, nil
 		}
 	}
 	return "", fmt.Errorf("waxseal: no Chromium found; set WAXSEAL_CHROME_BIN")
-}
-
-// homeTmpBase returns a $HOME-rooted base dir for the user-data-dir, because
-// snap-confined Chromium cannot open a profile under /tmp.
-func homeTmpBase() string {
-	if h, err := os.UserHomeDir(); err == nil && h != "" {
-		return h
-	}
-	return os.TempDir()
 }

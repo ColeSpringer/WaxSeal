@@ -29,16 +29,31 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:trixie-slim
 # Chromium renders WebGL with its own bundled SwiftShader because --disable-gpu is
 # set (unconditional in internal/cdp/launch.go), so the Mesa/LLVM stack chromium
-# pulls in is never loaded. Force-purging it drops 272 MB (1.15 GB with it, 878 MB
-# without); the dangling dlopen targets and the dpkg unmet-dependency note this
-# leaves behind have no runtime effect. Recheck these names on a base-image bump:
-# they are release specific (bookworm had libllvm15, no mesa-libgallium), and dpkg
-# --purge exits 0 with only a warning for a package that is not installed, so a
-# stale list silently stops saving anything.
+# pulls in is never loaded. Purging it drops 272 MB, and the dangling dlopen
+# targets it leaves behind have no runtime effect.
+#
+# The assertion guards the list, which is release specific (bookworm had
+# libllvm15, no mesa-libgallium) and fails silently: dpkg --purge exits 0 with a
+# warning for a package that is not installed. The globs catch a rename that
+# leaves its files, dpkg-query catches a remove that left a config record. If a
+# build trips either, fix the list rather than the assertion.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
  && dpkg --purge --force-depends libgl1-mesa-dri mesa-libgallium libllvm19 libz3-4 \
+ && for pat in 'libLLVM*.so*' 'libgallium*.so*' 'libz3*.so*'; do \
+      if ls /usr/lib/*/$pat >/dev/null 2>&1; then \
+        echo "ERROR: $pat survived the purge; the purge list is stale" >&2; \
+        ls -d /usr/lib/*/$pat >&2; exit 1; fi; \
+    done \
+ && if ls -d /usr/lib/*/dri >/dev/null 2>&1; then \
+      echo "ERROR: a Mesa dri/ directory survived the purge" >&2; \
+      ls -d /usr/lib/*/dri >&2; exit 1; fi \
+ && left=$(dpkg-query -W -f '${Package} ${db:Status-Status}\n' \
+      'libllvm*' 'mesa-libgallium*' 'libgl1-mesa-dri*' 'libz3-*' 2>/dev/null \
+      | awk '$2 == "installed" { print $1 }') \
+ && if [ -n "$left" ]; then \
+      echo "ERROR: still installed after the purge: $left" >&2; exit 1; fi \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with a writable HOME (the browser profile lives under $HOME).

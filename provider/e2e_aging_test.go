@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -106,6 +107,11 @@ type agingRecord struct {
 	// matrix whose arms carry individual delays, so the run-wide-delay matrix
 	// keeps its original columns.
 	gap string
+	// anchor is which instant the daemon's own separation gate held the streamed
+	// context back from: "proof" or "mint". It is what makes a proof-gap record
+	// self-certifying, because an arm that means to measure the proof edge but
+	// waited on a mint measured something else. Empty when the arm did not ask.
+	anchor string
 	// selfTestDone is when the daemon's startup self-test returned. It bounds a
 	// mint the consumer never saw, because the self-test mints inside the daemon.
 	selfTestDone time.Time
@@ -122,6 +128,9 @@ func (r *agingRecord) line() string {
 		agingField(r.potCache), agingField(r.tokenSame), r.potCalls, r.pcCalls)
 	if r.gap != "" {
 		fmt.Fprintf(&b, " gap=%s", r.gap)
+	}
+	if r.anchor != "" {
+		fmt.Fprintf(&b, " anchor=%s", r.anchor)
 	}
 	if !r.selfTestDone.IsZero() {
 		fmt.Fprintf(&b, " selftest_done=%s", agingTime(r.selfTestDone))
@@ -312,6 +321,72 @@ func (p *agingFixedContext) issued() (time.Time, int) {
 	return p.at, p.calls
 }
 
+// separationLog collects the anchors the minter reported waiting on. Only
+// waitBeforeEstablish reports "mint" or "proof"; waitBeforeMint reports
+// "establishment", so filtering on the anchor name isolates the gate that held
+// the streamed context back.
+type separationLog struct {
+	mu      sync.Mutex
+	anchors []string
+}
+
+func (l *separationLog) record(after string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.anchors = append(l.anchors, after)
+}
+
+// contextAnchors returns the anchors that held a context establishment back, in
+// order.
+func (l *separationLog) contextAnchors() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, a := range l.anchors {
+		if a == "mint" || a == "proof" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// separationWatcher forwards every record to inner and copies the anchor out of
+// the minter's separation-wait line. Reading the daemon's own log is what makes
+// a proof-gap record self-certifying: the arm states which anchor it means to
+// measure, and the record proves which one the daemon actually used.
+//
+// Enabled delegates, which is correct here because the line is logged at Info
+// and testDaemonLogger runs at Info or Debug.
+type separationWatcher struct {
+	inner slog.Handler
+	log   *separationLog
+}
+
+func (h separationWatcher) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.inner.Enabled(ctx, l)
+}
+
+func (h separationWatcher) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == "minter: separation wait" {
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "after" {
+				h.log.record(a.Value.String())
+				return false
+			}
+			return true
+		})
+	}
+	return h.inner.Handle(ctx, r)
+}
+
+func (h separationWatcher) WithAttrs(as []slog.Attr) slog.Handler {
+	return separationWatcher{inner: h.inner.WithAttrs(as), log: h.log}
+}
+
+func (h separationWatcher) WithGroup(name string) slog.Handler {
+	return separationWatcher{inner: h.inner.WithGroup(name), log: h.log}
+}
+
 // agingHarness is one iteration's fresh daemon and the client wiring around it.
 type agingHarness struct {
 	srv  *server.Server
@@ -320,6 +395,7 @@ type agingHarness struct {
 	p    *provider.Provider
 	rt   *potCacheRecorder
 	po   *agingPOToken
+	sep  *separationLog
 }
 
 // newAgingHarness starts a fresh cold daemon and warms one session the way
@@ -335,7 +411,11 @@ type agingHarness struct {
 // default in place.
 func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation time.Duration) *agingHarness {
 	t.Helper()
-	srv, addr := newInProcessDaemon(t, server.Config{MintSeparation: separation})
+	sepLog := &separationLog{}
+	srv, addr := newInProcessDaemon(t, server.Config{
+		MintSeparation: separation,
+		Logger:         slog.New(separationWatcher{inner: testDaemonLogger(t).Handler(), log: sepLog}),
+	})
 	startCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := srv.Warm(startCtx, ""); err != nil {
@@ -362,7 +442,7 @@ func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation t
 		client.WithAPIKey(os.Getenv("WAXSEAL_KEY")),
 		client.WithHTTPClient(&http.Client{Transport: rt, Timeout: 4 * time.Minute}))
 	p := provider.New(c)
-	return &agingHarness{srv: srv, base: base, c: c, p: p, rt: rt, po: &agingPOToken{inner: p}}
+	return &agingHarness{srv: srv, base: base, c: c, p: p, rt: rt, po: &agingPOToken{inner: p}, sep: sepLog}
 }
 
 // agingStream streams videoURL over the attested player-context path. It mirrors
@@ -419,7 +499,14 @@ type agingArm struct {
 	// gap overrides the run-wide delay with one this arm owns. Nil takes the
 	// run-wide delay and leaves the gap column out of the record.
 	gap *time.Duration
-	run func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep
+	// separation overrides the run-wide server.Config.MintSeparation with one
+	// this arm owns. An arm sets it when the daemon's own gate is the instrument
+	// rather than something to get out of the way. Nil takes the run-wide value.
+	separation *time.Duration
+	// watchAnchor asks the iteration to record which anchor the daemon's
+	// separation gate held the streamed context back from.
+	watchAnchor bool
+	run         func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep
 }
 
 // agingGap makes an arm's own delay addressable.
@@ -565,6 +652,43 @@ var agingMintGapArms = []agingArm{
 	},
 }
 
+// agingProofGapArm builds one row of the third matrix. The arm sets the daemon's
+// separation window to gap and runs the self-test, which mints and then proves,
+// so the proof is the later anchor waitBeforeEstablish measures from and the
+// daemon holds the context exactly gap past it. The gate is the instrument here,
+// which is why the arm sets it rather than removing it. The consumer's own token
+// fetch is a cache hit, so it cannot move the mint anchor; anchor= in the record
+// proves that per iteration.
+func agingProofGapArm(name string, gap time.Duration) agingArm {
+	return agingArm{
+		name:        name,
+		selfTest:    true,
+		gap:         agingGap(gap),
+		separation:  agingGap(gap),
+		watchAnchor: true,
+		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ *agingRecord, _ time.Duration) agingPrep {
+			return agingPrep{pc: newAgingLive(h.p)}
+		},
+	}
+}
+
+// agingProofGapArms fills the interval the earlier matrix left untested: it saw
+// the proof anchor fail at 3s and pass at 12s with nothing between. Both are kept
+// as controls, so a run where proof_gap3 passes measured something other than
+// what the earlier one did.
+//
+// The reading rule, fixed before the run: a truncation at gap g puts the edge at
+// or above g, an arm passes only at 4 of 4, and the default moves only if an arm
+// at or above 10s truncates.
+var agingProofGapArms = []agingArm{
+	agingProofGapArm("proof_gap3", 3*time.Second),
+	agingProofGapArm("proof_gap4", 4*time.Second),
+	agingProofGapArm("proof_gap6", 6*time.Second),
+	agingProofGapArm("proof_gap8", 8*time.Second),
+	agingProofGapArm("proof_gap10", 10*time.Second),
+	agingProofGapArm("proof_gap12", 12*time.Second),
+}
+
 // agingSleep is the arm's delay, interruptible by the iteration budget.
 func agingSleep(t *testing.T, ctx context.Context, d time.Duration) {
 	t.Helper()
@@ -590,6 +714,9 @@ func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separati
 	if arm.gap != nil {
 		delay = *arm.gap
 		rec.gap = delay.String()
+	}
+	if arm.separation != nil {
+		separation = *arm.separation
 	}
 	h := newAgingHarness(t, rec, arm.selfTest, separation)
 	prep := arm.run(t, ctx, h, rec, delay)
@@ -628,6 +755,24 @@ func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separati
 	// measures an aged token if the consumer was served that same one.
 	if (prep.preToken != "" || arm.selfTest) && rec.potCache != "hit" {
 		rec.appendNote("consumer token fetch was not a cache hit (pot_cache=" + agingField(rec.potCache) + ")")
+	}
+	if arm.watchAnchor {
+		// The last context-establishment wait of the iteration is the one that held
+		// the streamed context back. No wait at all, or one anchored on the mint,
+		// means this iteration did not measure the gap the arm names.
+		anchors := h.sep.contextAnchors()
+		switch {
+		case len(anchors) == 0:
+			rec.appendNote("no separation wait observed: the daemon did not hold the context back, so this iteration measured no gap")
+		default:
+			rec.anchor = anchors[len(anchors)-1]
+			if rec.anchor != "proof" {
+				rec.appendNote("separation anchor was the " + rec.anchor + ", not the proof: this iteration did not measure the proof edge")
+			}
+			if len(anchors) > 1 {
+				rec.appendNote(fmt.Sprintf("%d context waits in this iteration (anchors %s); the last one is reported", len(anchors), strings.Join(anchors, ",")))
+			}
+		}
 	}
 	if info.Client != clientWebContext {
 		rec.appendNote(fmt.Sprintf("client=%s (not the player-context path)", info.Client))
@@ -708,10 +853,12 @@ func TestAgingMatrix(t *testing.T) {
 		arms, label = agingArms, "1 (which artifact's age separates a full stream from a capped one)"
 	case "2":
 		arms, label = agingMintGapArms, "2 (how much distance between the mint and the streamed context is enough)"
+	case "3":
+		arms, label = agingProofGapArms, "3 (how much distance between the proof playback and the streamed context is enough)"
 	case "":
-		t.Skipf("set %s=1 or %s=2 to run an aging matrix (a long measurement run, not an assertion)", agingEnableEnv, agingEnableEnv)
+		t.Skipf("set %s=1, %s=2, or %s=3 to run an aging matrix (a long measurement run, not an assertion)", agingEnableEnv, agingEnableEnv, agingEnableEnv)
 	default:
-		t.Fatalf("%s=%q is not a recognized value; use 1 or 2", agingEnableEnv, raw)
+		t.Fatalf("%s=%q is not a recognized value; use 1, 2, or 3", agingEnableEnv, raw)
 	}
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
 		t.Skipf("the aging matrix needs its own cold daemon per iteration; unset WAXSEAL_URL (currently %s)", ext)
@@ -719,11 +866,19 @@ func TestAgingMatrix(t *testing.T) {
 	n := agingIterations(t)
 	d := agingDelay(t)
 	sep := agingSeparation(t)
+	// Matrix 3 makes the daemon's gate its instrument and sets it per arm, so a
+	// run-wide override would fight every arm's own value rather than refine it.
+	if raw == "3" && sep > 0 {
+		t.Fatalf("%s=%s cannot be combined with %s=3: every arm of that matrix sets the gate to its own gap, which is what holds the context the measured distance after the proof", agingSeparationEnv, sep, agingEnableEnv)
+	}
 	t.Logf("aging matrix %s: %d arms x %d iterations, video %s", label, len(arms), n, bbbVideoID)
 	t.Logf("run-wide delay %s (arms carrying their own gap ignore it)", d)
-	if sep > 0 {
+	switch {
+	case raw == "3":
+		t.Logf("%s unset, as this matrix requires: each arm sets the daemon's mint-to-establishment gate to its own gap, so the gate is the instrument that holds the streamed context exactly that long after the proof playback", agingSeparationEnv)
+	case sep > 0:
 		t.Logf("%s=%s: the daemon's mint-to-establishment gate is effectively removed; arms measure raw gaps", agingSeparationEnv, sep)
-	} else {
+	default:
 		t.Logf("%s unset: the daemon's own default mint-to-establishment gate applies; this run is a regression check (every arm expected full length)", agingSeparationEnv)
 	}
 
@@ -780,6 +935,36 @@ func agingSummary(t *testing.T, records []*agingRecord) {
 	for _, a := range order {
 		tl := byArm[a]
 		t.Logf("  %-16s %d/%d", a, tl.full, tl.total)
+	}
+	// An arm that watched the separation anchor is only meaningful when every one
+	// of its iterations waited on the anchor it names, so the tally is printed
+	// beside the outcomes rather than left to be grepped out of the per-iteration
+	// lines.
+	anchored := false
+	for _, r := range records {
+		if r.anchor != "" || strings.Contains(r.note, "separation") {
+			anchored = true
+			break
+		}
+	}
+	if anchored {
+		t.Log("separation anchor each iteration waited on (an arm measures the proof edge only at proof for every iteration):")
+		for _, a := range order {
+			counts := make(map[string]int)
+			for _, r := range records {
+				if r.arm != a {
+					continue
+				}
+				counts[agingField(r.anchor)]++
+			}
+			var parts []string
+			for _, key := range []string{"proof", "mint", "-"} {
+				if counts[key] > 0 {
+					parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))
+				}
+			}
+			t.Logf("  %-16s %s", a, strings.Join(parts, " "))
+		}
 	}
 	t.Log("iterations that did not stream full length, artifact age at stream start:")
 	anyTruncated := false

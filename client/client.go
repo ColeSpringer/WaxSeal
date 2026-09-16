@@ -53,21 +53,45 @@ type Session struct {
 // code embedded in ServerAbrStreamingURL.
 //
 // This type mirrors browser.PlayerContext without importing the browser package
-// and its Chromium dependencies. Keep the JSON tags in sync.
+// and its Chromium dependencies, with one addition: the server embeds that struct
+// and adds session_generation, which has no browser-side counterpart. Keep the
+// JSON tags of the shared fields in sync.
 type PlayerContext struct {
-	PlayabilityStatus            string        `json:"playability_status"`
-	PlayerURL                    string        `json:"player_url"`
-	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
-	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
-	VisitorData                  string        `json:"visitor_data"`
-	ClientVersion                string        `json:"client_version"`
-	Title                        string        `json:"title"`
-	Author                       string        `json:"author"`
-	LengthSeconds                int           `json:"length_seconds"`
-	AudioFormats                 []AudioFormat `json:"audio_formats"`
+	PlayabilityStatus            string `json:"playability_status"`
+	PlayerURL                    string `json:"player_url"`
+	ServerAbrStreamingURL        string `json:"server_abr_streaming_url"`
+	VideoPlaybackUstreamerConfig string `json:"video_playback_ustreamer_config"`
+	VisitorData                  string `json:"visitor_data"`
+	ClientVersion                string `json:"client_version"`
+	Title                        string `json:"title"`
+	Author                       string `json:"author"`
+	LengthSeconds                int    `json:"length_seconds"`
+	ChannelID                    string `json:"channel_id"`  // the "UC..." owner id
+	Description                  string `json:"description"` // the video's full description text
+	// Thumbnails is the ladder in the player response's own order, smallest first.
+	// Sort it if you need a particular rung.
+	Thumbnails []Thumbnail `json:"thumbnails"`
+	// IsLiveContent is true for anything that was ever a broadcast, including a
+	// finished VOD; IsLiveNow only while one is on air; IsUpcoming for a scheduled
+	// premiere or broadcast.
+	IsLiveContent bool `json:"is_live_content"`
+	IsLiveNow     bool `json:"is_live_now"`
+	IsUpcoming    bool `json:"is_upcoming"`
+	// PublishDate is RFC 3339 or a bare 2006-01-02 date, and is empty when the
+	// player response carries no microformat.
+	PublishDate  string        `json:"publish_date"`
+	AudioFormats []AudioFormat `json:"audio_formats"`
 	// SessionGeneration identifies the daemon session that produced this context.
 	// Use it to report a degraded stream.
 	SessionGeneration uint64 `json:"session_generation"`
+}
+
+// Thumbnail is one rung of the video's thumbnail ladder. Width and height are
+// zero when the player response omits them.
+type Thumbnail struct {
+	URL    string `json:"url"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
 }
 
 // AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
@@ -84,7 +108,7 @@ type AudioFormat struct {
 	AudioSampleRate  int    `json:"audio_sample_rate"`
 	AudioChannels    int    `json:"audio_channels"`
 	AudioQuality     string `json:"audio_quality"`
-	IsDrc            bool   `json:"is_drc"`         // whether the rendition uses dynamic range compression
+	IsDrc            bool   `json:"is_drc"`         // whether client_abr_state.drc_enabled is required
 	AudioTrackID     string `json:"audio_track_id"` // audioTrack.id; empty for the default or only track
 }
 

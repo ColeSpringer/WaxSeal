@@ -13,7 +13,7 @@ const (
 	// recognizes profiles created by os.MkdirTemp.
 	profilePrefix = ".waxseal-"
 
-	// creatorMarkerFile identifies a WaxSeal profile. Its advisory lock, rather
+	// creatorMarkerFile identifies a WaxSeal profile. Its ownership lock, rather
 	// than the recorded PID, indicates whether the creator is still running.
 	creatorMarkerFile = "creator.pid"
 )
@@ -28,10 +28,11 @@ func writeMarker(dir string) error {
 	return os.WriteFile(filepath.Join(dir, creatorMarkerFile), []byte(strconv.Itoa(os.Getpid())), 0o600)
 }
 
-// markProfileDir writes the marker and takes its advisory lock, returning the open
-// file that holds the lock (nil if marking or locking failed). The caller owns the
-// returned file and must close it to release the lock, after removing the profile
-// directory. Advisory locks avoid false liveness results from PID reuse and PID
+// markProfileDir writes the marker and takes its ownership lock, returning the
+// open file that holds the lock (nil if marking or locking failed). The caller
+// owns the returned file and closes it through profileHandle.cleanup, which knows
+// the platform's order relative to removing the directory. A held handle avoids
+// the false liveness results a recorded PID gives under PID reuse and PID
 // namespaces. If marking or locking fails, the marker is removed so the reaper
 // leaves the profile untouched.
 func markProfileDir(dir string) *os.File {
@@ -69,14 +70,15 @@ func classifyStaleProfiles(states []profileState, lockable func(marker string) b
 // ReapStaleProfiles removes abandoned profile directories created by WaxSeal.
 //
 // A directory is removed only when its name matches profileDirPattern, it contains
-// a creator marker, and the marker's advisory lock is free. Unmarked directories
-// are left untouched. On Windows, markerLockable always returns false, so cleanup
-// must be performed manually. Call ReapStaleProfiles before launching a browser.
+// a creator marker, and the marker's ownership lock is free. Unmarked directories
+// are left untouched. The lock is an advisory flock on Unix and an exclusive open
+// on Windows; both are released by the kernel on any exit, so neither can leave a
+// stale lock behind. Call ReapStaleProfiles before launching a browser.
 func ReapStaleProfiles(log *slog.Logger) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	matches, err := filepath.Glob(filepath.Join(homeTmpBase(), profilePrefix+"*"))
+	matches, err := filepath.Glob(filepath.Join(profileBase(), profilePrefix+"*"))
 	if err != nil {
 		log.Warn("waxseal: profile sweep glob failed", "err", err)
 		return

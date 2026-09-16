@@ -25,6 +25,11 @@ That pulls the `:latest` tag; pin a release with `WAXSEAL_VERSION`, for example
 `WAXSEAL_VERSION=1.0.0 docker compose up -d`. To build the image from source instead
 of pulling, run `make docker-build` first; it tags the same name locally.
 
+The image is published for linux/amd64 and linux/arm64. The plain tag
+(`:latest`, `:1.0.0`) is a manifest covering both, so Docker resolves the right
+one; the per-architecture tags it is assembled from (`:1.0.0-amd64`,
+`:1.0.0-arm64`) stay pullable for pinning one platform.
+
 The container is ready when its healthcheck passes. The daemon binds its socket
 before browser startup but serves only once `/ping` returns `{"ok":true,...}`;
 startup attests the first tenant, caches a GVS token, and runs a full-length
@@ -58,8 +63,8 @@ under [Authentication and tenants](#authentication-and-tenants).
 
 ### From source
 
-Build and run without Docker, on Linux or macOS (the daemon does not run on
-Windows). This path needs Go and a system Chromium:
+Build and run without Docker, on Linux, macOS, or Windows. This path needs Go and
+a system Chromium or Chrome:
 
 ```sh
 go build ./...
@@ -76,7 +81,8 @@ go run ./cmd/waxseal ping                       # check a running daemon
 ```
 
 Prefer the warm daemon for repeated requests. Commands that take `--video` want a
-bare video ID, not a URL.
+bare video ID, not a URL. The one-shot `player-context` prints the same object the
+endpoint returns, minus `session_generation`: there is no daemon session to report.
 
 `doctor` can also stop short of the full check. `--skip-attest` reports the
 captured identity without attesting, leaving the `attest` key out of the report
@@ -86,6 +92,12 @@ that Chromium renders and navigates with no external network at all;
 `--landing-url` aims that check at some other page. Neither combines with
 `--full`, which needs an attested session. The container image is smoke-tested
 with `waxseal doctor --stop-after-load` on an isolated network.
+
+On Windows, Chrome is auto-detected under Program Files and the per-user install
+directory (`WAXSEAL_CHROME_BIN` overrides it, and Edge is never picked up on its
+own because it reports a different browser identity), browser profiles live under
+`%TEMP%`, and Ctrl-C stops the daemon the same way it does elsewhere. The
+container remains the recommended deployment on every host.
 
 ## HTTP API
 
@@ -150,6 +162,15 @@ status-1 protection code embedded in the signed URL.
   "title": "<video title>",
   "author": "<channel name>",
   "length_seconds": 634,
+  "channel_id": "UC...",                  // the "UC..." id of the channel that owns the video
+  "description": "<full description>",
+  "thumbnails": [                         // the player response's own order, smallest first; not
+    {"url": "https://i.ytimg.com/vi/...", "width": 168, "height": 94}   // reordered here, because consumers sort it
+  ],
+  "is_live_content": false,               // true for anything that was ever a broadcast, finished VODs included
+  "is_live_now": false,                   // true only while a broadcast is on air
+  "is_upcoming": false,                   // true for a scheduled premiere or broadcast
+  "publish_date": "2015-04-10T00:00:00-07:00",  // the microformat's string: RFC3339 or a bare date; empty when absent
   "audio_formats": [
     {
       "itag": 251,
@@ -515,6 +536,9 @@ go test ./...                              # offline unit tests; no browser or n
 (cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs WAXSEAL_URL/WAXSEAL_KEY
+make vet                                   # what CI vets: both modules, plus a windows cross-vet
+make test                                  # both modules' offline tests, race-enabled
+make live                                  # the live CDP tests above
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js
 ```
@@ -533,9 +557,10 @@ need a warm daemon and include the full-length WEB SABR download
 `go test -v` output for that suite. `TestAgingMatrix` is a separate, opt-in
 measurement of how an artifact's age affects a capped stream, not a regression
 test: it skips unless `WAXSEAL_E2E_AGING=1` (which artifact's age predicts a
-truncated stream) or `=2` (how much separation between a mint and a served
-context is enough) is set, runs for tens of minutes, and only ever reports a
-tally, never a pass/fail on truncation. `WAXSEAL_E2E_AGING_N` overrides the
+truncated stream), `=2` (how much separation between a mint and a served context
+is enough), or `=3` (the same question for the distance between the proof
+playback and the served context) is set, runs for tens of minutes, and only ever
+reports a tally, never a pass/fail on truncation. `WAXSEAL_E2E_AGING_N` overrides the
 per-arm iteration count (default 6) and `WAXSEAL_E2E_AGING_DELAY` overrides the
 run-wide delay between warming and streaming (default `30s`; an arm carrying its
 own delay ignores it). By default every in-process daemon the suite starts keeps
@@ -546,6 +571,12 @@ such as `1ms`) overrides that gate on those daemons so the arms measure raw gaps
 again, the way the matrix originally separated them; because attestation always
 pre-mints a token, the token age arms then measure time since attestation rather
 than since their own mint call, which usually just returns that cached token.
+`=3` refuses `WAXSEAL_E2E_AGING_SEPARATION` instead of honouring it: every arm of
+that matrix sets the gate to its own gap, which is what holds the served context
+exactly that far past the proof, so the gate is the measuring instrument rather
+than something to remove. Each of its records carries an `anchor=` column read
+out of the daemon's own log, so a run proves per iteration that it waited on the
+proof and not on a mint.
 The `client` package is a reusable, consumer-agnostic HTTP client; the
 `provider/` module adapts it to the token-provider interface a streaming
 consumer expects.

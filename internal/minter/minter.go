@@ -254,11 +254,19 @@ const (
 	ReportBurst = 4
 
 	// defaultMintSeparation is how far apart the daemon keeps an in-page mint and
-	// a context establishment. A consumer that streamed a context established
-	// 0.6 s from the mint of the token it sent was graded a preview every time
-	// (0 of 6 streams ran to completion), while the same measurement at 10.6 s
-	// ran full length every time (6 of 6). 12 s is that measured edge plus
-	// margin. WAXSEAL_MINT_SEPARATION overrides it.
+	// a context establishment. Two anchors set it, and 12 s covers both.
+	//
+	// Mint: a context established 0.6 s after the mint of the token that streamed
+	// it was graded a preview 6 times out of 6, and ran full length 6 of 6 at
+	// 10.6 s. 12 s is that edge plus margin.
+	//
+	// Proof: first bracketed at 0 of 4 full at 3 s and 4 of 4 at 12 s, then
+	// re-measured across the interval on 2026-09-16 (WAXSEAL_E2E_AGING=3). Every
+	// gap from 3 s up ran 4 of 4, so no proof edge was found; but the 3 s arm was
+	// the earlier known-fail control and did not reproduce, so read that as the
+	// edge being below 3 s on that egress, not as retiring the earlier result.
+	//
+	// WAXSEAL_MINT_SEPARATION overrides it.
 	defaultMintSeparation = 12 * time.Second
 
 	// mintSeparationEnv overrides defaultMintSeparation with a positive Go
@@ -690,7 +698,10 @@ func (m *Minter) markMinted() {
 	m.mu.Unlock()
 }
 
-// markEstablished records a completed context establishment.
+// markEstablished records a completed context establishment. Its body is
+// identical to markPlayback's, which records an attempt: both arm the mint gate
+// through lastEstablishAt and nothing else. The two names are kept apart because
+// the call sites read differently, one on every attempt and one only on success.
 func (m *Minter) markEstablished() {
 	m.mu.Lock()
 	m.lastEstablishAt = time.Now()
@@ -701,9 +712,10 @@ func (m *Minter) markEstablished() {
 // successfully or not: sess.PlayerContext in PlayerContext and
 // sess.EnsureEstablished in ensureProven and SelfTest each call it after every
 // attempt. A failed establishment still touched the page, so it arms the mint
-// gate (waitBeforeMint) exactly like a successful one; markEstablished and
-// markProved additionally run on the success paths for their own bookkeeping
-// (the context-gate anchor lastProofAt, and clearing the proof-failure state).
+// gate (waitBeforeMint) exactly like a successful one. The success paths also
+// call markEstablished, whose effect is the same, or markProved, which does the
+// extra bookkeeping: the context-gate anchor lastProofAt, and clearing the
+// proof-failure state.
 func (m *Minter) markPlayback() {
 	m.mu.Lock()
 	m.lastEstablishAt = time.Now()

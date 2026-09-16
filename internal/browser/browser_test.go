@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -327,6 +328,41 @@ func TestAudioFormatTagDrift(t *testing.T) {
 	}
 	if f.AudioTrackID != "en.4" {
 		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
+	}
+}
+
+// TestPlayerContextTagDrift keeps the metadata keys emitted by
+// playerContextExtractJS in sync with PlayerContext, the same way
+// TestAudioFormatTagDrift covers the format list. The payload is the JS shape,
+// not the Go field names.
+func TestPlayerContextTagDrift(t *testing.T) {
+	const payload = `{"channel_id":"UCabc","description":"desc","thumbnails":[{"url":"https://t/1.jpg","width":120,"height":90}],` +
+		`"is_live_content":true,"is_live_now":true,"is_upcoming":true,"publish_date":"2015-04-10"}`
+	var pc PlayerContext
+	if err := json.Unmarshal([]byte(payload), &pc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if pc.ChannelID != "UCabc" || pc.Description != "desc" || pc.PublishDate != "2015-04-10" {
+		t.Errorf("metadata = %+v", pc)
+	}
+	if !pc.IsLiveContent || !pc.IsLiveNow || !pc.IsUpcoming {
+		t.Errorf("live flags = %v/%v/%v, want all true", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+	}
+	if len(pc.Thumbnails) != 1 || pc.Thumbnails[0].URL != "https://t/1.jpg" || pc.Thumbnails[0].Width != 120 || pc.Thumbnails[0].Height != 90 {
+		t.Errorf("thumbnails = %+v", pc.Thumbnails)
+	}
+}
+
+// TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
+// every documented key. The JS runs only in Chromium, so a key dropped from the
+// JSON.stringify literal would otherwise surface as an empty field in a live run.
+func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
+	typ := reflect.TypeOf(PlayerContext{})
+	for i := range typ.NumField() {
+		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if !strings.Contains(playerContextExtractJS, name+":") {
+			t.Errorf("playerContextExtractJS never emits %q", name)
+		}
 	}
 }
 
