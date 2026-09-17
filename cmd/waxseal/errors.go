@@ -28,7 +28,9 @@ func renderError(w io.Writer, err error) {
 }
 
 // exitCodeFor maps usage errors to 2, unavailable videos to 3, interrupts to 130,
-// and all other failures to 1.
+// and all other failures to 1. A bot check is one of those others on purpose: it
+// describes the browser session, not the video, so exit 3 would tell a script the
+// wrong thing about a video that is fine.
 func exitCodeFor(err error) int {
 	switch {
 	case err == nil:

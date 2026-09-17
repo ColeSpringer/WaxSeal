@@ -93,11 +93,26 @@ func TestPoolRelaunchBackoffAfterFailure(t *testing.T) {
 	if got := atomic.LoadInt64(&created); got != 1 {
 		t.Fatalf("newInstance calls = %d, want 1", got)
 	}
-	if _, err := p.relaunch(stale); err == nil {
+	_, err := p.relaunch(stale)
+	if err == nil {
 		t.Fatal("second relaunch within the backoff window should fail fast")
 	}
 	if got := atomic.LoadInt64(&created); got != 1 {
 		t.Errorf("newInstance calls during backoff = %d, want 1", got)
+	}
+	// The wait is typed so the minter can pass it to the caller as Retry-After.
+	be, ok := errors.AsType[*RelaunchBackoffError](err)
+	if !ok {
+		t.Fatalf("backoff refusal = %v (%T), want a *RelaunchBackoffError", err, err)
+	}
+	if be.Wait <= 0 || be.Wait > relaunchBackoffBase {
+		t.Errorf("wait = %v, want it inside the first backoff window (%v)", be.Wait, relaunchBackoffBase)
+	}
+	if be.Streak != 1 {
+		t.Errorf("streak = %d, want 1", be.Streak)
+	}
+	if !strings.Contains(be.Error(), "backing off") {
+		t.Errorf("error text = %q, want it to name the backoff", be.Error())
 	}
 }
 

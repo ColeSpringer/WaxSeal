@@ -86,6 +86,12 @@ type Minter struct {
 	// proof succeeds.
 	proofFailGen  uint64
 	proofFailedAt time.Time
+	// proofFailCause is the failure the record was opened for and
+	// proofFailCooldown the window it earned, so a refusal from inside the window
+	// can name what went wrong and state the right wait. A bot check records a
+	// different cause and a longer window than a failed proof.
+	proofFailCause    error
+	proofFailCooldown time.Duration
 	// proofCooldownWarnedAt is the proofFailedAt value the cool-down warning has
 	// already fired for, so repeated refusals within the same cool-down window log
 	// the warning once instead of once per refused request. Cleared alongside
@@ -98,8 +104,15 @@ type Minter struct {
 	// persistently unprovable environment from restarting Chromium again on
 	// every cool-down forever. This flag is that stop: it survives a new
 	// generation, however that generation came to exist, and only a successful
-	// proof (markProved) clears it.
+	// proof (markProved) clears it. A bot check is a separate rule with its own
+	// window: see botCheckRelaunchedAt.
 	proofRelaunched bool
+
+	// botCheckRelaunchedAt is when a bot check last bought a fresh identity. It is
+	// never cleared, markProved included: the grant is per window, not per streak,
+	// so a replacement that proves and then walls on a context cannot claim a
+	// second one.
+	botCheckRelaunchedAt time.Time
 
 	// retiredGen and retiredCrash record the last generation torn down and
 	// whether the browser died under it. sessionDied reads them back instead of
@@ -200,11 +213,15 @@ type minterMetrics struct {
 	SeparationWaits atomic.Int64
 	// UnprovenRejections counts player-context requests refused because no
 	// session proved full-length streaming for them: a proof that failed, a
-	// cool-down from an earlier failure, or a browser that died mid-proof and
+	// cool-down from an earlier failure or a bot check, or a browser that died mid-proof and
 	// left the request nothing to serve from. The death is not graded against the
 	// next generation, but the refusal is still the request's outcome and is
 	// counted here, since no other counter records it. Once per request.
 	UnprovenRejections atomic.Int64
+	// BotChecks counts each bot check the browser answered, at a proof or at a
+	// context. A cool-down refusal that follows is counted under
+	// UnprovenRejections, whichever failure opened the cool-down.
+	BotChecks atomic.Int64
 
 	// Session recycles are separated by cause.
 	StreamingRecycles    atomic.Int64 // time-based recycle on a streaming handoff
@@ -284,6 +301,18 @@ const (
 	// refuse each one; the cool-down lets most of them fail fast instead.
 	proofRetryCooldown = 30 * time.Second
 
+	// botCheckCooldown is how long a bot check refuses before the same identity is
+	// tried again. It is longer than the proof cool-down because a wall does not
+	// lift in 30 s, and above 60 s because a consumer that sleeps through a stated
+	// wait up to that would only retry into the same wall; above it, a consumer
+	// reports at once and skips WEB for the wait, which is what a batch wants.
+	botCheckCooldown = 2 * time.Minute
+
+	// botCheckRelaunchWindow is how often a bot check may buy a fresh identity.
+	// Unlike the proof streak, a passing proof does not reset it: a replacement
+	// that proves and then walls on a context would otherwise relaunch again.
+	botCheckRelaunchWindow = 10 * time.Minute
+
 	// pingProbeTimeout allows for a busy host without leaving /ping unbounded.
 	pingProbeTimeout = 5 * time.Second
 
@@ -318,6 +347,36 @@ var ErrClosed = errors.New("waxseal: minter closed")
 // rather than serving one. It is exported so a caller can tell a refusal apart
 // from an extraction failure.
 var ErrUnproven = errors.New("waxseal: session has not proved full-length streaming")
+
+// RetryAfterError wraps a refusal the daemon expects to lift on its own and says
+// how long the caller should wait before asking again: the rest of a cool-down,
+// or the browser pool's relaunch backoff. The server sends it as Retry-After and
+// retry_after_seconds; errors.Is still sees the cause, so routing is unmoved.
+type RetryAfterError struct {
+	Err   error
+	After time.Duration
+}
+
+func (e *RetryAfterError) Error() string { return e.Err.Error() }
+
+func (e *RetryAfterError) Unwrap() error { return e.Err }
+
+// Seconds is After rounded up to whole seconds and never below 1, the form the
+// header takes: a wait under a second is still later, not now.
+func (e *RetryAfterError) Seconds() int { return max(1, ceilSeconds(e.After)) }
+
+// unprovenRefusal is the refusal that starts a proof cool-down, so its wait is
+// the whole window.
+func unprovenRefusal(cause error) error {
+	return &RetryAfterError{Err: fmt.Errorf("%w: %w", ErrUnproven, cause), After: proofRetryCooldown}
+}
+
+// botCheckRefusal is the refusal that starts a bot-check cool-down. The cause
+// stays the bot check rather than ErrUnproven: the session may well have proved,
+// and the refusal should name the wall.
+func botCheckRefusal(cause error) error {
+	return &RetryAfterError{Err: cause, After: botCheckCooldown}
+}
 
 // NewMinter builds a single-identity minter for video (the landing watch id). It
 // launches a browser only when an operation first needs a session.
@@ -491,10 +550,17 @@ func (m *Minter) waitBeforeEstablish(ctx context.Context, what string) error {
 // instead, once; a replacement that dies too is refused, and the next request
 // relaunches.
 //
+// A bot check is not a proof failure at all: the identity is walled, not the
+// session's ability to stream, so waiting cannot lift it and a fresh identity
+// can. It relaunches at once rather than taking the first-failure step, at most
+// once per botCheckRelaunchWindow, and refuses with botCheckCooldown when that
+// grant is spent or the replacement is walled too. The proof-failure streak is a
+// separate rule and neither consults nor claims the other's grant.
+//
 // ensureProven returns the session and generation the caller should use for the
 // rest of the request: sess and gen unchanged on success or a refusal, or the
-// replacement pair after a second failure that still had its relaunch to spend
-// or after the browser died mid-proof. what names the caller ("player-context"
+// replacement pair after a second failure that still had its relaunch to spend,
+// after a bot check that claimed its window, or after the browser died mid-proof. what names the caller ("player-context"
 // or "session") and appears on every warn line this function emits, so a log
 // reader can tell which endpoint paid for a given proof attempt or refusal.
 func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint64, what string) (minterSession, uint64, error) {
@@ -505,16 +571,18 @@ func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint6
 // browser dies during the proof; the replacement is proved with it false, so a
 // request takes at most one replacement here.
 func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what string, replaceOnDeath bool) (minterSession, uint64, error) {
-	if sess.Established() {
-		return sess, gen, nil
-	}
-
+	// The cool-down is checked before the established short-circuit: a bot check
+	// can open one on a session that already proved, and that session must be
+	// refused too. A record exists only after a failed proof or a bot check, so an
+	// established session with no record is unaffected.
 	m.mu.Lock()
-	onCooldown := m.proofFailGen == gen && time.Since(m.proofFailedAt) < proofRetryCooldown
+	onCooldown := m.proofFailGen == gen && time.Since(m.proofFailedAt) < m.proofFailCooldown
 	var remaining time.Duration
+	var cause error
 	var warnCooldown bool
 	if onCooldown {
-		remaining = (proofRetryCooldown - time.Since(m.proofFailedAt)).Round(time.Millisecond)
+		remaining = (m.proofFailCooldown - time.Since(m.proofFailedAt)).Round(time.Millisecond)
+		cause = m.proofFailCause
 		// Warn once per cool-down window: repeated refusals compare the window's
 		// own proofFailedAt against the last value warned about, rather than firing
 		// on every refused request.
@@ -525,14 +593,23 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 	}
 	m.mu.Unlock()
 	if onCooldown {
-		if warnCooldown {
-			m.log.Warn("minter: refusing "+what+"; session is in a proof cool-down",
-				"what", what, "gen", gen, "remaining", remaining)
+		// The refusal names what actually failed rather than the bare sentinel, and
+		// states what is left of the window that failure earned.
+		refusal := error(&RetryAfterError{Err: fmt.Errorf("%w: %w", ErrUnproven, cause), After: remaining})
+		line := "minter: refusing " + what + "; session is in a proof cool-down"
+		if errors.Is(cause, browser.ErrBotCheck) {
+			line = "minter: refusing " + what + "; session is in a bot-check cool-down"
+			refusal = &RetryAfterError{Err: cause, After: remaining}
 		}
-		m.log.Debug("minter: refusing "+what+"; session is in a proof cool-down",
-			"what", what, "gen", gen, "remaining", remaining)
+		if warnCooldown {
+			m.log.Warn(line, "what", what, "gen", gen, "remaining", remaining)
+		}
+		m.log.Debug(line, "what", what, "gen", gen, "remaining", remaining)
 		m.metrics.UnprovenRejections.Add(1)
-		return sess, gen, ErrUnproven
+		return sess, gen, refusal
+	}
+	if sess.Established() {
+		return sess, gen, nil
 	}
 
 	proofErr := sess.EnsureEstablished(ctx)
@@ -563,13 +640,36 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 		m.log.Warn("minter: refusing "+what+"; the replacement session died during its proof as well",
 			"gen", gen, "err", proofErr)
 		m.metrics.UnprovenRejections.Add(1)
+		// No wait: nothing was recorded, so there is no window to state, and a
+		// caller's own quick retry is the right one after a death.
 		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
 	}
 	deadline := errors.Is(ctx.Err(), context.DeadlineExceeded)
+
+	// A bot check blocks the identity, not the session's ability to stream, so it
+	// skips the first-failure step a proof failure gets: waiting cannot lift it,
+	// and a fresh identity can. The proof-failure streak is a separate rule and is
+	// left untouched here.
+	if errors.Is(proofErr, browser.ErrBotCheck) {
+		// A caller whose own budget is already spent cannot launch and prove a fresh
+		// session, so it does not claim the window either.
+		if !m.recordBotCheck(gen, proofErr, !deadline) {
+			m.log.Warn("minter: refusing "+what+"; hit a bot check with no relaunch to spend",
+				"what", what, "gen", gen, "err", proofErr, "budget_spent", deadline)
+			m.metrics.UnprovenRejections.Add(1)
+			if deadline {
+				return sess, gen, ctx.Err()
+			}
+			return sess, gen, botCheckRefusal(proofErr)
+		}
+		m.log.Warn("minter: "+what+" proof hit a bot check; relaunching for a fresh identity", "gen", gen, "err", proofErr)
+		return m.relaunchAndProve(ctx, sess, gen, what, "bot check; relaunching", deadline, proofErr)
+	}
+
 	m.log.Warn("minter: refusing "+what+"; session could not prove full-length streaming",
 		"gen", gen, "err", proofErr)
 
-	secondFailure, relaunch := m.recordProofFailure(gen, true)
+	secondFailure, relaunch := m.recordProofFailure(gen, proofErr, true)
 	if !secondFailure {
 		// This refusal is returned to the caller either way (as ctx.Err() or as a
 		// wrapped ErrUnproven), so it counts once here rather than once per branch.
@@ -577,7 +677,7 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 		if deadline {
 			return sess, gen, ctx.Err()
 		}
-		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+		return sess, gen, unprovenRefusal(proofErr)
 	}
 	if !relaunch {
 		m.log.Warn("minter: proof-driven relaunch for this failure streak was already spent; the session will be recycled by a successful proof, a crash, a consumer report, or the max-age recycle",
@@ -586,29 +686,38 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 		if deadline {
 			return sess, gen, ctx.Err()
 		}
-		return sess, gen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+		return sess, gen, unprovenRefusal(proofErr)
 	}
 
 	// A second failure on the same generation, past the cool-down, with this
 	// failure streak's relaunch still unspent (recordProofFailure just claimed
 	// it): relaunch once and prove the fresh session.
-	// Escalations counts abandoning a generation this request was still using, so
-	// it is gated on retire actually closing one, matching both ladders. A
-	// generation retired out from under this proof is not this request's to
-	// abandon; the relaunch below still runs, because the request still needs a
-	// session it can prove.
+	return m.relaunchAndProve(ctx, sess, gen, what, "proof failed twice; relaunching", deadline, proofErr)
+}
+
+// relaunchAndProve is the tail both relaunching branches of prove share: retire
+// gen for reason, launch a fresh session, and prove that one. proofErr is the
+// failure that earned the relaunch, so the refusals below can name it and grade
+// a bot check apart from a session that could not prove. deadline says the
+// caller's own budget is already spent.
+//
+// Escalations counts abandoning a generation this request was still using, so it
+// is gated on retire actually closing one, matching both ladders. A generation
+// retired out from under this proof is not this request's to abandon; the
+// relaunch still runs, because the request still needs a session it can prove.
+func (m *Minter) relaunchAndProve(ctx context.Context, sess minterSession, gen uint64, what, reason string, deadline bool, proofErr error) (minterSession, uint64, error) {
 	if deadline {
 		// ctx's own deadline is what ended this proof, so this request has no
 		// budget left to launch and prove a fresh session. Retire the generation
 		// and let the next request's ensure relaunch instead; do not launch here.
 		// This request is refused, so it is counted like the branches above.
 		m.metrics.UnprovenRejections.Add(1)
-		if m.retire(gen, "proof timed out twice; relaunching on the next request", false) {
+		if m.retire(gen, reason+" (out of budget; relaunching on the next request)", false) {
 			m.metrics.Escalations.Add(1)
 		}
 		return sess, gen, ctx.Err()
 	}
-	if m.retire(gen, "proof failed twice; relaunching", false) {
+	if m.retire(gen, reason, false) {
 		m.metrics.Escalations.Add(1)
 	}
 	newSess, newGen, err := m.ensure(ctx)
@@ -638,16 +747,29 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 				"gen", newGen, "err", proofErr)
 			return newSess, newGen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
 		}
+		// A replacement that met the wall too is named and counted as the bot check
+		// it is. This request is already on its one replacement, so it claims
+		// nothing: recordBotCheck only opens the cool-down on the fresh generation.
+		if errors.Is(proofErr, browser.ErrBotCheck) {
+			m.log.Warn("minter: refusing "+what+"; the relaunched session hit a bot check as well",
+				"gen", newGen, "err", proofErr)
+			m.recordBotCheck(newGen, proofErr, false)
+			m.metrics.UnprovenRejections.Add(1)
+			if newDeadline {
+				return newSess, newGen, ctx.Err()
+			}
+			return newSess, newGen, botCheckRefusal(proofErr)
+		}
 		m.log.Warn("minter: refusing "+what+"; relaunched session could not prove full-length streaming",
 			"gen", newGen, "err", proofErr)
 		// Record the fresh generation's own failure, but never let this call claim
 		// the failure streak's relaunch: that grant was already spent (or kept
-		// unspent) by the recordProofFailure call above, and a generation that
+		// unspent) by prove's own recordProofFailure call, and a generation that
 		// ensure just published cannot legitimately carry a prior failure of its
 		// own. secondFailure should therefore always be false here; a true value
 		// would mean gen and newGen collided, which is worth a warn rather than a
 		// silent second relaunch.
-		if secondFailure, _ := m.recordProofFailure(newGen, false); secondFailure {
+		if secondFailure, _ := m.recordProofFailure(newGen, proofErr, false); secondFailure {
 			m.log.Warn("minter: relaunched session's generation already carried a proof-failure record; a freshly published generation should never carry one",
 				"what", what, "gen", newGen)
 		}
@@ -658,14 +780,15 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 		if newDeadline {
 			return newSess, newGen, ctx.Err()
 		}
-		return newSess, newGen, fmt.Errorf("%w: %w", ErrUnproven, proofErr)
+		return newSess, newGen, unprovenRefusal(proofErr)
 	}
 	m.markProved()
 	return newSess, newGen, nil
 }
 
-// recordProofFailure marks generation gen's most recent proof attempt as
-// failed and reports whether this is gen's second recorded failure and, if so,
+// recordProofFailure marks generation gen's most recent proof attempt as failed
+// under cause, which a later refusal from inside the cool-down names, and reports
+// whether this is gen's second recorded failure and, if so,
 // whether this failure streak still has its one relaunch to spend. claimRelaunch
 // tells recordProofFailure whether this call is even eligible to spend the
 // streak's relaunch: a caller passes false when it must record a failure but must
@@ -678,17 +801,44 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 // current generation, so mintMu (held by every caller through Mint or
 // PlayerContext) rules out a concurrent claim on a different generation racing
 // this one.
-func (m *Minter) recordProofFailure(gen uint64, claimRelaunch bool) (secondFailure, relaunchGranted bool) {
+func (m *Minter) recordProofFailure(gen uint64, cause error, claimRelaunch bool) (secondFailure, relaunchGranted bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	secondFailure = m.proofFailGen == gen
+	// The two rules share one cool-down record, so the streak reads the cause: a
+	// bot check is not a proof failure and must not make this one the second.
+	secondFailure = m.proofFailGen == gen && !errors.Is(m.proofFailCause, browser.ErrBotCheck)
 	m.proofFailGen = gen
 	m.proofFailedAt = time.Now()
+	m.proofFailCause, m.proofFailCooldown = cause, proofRetryCooldown
 	if secondFailure && claimRelaunch && !m.proofRelaunched {
 		m.proofRelaunched = true
 		relaunchGranted = true
 	}
 	return secondFailure, relaunchGranted
+}
+
+// recordBotCheck counts a bot check against gen, starts its cool-down, and
+// reports whether this one may relaunch: the first in botCheckRelaunchWindow
+// does, and claims the window. Waiting cannot lift a bot check, so there is no
+// first-failure step; the proof-failure streak is a separate rule and is not
+// consulted.
+//
+// claimRelaunch says whether this caller could act on a grant at all, the way
+// recordProofFailure's does. A caller already running on a replacement passes
+// false: it will not launch again whatever the answer, and claiming the window
+// there would spend the grant with no fresh identity to show for it and refuse
+// the next bot check that could have used one.
+func (m *Minter) recordBotCheck(gen uint64, cause error, claimRelaunch bool) (relaunchGranted bool) {
+	m.metrics.BotChecks.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.proofFailGen, m.proofFailedAt = gen, time.Now()
+	m.proofFailCause, m.proofFailCooldown = cause, botCheckCooldown
+	if !claimRelaunch || time.Since(m.botCheckRelaunchedAt) < botCheckRelaunchWindow {
+		return false
+	}
+	m.botCheckRelaunchedAt = time.Now()
+	return true
 }
 
 // markMinted records a completed in-page mint.
@@ -723,6 +873,7 @@ func (m *Minter) markProved() {
 	m.proofFailGen = 0
 	m.proofFailedAt = time.Time{}
 	m.proofCooldownWarnedAt = time.Time{}
+	m.proofFailCause, m.proofFailCooldown = nil, 0
 	m.proofRelaunched = false
 	m.mu.Unlock()
 }
@@ -965,6 +1116,11 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		if err != nil {
 			m.mu.Unlock()
 			m.metrics.LaunchFailures.Add(1)
+			// The pool is the only place that knows how long its backoff has left,
+			// so a caller refused by one gets to be told.
+			if be, ok := errors.AsType[*browser.RelaunchBackoffError](err); ok {
+				err = &RetryAfterError{Err: err, After: be.Wait}
+			}
 			return nil, 0, err
 		}
 		if m.closed {
@@ -994,6 +1150,7 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		m.proofFailGen = 0
 		m.proofFailedAt = time.Time{}
 		m.proofCooldownWarnedAt = time.Time{}
+		m.proofFailCause, m.proofFailCooldown = nil, 0
 		// A generation bump invalidates every cached token. Under m.mu, no
 		// new-generation cachePut can interleave before the clear, so every existing
 		// entry belongs to the old session. Clear only the positive cache: an
@@ -1426,6 +1583,11 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	if m.playerContextDied(ctx, sess, gen, err) {
 		return m.playerContextOnReplacement(ctx, videoID)
 	}
+	// A bot check is about the identity, not the video and not the page, so it
+	// skips the in-place retry that would meet the same wall.
+	if ctx.Err() == nil && errors.Is(err, browser.ErrBotCheck) {
+		return m.playerContextBotChecked(ctx, videoID, gen, err)
+	}
 	if m.playerContextStop(ctx, videoID, err) { // terminal or cancelled: don't escalate.
 		return browser.PlayerContext{}, gen, err
 	}
@@ -1448,6 +1610,9 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		}
 		if m.playerContextDied(ctx, sess, gen, err) {
 			return m.playerContextOnReplacement(ctx, videoID)
+		}
+		if ctx.Err() == nil && errors.Is(err, browser.ErrBotCheck) {
+			return m.playerContextBotChecked(ctx, videoID, gen, err)
 		}
 		if m.playerContextStop(ctx, videoID, err) {
 			return browser.PlayerContext{}, gen, err
@@ -1479,6 +1644,27 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// only that is an escalation: a generation somebody else already retired is
 	// not this request's to abandon, and only one attempt against it ever failed.
 	if m.retire(gen, "player-context failed twice; relaunching", false) {
+		m.metrics.Escalations.Add(1)
+	}
+	return m.playerContextOnReplacement(ctx, videoID)
+}
+
+// playerContextBotChecked answers a bot check met while serving a context. The
+// wall keys on the visitor, so the one thing that can lift it is a fresh
+// identity: the request takes the replacement inline, the way level 2 does, and
+// is served from it when the new identity is clean. A window with its relaunch
+// already spent refuses with the cool-down instead. The video is never
+// negative-cached: nothing is wrong with it.
+func (m *Minter) playerContextBotChecked(ctx context.Context, videoID string, gen uint64, err error) (browser.PlayerContext, uint64, error) {
+	m.metrics.PlayerContextFailures.Add(1)
+	if !m.recordBotCheck(gen, err, true) {
+		m.log.Warn("minter: refusing player-context; hit a bot check with no relaunch to spend",
+			"gen", gen, "video_id", videoID, "err", err)
+		return browser.PlayerContext{}, gen, botCheckRefusal(err)
+	}
+	m.log.Warn("minter: player-context hit a bot check; relaunching for a fresh identity",
+		"gen", gen, "video_id", videoID, "err", err)
+	if m.retire(gen, "bot check; relaunching", false) {
 		m.metrics.Escalations.Add(1)
 	}
 	return m.playerContextOnReplacement(ctx, videoID)
@@ -1519,6 +1705,15 @@ func (m *Minter) playerContextOnReplacement(ctx context.Context, videoID string)
 		if errors.Is(err, browser.ErrUnplayable) {
 			m.negCachePut(videoID, err)
 			return browser.PlayerContext{}, gen, err
+		}
+		// A wall on the replacement opens the cool-down on this generation. The
+		// request is already on its one replacement, so it claims nothing: whether
+		// the window still holds a grant is the next request's to find out.
+		if errors.Is(err, browser.ErrBotCheck) {
+			m.recordBotCheck(gen, err, false)
+			m.log.Warn("minter: refusing player-context; the replacement session hit a bot check as well",
+				"gen", gen, "video_id", videoID, "err", err)
+			return browser.PlayerContext{}, gen, botCheckRefusal(err)
 		}
 		return browser.PlayerContext{}, gen, fmt.Errorf("minter: player-context failed after relaunch: %w", err)
 	}
@@ -2053,7 +2248,16 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 		// not already established, so a rerun that finds it already proved never
 		// double-counts this mark.
 		m.markPlayback()
-		if err != nil {
+		switch {
+		case err == nil:
+			m.markProved()
+		case errors.Is(err, browser.ErrBotCheck):
+			// No cool-down for a bot check at boot: a walled daemon would refuse its
+			// first requests without ever trying a fresh identity. With no record the
+			// first request meets the wall itself and relaunches at once.
+			m.metrics.BotChecks.Add(1)
+			m.log.Warn("minter: self-test establishment hit a bot check; the first request will relaunch for a fresh identity", "err", err)
+		default:
 			m.log.Warn("minter: self-test establishment failed; a later /session or /player-context request will retry", "err", err)
 			// Record the failure on this generation through the same helper
 			// ensureProven uses for a first failure, so the first /player-context
@@ -2061,9 +2265,7 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 			// for another proof attempt against a session that just failed one. The
 			// self-test never relaunches on its own, so it never claims the failure
 			// streak's relaunch: that stays available for ensureProven's own ladder.
-			m.recordProofFailure(gen, false)
-		} else {
-			m.markProved()
+			m.recordProofFailure(gen, err, false)
 		}
 	}
 	return nil
@@ -2083,6 +2285,7 @@ var lifetimeCounterKeys = []string{
 	"status2_rejections",
 	"separation_waits",
 	"unproven_rejections",
+	"bot_checks",
 	"crashes",
 	"probe_failures",
 	"probe_busy",
@@ -2113,6 +2316,7 @@ func (m *Minter) counterValues() map[string]int64 {
 		"status2_rejections":                    m.metrics.Status2Rejections.Load(),
 		"separation_waits":                      m.metrics.SeparationWaits.Load(),
 		"unproven_rejections":                   m.metrics.UnprovenRejections.Load(),
+		"bot_checks":                            m.metrics.BotChecks.Load(),
 		"crashes":                               m.metrics.Crashes.Load(),
 		"probe_failures":                        m.metrics.ProbeFailures.Load(),
 		"probe_busy":                            m.metrics.ProbeBusy.Load(),

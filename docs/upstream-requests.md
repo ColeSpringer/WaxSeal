@@ -16,93 +16,39 @@ follow-up and remove both entries.
 
 ## WaxTap
 
-- **A sidecar error's `code` is discarded.** WaxSeal answers every
-  failure with `{"error","code"}`, and the code carries the consumer's
-  decision: `video-unavailable` (422) is terminal for the video, while
-  `player-context-failed` (502) during the 30 s proof cool-down and
-  `no-session` (503) in the re-establishment window are safe to retry.
-  `sidecarReason` (`sidecar.go`) keeps only the `error` or `message`
-  text, `SidecarResponseError` carries the status and that text, the CLI
-  classifies by status alone (`sidecarResponseExit`: a 4xx other than
-  408 and 429 exits 2, a 5xx exits 9), and the library wraps the error in
-  `waxerr.ProviderError` and falls back down the client chain before
-  delivery. So a 422 is never mapped to `ErrVideoUnavailable`: the chain
-  learns the availability again from its own `/player`, and a chain with
-  no fallback exits 2. And a 502 or 503 is a provider failure like any
-  other: WaxTap leaves the WEB path for that download (the adopted
-  session, then a non-WEB client) instead of waiting out a cool-down the
-  daemon lifts on its own, and the WEB stream is what the sidecar exists
-  to provide. Wanted: a `Code` on `SidecarResponseError` read from the
-  JSON, `video-unavailable` mapped to `ErrVideoUnavailable` (skip-class,
-  no fallback needed), and one retry after the cool-down (or after a
-  `Retry-After`, once WaxSeal sends one; see deferred-work.md) for
-  `player-context-failed` and `no-session` before the fallback. Shipped
-  workaround: the README documents both refusals, and a library consumer
-  that embeds WaxSeal's own `client` and `provider/` packages sees
-  `*client.APIError` with the code; one on the sidecar path sees the
-  text.
+- **`potoken.PlayerContext` cannot carry the context's user agent.**
+  `/player-context` now sends `user_agent`, the session identity the
+  context was minted under and the same value `/session` exports,
+  answering WaxTap's own ask for it (its `docs/upstream-requests.md`,
+  2026-09-16). `potoken.PlayerContext` has `ClientVersion` only and the
+  sidecar's `playerContextResponse` reads no `user_agent`, so the context
+  arm streams under WaxTap's own user agent with the context's client
+  version, which is the same coherence gap the session arm had before
+  `potoken.Session` grew the pair. Wanted: `UserAgent` on
+  `potoken.PlayerContext`, read by the sidecar and applied through
+  `webContextProfile` the way the session's is. Shipped workaround: none
+  is needed. Delivery is full length under WaxTap's identity, as WaxTap's
+  own ask says, so this is coherence rather than an observed failure. The
+  test that will notice the field landing is the mapping pin in
+  `provider_test.go`. Opened 2026-09-17.
 
-- **`potoken.PlayerContext` cannot carry the video's metadata.**
-  `/player-context` now returns `channel_id`, `description`, the
-  `thumbnails` ladder, `is_live_content`, `is_live_now`, `is_upcoming`,
-  and `publish_date` beside the title, author, and length, answering
-  WaxTap's own ask for them (its `docs/upstream-requests.md`, 2026-09-06;
-  WaxTap's deferred entry "Fill the web-context `Video`" is the consumer
-  half). `potoken.PlayerContext` has `Title`, `Author`, and
-  `LengthSeconds` only, so `provider.ProvidePlayerContext` maps those
-  three and drops the rest, and a Go consumer that goes through the
-  adapter still builds a `Video` with an empty `ChannelID` and
-  `Description`. Wanted: the seven fields on `potoken.PlayerContext`,
-  with the ladder in the order WaxSeal sends it (the player response's
-  own, smallest first) and the publish date as the raw string, since
-  WaxTap already parses RFC 3339 or `2006-01-02` on its `/player` path.
-  Shipped workaround: WaxTap's sidecar reads the JSON directly, so the
-  sidecar path needs nothing; only the adapter is short. Mapping the
-  fields and pinning them in `provider_test.go` is the WaxSeal-side
-  follow-up in deferred-work.md.
-
-- **`potoken.Session` cannot carry the attested identity's user agent or
-  client version.** `/session` exports `user_agent` and `client_version`
-  beside `visitor_data` and the cookies so that attestation, token
-  binding, and the download run under one browser identity, and
-  `client.Session` carries both. `potoken.Session` has `VisitorData`,
-  `Cookies`, and `Generation` only, and WaxTap's `/session` sidecar
-  documents `user_agent`, `client_version`, and `cookie_header` as
-  ignored, so an adopted session streams under WaxTap's own Chrome user
-  agent (`clientident`) and its pinned WEB client version rather than the
-  identity that attested the token and issued the cookies, where a player
-  context's `ClientVersion` is already applied through
-  `webContextProfile`. Wanted: `UserAgent` and `ClientVersion` on
-  `potoken.Session` (empty meaning WaxTap's own), read by the sidecar and
-  applied to the adopted WEB profile the way the context's version is.
-  Shipped workaround: none is needed today. The session arm streams full
-  length under WaxTap's own profile (`provider` e2e
-  `TestSessionOnlyFullLengthHTTP`, 3 of 3 on 2026-09-02) and WaxTap keeps
-  its Chrome major current, so this is a coherence gap rather than an
-  observed failure. `provider.Session` drops the two fields; mapping them
-  is the WaxSeal-side follow-up in deferred-work.md.
-
-- **The sidecar clients' timeouts are fixed, or default below WaxSeal's
-  documented first-call cost.** The `/get_pot` and `/session` sidecar
-  clients use a fixed 30 s `http.Client` timeout with no `SidecarOption`
-  to change it; `/player-context` has no client timeout and relies on
-  `Timeouts.WebContext`, which the CLI defaults to 20 s
-  (`cmd/waxtap/config.go`) and the library leaves unbounded at zero. On
-  the WaxSeal side, the first `/player-context` on a browser session
-  waits for the streaming proof and then the 12 s separation window
-  (about 15 s on a warm session), `/session` runs the proof inline when
-  the session is unproven, and after a relaunch (a crash, a report-driven
-  retirement, `--streaming-max-age`) either call first pays the launch,
-  attestation, and proof that startup spends 10 to 30 s on. So the CLI's
-  20 s can expire on the first context after a relaunch, the fixed 30 s
-  sits at the top of the documented range for `/session`, and a call that
-  times out on the consumer's side has spent that wait for nothing.
-  Wanted: a `SidecarOption` for the token and session clients' timeout,
-  and a CLI web-context default that covers a proof plus the separation
-  window after a relaunch, or the session sidecar honouring
-  `Timeouts.WebContext` as the context sidecar does. Shipped workaround:
-  the startup self-test proves the session before the daemon accepts
-  traffic, so the common first call is fast; library callers such as the
-  `provider` e2e harness set no web-context bound; CLI users raise
-  `WAXTAP_WEB_CONTEXT_TIMEOUT`. No timeout failure has been observed; the
-  entry records a mismatch between the two repos' documented numbers.
+- **`SidecarResponseError` cannot carry the cause, and the retry rule is
+  unexported.** `provider/` translates a `*client.APIError` into a
+  `*waxtap.SidecarResponseError` so WaxTap classifies and waits exactly
+  as it does for its own sidecar. Two things follow from the types.
+  `SidecarResponseError` has no field for an underlying error and its
+  `Unwrap` is reserved for the playability verdict, so the original
+  `*client.APIError` cannot travel with it: a consumer that reaches
+  through `provider/` for `errors.AsType[*client.APIError]` no longer
+  finds one, and has to use the WaxSeal `client` package directly for
+  that. And `sidecarCall`, `sidecarRetryWait`, and
+  `retryableSidecarStatus` are unexported, so the one-retry rule is
+  copied into `provider/call` rather than shared, and the two can drift
+  apart silently. Wanted: a `Cause error` on `SidecarResponseError`
+  (reported, not unwrapped, so the verdict `Unwrap` is unchanged), and
+  the retry rule exported in some form, for example a
+  `RetryAfterFor(err) (time.Duration, bool)`. Shipped workaround: the
+  copy mirrors WaxTap `9a53a55` line for line and
+  `TestProviderRetriesOnceAfterStatedWait` pins every arm of it, so a
+  drift is at least visible in this repo's own tests. Opened 2026-09-17,
+  from a review of the adapter change.

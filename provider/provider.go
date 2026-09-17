@@ -1,6 +1,11 @@
 // Package provider adapts a WaxSeal HTTP client to WaxTap's potoken.Provider
 // interface. It lives in a separate Go module so the rest of WaxSeal does not
 // depend on WaxTap.
+//
+// Failures are reported as WaxTap's own sidecar error types, and a transient one
+// is retried once after the daemon's stated wait, exactly as WaxTap's HTTP
+// sidecar does. A consumer therefore classifies refusals and waits the same way
+// whichever of the two adapters it wires.
 package provider
 
 import (
@@ -8,12 +13,59 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/colespringer/waxseal/client"
+	waxtap "github.com/colespringer/waxtap/v3"
 	"github.com/colespringer/waxtap/v3/potoken"
 )
+
+// Endpoint labels and paths. The label names this adapter in the errors WaxTap
+// prints; the path completes the endpoint the daemon was asked at.
+const (
+	labelPOToken       = "WaxSeal PO-token endpoint"
+	labelPlayerContext = "WaxSeal player-context endpoint"
+	labelSession       = "WaxSeal session endpoint"
+	labelReport        = "WaxSeal report endpoint"
+
+	pathPOToken       = "/get_pot"
+	pathPlayerContext = "/player-context"
+	pathSession       = "/session"
+	pathReport        = "/report"
+)
+
+// Text caps on the way into a sidecar error, matching WaxTap's own. An
+// APIError.Message can be kilobytes of CDP trace, and these strings print into
+// WaxTap's CLI hints.
+const (
+	reasonRunes = 200
+	codeRunes   = 64
+)
+
+const (
+	// retryAfterMax is the longest stated wait this adapter sleeps through, and
+	// transientWait is the poke a transient failure that stated none earns. Both
+	// are WaxTap's sidecar numbers: past the maximum a wait is a cool-down to
+	// report, not to sleep through.
+	retryAfterMax = 60 * time.Second
+	transientWait = 500 * time.Millisecond
+)
+
+// sleep waits d or until ctx ends. It is a variable so a test can record the
+// wait instead of serving it.
+var sleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
 
 // ErrUnsupportedScope is returned for a scope WaxSeal does not serve, such as
 // ScopeSubtitles.
@@ -55,6 +107,146 @@ func New(c *client.Client, opts ...Option) *Provider {
 	return p
 }
 
+// sidecarErr translates a client failure into the error type WaxTap's own HTTP
+// sidecar would have produced, so its classifier, WEB-context skip window, CLI
+// hints, and doctor output all work for this adapter unchanged. A nil error
+// stays nil.
+//
+// Only a caller that actually went away gets its error back untranslated, which
+// is why this reads ctx rather than the error: net/http reports its own client
+// timeout as context.DeadlineExceeded too, and a daemon that is merely slow is a
+// transport failure worth one retry, not a caller giving up.
+func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+	endpoint := p.c.BaseURL() + path
+	if apiErr, ok := errors.AsType[*client.APIError](err); ok {
+		// Only a recognized envelope's text is forwarded. Anything else in Message
+		// is raw bytes from whatever answered instead, and Reason prints into
+		// WaxTap's CLI hints, so an intermediary's page never travels.
+		reason := "unrecognized response body"
+		if apiErr.Envelope {
+			reason = capRunes(apiErr.Message, reasonRunes)
+		}
+		return &waxtap.SidecarResponseError{
+			Label:      label,
+			Endpoint:   endpoint,
+			StatusCode: apiErr.StatusCode,
+			Code:       capRunes(apiErr.Code, codeRunes),
+			Details:    capRunes(apiErr.Details, reasonRunes),
+			Reason:     reason,
+			RetryAfter: apiErr.RetryAfter,
+		}
+	}
+	// net.Error covers the *url.Error http.Client.Do wraps a transport failure in,
+	// so one check answers both.
+	if _, ok := errors.AsType[net.Error](err); ok {
+		return &waxtap.SidecarError{Label: label, Endpoint: endpoint, Err: err}
+	}
+	// The daemon answered, but not with something usable: a decode failure, or one
+	// of the shape checks below. A zero status marks a contract mismatch, which is
+	// never retried.
+	return &waxtap.SidecarResponseError{Label: label, Endpoint: endpoint, Reason: capRunes(err.Error(), reasonRunes)}
+}
+
+// capRunes truncates s to at most n runes, appending an ellipsis when truncated,
+// the way WaxTap caps the same fields. It counts runes so a multibyte character
+// is never split.
+func capRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\u2026"
+}
+
+// call runs fn and retries it once when the translated failure earns it, on
+// WaxTap's sidecar rule: a stated wait up to retryAfterMax on a 408, 429, or
+// 5xx, or transientWait on a transport failure or a 408/5xx that stated none.
+//
+// Sleeping into a deadline is the waste a stated wait exists to avoid, so a
+// cancellation returns the cancellation, and a budget that cannot fit the wait
+// plus a second of headroom returns the refusal now. A deadline that expires
+// during the sleep returns the refusal too: it is the error that explains the
+// run.
+func (p *Provider) call(ctx context.Context, label string, fn func() error) error {
+	err := fn()
+	if err == nil {
+		return nil
+	}
+	wait, retry := retryWait(err)
+	if !retry {
+		return err
+	}
+	if cerr := ctx.Err(); cerr != nil && !errors.Is(cerr, context.DeadlineExceeded) {
+		return cerr
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+		return err
+	}
+	p.log.Info("waxseal/provider: retrying after the daemon's stated wait",
+		"endpoint", label, "wait", wait, "code", sidecarCode(err))
+	if serr := sleep(ctx, wait); serr != nil {
+		if !errors.Is(serr, context.DeadlineExceeded) {
+			return serr
+		}
+		return err
+	}
+	return fn()
+}
+
+// retryWait reports how long to wait before retrying err and whether a retry is
+// warranted at all. A bare 429 says back off, so it earns one only with a stated
+// wait; a wait past retryAfterMax is a cool-down to report rather than serve.
+func retryWait(err error) (time.Duration, bool) {
+	if _, ok := errors.AsType[*waxtap.SidecarError](err); ok {
+		return transientWait, true
+	}
+	sre, ok := errors.AsType[*waxtap.SidecarResponseError](err)
+	if !ok {
+		return 0, false
+	}
+	if sre.RetryAfter > 0 {
+		if sre.RetryAfter > retryAfterMax {
+			return 0, false
+		}
+		return sre.RetryAfter, sre.StatusCode == http.StatusTooManyRequests || retryableStatus(sre.StatusCode)
+	}
+	if retryableStatus(sre.StatusCode) {
+		return transientWait, true
+	}
+	return 0, false
+}
+
+// retryableStatus reports whether a status is the kind a second attempt can
+// clear on its own: the daemon may be launching a browser, mid-relaunch, or
+// briefly wedged. It is WaxTap's set, so one status does not mean transient on
+// one adapter and final on the other.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, // 408
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout:      // 504
+		return true
+	default:
+		return false
+	}
+}
+
+// sidecarCode is the refusal's code for a log line, empty for anything else.
+func sidecarCode(err error) string {
+	if sre, ok := errors.AsType[*waxtap.SidecarResponseError](err); ok {
+		return sre.Code
+	}
+	return ""
+}
+
 // ProvidePOToken maps a WaxTap scope to a WaxSeal content_binding and mints the
 // token. ScopeGVS binds visitor_data, ScopePlayer binds video_id, ScopeNone does
 // nothing, and ScopeSubtitles returns ErrUnsupportedScope.
@@ -70,7 +262,12 @@ func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (pot
 	default: // ScopeSubtitles or unknown
 		return potoken.Response{}, fmt.Errorf("%w: %s", ErrUnsupportedScope, req.Scope)
 	}
-	tok, err := p.c.POToken(ctx, binding, scope)
+	var tok client.Token
+	err := p.call(ctx, labelPOToken, func() error {
+		var err error
+		tok, err = p.c.POToken(ctx, binding, scope)
+		return p.sidecarErr(ctx, labelPOToken, pathPOToken, err)
+	})
 	if err != nil {
 		return potoken.Response{}, err
 	}
@@ -90,11 +287,25 @@ func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (pot
 // by value here is the one arm a delivery cap cannot rotate: WaxTap holds it for
 // the Client's lifetime with nowhere to report it.
 func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
-	s, err := p.c.Session(ctx)
+	var s *client.Session
+	err := p.call(ctx, labelSession, func() error {
+		var err error
+		s, err = p.c.Session(ctx)
+		return p.sidecarErr(ctx, labelSession, pathSession, err)
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &potoken.Session{VisitorData: s.VisitorData, Cookies: s.Cookies, Generation: s.SessionGeneration}, nil
+	// The identity travels whole: WaxTap applies the user agent and client version
+	// to every WEB request made under this session, so the cookies, the visitor id,
+	// and the requests present one browser.
+	return &potoken.Session{
+		VisitorData:   s.VisitorData,
+		Cookies:       s.Cookies,
+		UserAgent:     s.UserAgent,
+		ClientVersion: s.ClientVersion,
+		Generation:    s.SessionGeneration,
+	}, nil
 }
 
 // ProvideSession is the pull-based form of Session, for WaxTap's
@@ -150,19 +361,29 @@ func (p *Provider) InvalidateSession(ctx context.Context, inv potoken.SessionInv
 	if inv.Generation == 0 {
 		return errors.New("waxseal/provider: no session generation to report; the session or player-context response carried none")
 	}
+	// A report is sent once, so it is deliberately not routed through call: the
+	// one resend below is about dropping a rejected diagnostic, not about waiting
+	// out a transient failure.
 	res, err := p.c.Report(ctx, inv.Generation, inv.VideoID, inv.Reason)
 	if err != nil {
 		if !rejectedDiagnostics(err, inv) {
-			return err
+			return p.sidecarErr(ctx, labelReport, pathReport, err)
 		}
 		p.log.Warn("waxseal/provider: daemon rejected the report's diagnostics; retrying without them",
 			"video_id", preview(inv.VideoID), "reason", preview(inv.Reason), "err", err)
 		if res, err = p.c.Report(ctx, inv.Generation, "", ""); err != nil {
-			return err
+			return p.sidecarErr(ctx, labelReport, pathReport, err)
 		}
 	}
 	if res.RetryAfterSeconds > 0 {
-		return fmt.Errorf("waxseal/provider: session recycling is rate-limited; retry in %ds", res.RetryAfterSeconds)
+		// The daemon accepted the request and refused the recycle, so this is a
+		// refusal with a wait, shaped like every other one WaxTap reads.
+		return &waxtap.SidecarResponseError{
+			Label:      labelReport,
+			Endpoint:   p.c.BaseURL() + pathReport,
+			Reason:     "session recycling is rate-limited",
+			RetryAfter: time.Duration(res.RetryAfterSeconds) * time.Second,
+		}
 	}
 	return nil
 }
@@ -176,23 +397,38 @@ func rejectedDiagnostics(err error, inv potoken.SessionInvalidation) bool {
 	if inv.VideoID == "" && inv.Reason == "" {
 		return false
 	}
-	var apiErr *client.APIError
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest
+	apiErr, ok := errors.AsType[*client.APIError](err)
+	return ok && apiErr.StatusCode == http.StatusBadRequest
 }
 
 // ProvidePlayerContext fetches the attested WEB player context for videoID and
 // maps it to WaxTap's SABR audio context. It rejects incomplete responses before
 // WaxTap begins SABR setup.
 func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (potoken.PlayerContext, error) {
-	pc, err := p.c.PlayerContext(ctx, videoID)
+	var pc *client.PlayerContext
+	err := p.call(ctx, labelPlayerContext, func() error {
+		var err error
+		pc, err = p.c.PlayerContext(ctx, videoID)
+		return p.sidecarErr(ctx, labelPlayerContext, pathPlayerContext, err)
+	})
 	if err != nil {
 		return potoken.PlayerContext{}, err
 	}
 	if pc.PlayabilityStatus != "" && !strings.EqualFold(pc.PlayabilityStatus, "OK") {
-		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context returned playability status %q", pc.PlayabilityStatus)
+		// A 200 that names a non-OK status is the same verdict a 422
+		// video-unavailable carries, so code it the same way and let WaxTap unwrap
+		// both to the playability verdict.
+		return potoken.PlayerContext{}, &waxtap.SidecarResponseError{
+			Label:    labelPlayerContext,
+			Endpoint: p.c.BaseURL() + pathPlayerContext,
+			Code:     waxtap.SidecarCodeVideoUnavailable,
+			Details:  capRunes(pc.PlayabilityStatus, reasonRunes),
+			Reason:   fmt.Sprintf("playability_status %q", capRunes(pc.PlayabilityStatus, reasonRunes)),
+		}
 	}
 	if pc.ServerAbrStreamingURL == "" || pc.PlayerURL == "" || pc.VisitorData == "" || pc.VideoPlaybackUstreamerConfig == "" || len(pc.AudioFormats) == 0 {
-		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context missing server_abr_streaming_url, player_url, visitor_data, video_playback_ustreamer_config, or audio_formats")
+		return potoken.PlayerContext{}, p.sidecarErr(ctx, labelPlayerContext, pathPlayerContext,
+			errors.New("player-context missing server_abr_streaming_url, player_url, visitor_data, video_playback_ustreamer_config, or audio_formats"))
 	}
 
 	formats := make([]potoken.PlayerContextFormat, 0, len(pc.AudioFormats))
@@ -212,6 +448,20 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 			AudioTrackID:     f.AudioTrackID,
 		})
 	}
+	// Allocate the ladder only when the response carried rungs, so an absent or
+	// empty thumbnails key leaves Thumbnails nil. A rung without a URL is dropped,
+	// matching WaxTap's own sidecar. The order is the response's own, smallest
+	// first; WaxTap sorts it itself.
+	var thumbs []potoken.PlayerContextThumbnail
+	for _, t := range pc.Thumbnails {
+		if t.URL == "" {
+			continue
+		}
+		thumbs = append(thumbs, potoken.PlayerContextThumbnail{URL: t.URL, Width: t.Width, Height: t.Height})
+	}
+	// pc.UserAgent has nowhere to go: potoken.PlayerContext carries ClientVersion
+	// only, so the context arm streams under WaxTap's own user agent. See the open
+	// entry in docs/upstream-requests.md.
 	return potoken.PlayerContext{
 		ServerAbrURL:    pc.ServerAbrStreamingURL,
 		PlayerURL:       pc.PlayerURL,
@@ -221,6 +471,13 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 		Title:           pc.Title,
 		Author:          pc.Author,
 		LengthSeconds:   pc.LengthSeconds,
+		ChannelID:       pc.ChannelID,
+		Description:     pc.Description,
+		Thumbnails:      thumbs,
+		IsLiveContent:   pc.IsLiveContent,
+		IsLiveNow:       pc.IsLiveNow,
+		IsUpcoming:      pc.IsUpcoming,
+		PublishDate:     pc.PublishDate,
 		AudioFormats:    formats,
 		Generation:      pc.SessionGeneration,
 	}, nil

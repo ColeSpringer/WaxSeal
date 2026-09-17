@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -788,13 +789,24 @@ func (f *fakePlayerSession) Close() { f.closed.Store(true) }
 // (generation 1), so live-session handlers run without a browser.
 func liveServer(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) *Server {
 	t.Helper()
+	s, _ := liveServerMinter(t, keys, sessions)
+	return s
+}
+
+// liveServerMinter is liveServer for a test that also has to reach the minter
+// behind one tenant, such as to age a cool-down without sleeping through it.
+func liveServerMinter(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) (*Server, map[string]*minter.Minter) {
+	t.Helper()
 	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0, 0)
+	minters := make(map[string]*minter.Minter, len(sessions))
 	for key, sess := range sessions {
-		if _, err := tn.InjectSessionForTest(context.Background(), key, sess); err != nil {
+		m, err := tn.InjectSessionForTest(context.Background(), key, sess)
+		if err != nil {
 			t.Fatalf("inject session for %q: %v", key, err)
 		}
+		minters[key] = m
 	}
-	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}, minters
 }
 
 func TestPlayerContextEchoesGeneration(t *testing.T) {
@@ -2212,6 +2224,8 @@ func TestPlayerContextUnprovenSessionMaps502(t *testing.T) {
 	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
 		t.Errorf("unproven_rejections = %v, want 1", got)
 	}
+	// The failure opened a cool-down, so the refusal states how long it runs.
+	wantRetryAfter(t, w, 30)
 }
 
 // TestSessionUnprovenSessionMaps503 checks that a session which cannot prove
@@ -2234,6 +2248,148 @@ func TestSessionUnprovenSessionMaps503(t *testing.T) {
 	}
 	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
 		t.Errorf("unproven_rejections = %v, want 1", got)
+	}
+	wantRetryAfter(t, w, 30)
+}
+
+// wantRetryAfter asserts that a refusal states its wait both ways: the header a
+// generic HTTP client reads and the envelope field a JSON consumer does.
+func wantRetryAfter(t *testing.T, w *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if got := w.Header().Get("Retry-After"); got != strconv.Itoa(want) {
+		t.Errorf("Retry-After = %q, want %q", got, strconv.Itoa(want))
+	}
+	var env struct {
+		RetryAfterSeconds int `json:"retry_after_seconds"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error body %q: %v", w.Body.Bytes(), err)
+	}
+	if env.RetryAfterSeconds != want {
+		t.Errorf("retry_after_seconds = %d, want %d", env.RetryAfterSeconds, want)
+	}
+}
+
+// playerContextReq drives one /player-context request for video and returns the
+// recorder.
+func playerContextReq(s *Server, video string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"`+video+`"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	return w
+}
+
+// A refusal from inside a cool-down states what is left of it, not the whole
+// window: a consumer that waits the stated time finds the daemon ready. Ageing
+// the record by a known amount is what makes that testable, since the whole
+// window also satisfies "somewhere in the window".
+func TestPlayerContextCooldownRetryAfterIsRemaining(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s, minters := liveServerMinter(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	wantRetryAfter(t, w, 30)
+
+	minters["K"].RewindProofCooldownForTest(12 * time.Second)
+	w = playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	secs, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	if err != nil {
+		t.Fatalf("Retry-After = %q: %v", w.Header().Get("Retry-After"), err)
+	}
+	if secs != 18 {
+		t.Errorf("Retry-After = %d, want 18 (the 30 s window less the 12 s aged off it)", secs)
+	}
+}
+
+// A bot check is the browser session's problem, so it answers as a retryable
+// player-context-failed with the bot-check wait, never as video-unavailable, and
+// the video stays out of the negative cache.
+func TestPlayerContextBotCheckMaps502WithRetryAfter(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd",
+		pcErr: &browser.BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you\u2019re not a bot"}}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502 (a bot check is not a verdict on the video)", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodePlayerContextFailed {
+		t.Errorf("code = %q, want %q", got, CodePlayerContextFailed)
+	}
+	var env struct {
+		Error   string `json:"error"`
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Details != "" {
+		t.Errorf("details = %q, want none: details carries a playabilityStatus verdict", env.Details)
+	}
+	if !strings.Contains(env.Error, "bot check") {
+		t.Errorf("error = %q, want it to name the bot check", env.Error)
+	}
+	wantRetryAfter(t, w, 120)
+	if got := aggregateCounter(t, s, "bot_checks"); got != 2 {
+		t.Errorf("bot_checks = %v, want 2 (the context, then the replacement's)", got)
+	}
+	if got := aggregateCounter(t, s, "escalations"); got != 1 {
+		t.Errorf("escalations = %v, want 1", got)
+	}
+
+	// The next request is refused from the cool-down, not from the negative cache.
+	if w := playerContextReq(s, "aqz-KE-bpKQ"); w.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := aggregateCounter(t, s, "player_context_negative_cache_hits"); got != 0 {
+		t.Errorf("player_context_negative_cache_hits = %v, want 0 (a bot check is never cached against the video)", got)
+	}
+}
+
+// The browser pool's relaunch backoff reaches the mint path too, and its wait is
+// the caller's.
+func TestGetPotBackoffCarriesRetryAfter(t *testing.T) {
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	if _, err := tn.FailLaunchForTest("K", &browser.RelaunchBackoffError{Wait: 9 * time.Second, Streak: 3}); err != nil {
+		t.Fatalf("FailLaunchForTest: %v", err)
+	}
+	s := &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"vd"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeMintFailed {
+		t.Errorf("code = %q, want %q", got, CodeMintFailed)
+	}
+	wantRetryAfter(t, w, 9)
+}
+
+// A refusal the daemon cannot put a number on says nothing rather than guessing:
+// no header, and the field stays out of the envelope.
+func TestPlayerContextFailureWithoutWaitOmitsRetryAfter(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", pcErr: errors.New("extract failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want no header", got)
+	}
+	if strings.Contains(w.Body.String(), "retry_after_seconds") {
+		t.Errorf("body = %s, want no retry_after_seconds field", w.Body)
 	}
 }
 

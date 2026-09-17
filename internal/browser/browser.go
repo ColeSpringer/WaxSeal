@@ -84,6 +84,38 @@ func (e *UnplayableError) Error() string {
 
 func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 
+// ErrBotCheck marks a playabilityStatus that describes the browser session
+// rather than the video: YouTube's "Sign in to confirm you're not a bot". It
+// deliberately does not unwrap to ErrUnplayable, so the minter relaunches the
+// session instead of negative-caching the video.
+var ErrBotCheck = errors.New("waxseal: browser session hit a bot check")
+
+// BotCheckError keeps the status and the player's phrase for the log line.
+type BotCheckError struct {
+	Status string // playabilityStatus the wall arrived under, such as "LOGIN_REQUIRED"
+	Reason string // player-provided reason, the phrase isBotCheck matched
+}
+
+func (e *BotCheckError) Error() string {
+	return fmt.Sprintf("%s: %s (playabilityStatus %q)", ErrBotCheck.Error(), e.Reason, e.Status)
+}
+
+func (e *BotCheckError) Unwrap() error { return ErrBotCheck }
+
+// isBotCheck matches the bot wall on its phrase alone, so YouTube's curly
+// apostrophe and a fixture's ASCII one both hit and a status rename cannot
+// reopen the per-video path. A private video ("This video is private") and an
+// age gate ("Sign in to confirm your age") share LOGIN_REQUIRED with it and stay
+// per-video verdicts, which is why the status cannot decide this.
+//
+// reason is user-facing text, so this reads English. WaxSeal pins no browser
+// locale, and a wall phrased in another language falls through to the per-video
+// path: the video is negative-cached and the session is not relaunched. See the
+// entry in docs/deferred-work.md.
+func isBotCheck(reason string) bool {
+	return strings.Contains(strings.ToLower(reason), "not a bot")
+}
+
 // ErrStatus2Unconfirmed reports that WaxSeal could not confirm the requested
 // streaming context past the status-2 preview cap before its deadline. The cap is
 // currently about 70 seconds. These failures are session-local and usually timing
@@ -770,6 +802,19 @@ func (p *Pool) RelaunchFailures() int64 {
 	return p.relaunchFailures.Load()
 }
 
+// RelaunchBackoffError reports that a relaunch was refused because the pool is
+// backing off after consecutive relaunches. The pool is the only place that
+// knows how long is left, so it says: the minter passes the wait on to the
+// caller as Retry-After.
+type RelaunchBackoffError struct {
+	Wait   time.Duration // time left before another launch is allowed
+	Streak int           // consecutive relaunches behind the current window
+}
+
+func (e *RelaunchBackoffError) Error() string {
+	return fmt.Sprintf("waxseal: pooled chromium relaunch backing off %s after %d consecutive relaunches", e.Wait.Round(time.Second), e.Streak)
+}
+
 // relaunch replaces stale with a new browser instance. Concurrent callers that
 // observed the same stale instance wait for the same relaunch.
 //
@@ -803,7 +848,7 @@ func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
 			if wait := p.lastRelaunchAt.Add(p.backoffWindow()).Sub(now); wait > 0 {
 				streak := p.relaunchStreak
 				p.mu.Unlock()
-				return nil, fmt.Errorf("waxseal: pooled chromium relaunch backing off %s after %d consecutive relaunches", wait.Round(time.Second), streak)
+				return nil, &RelaunchBackoffError{Wait: wait, Streak: streak}
 			}
 		}
 		// Count the attempt before launching so an immediate post-launch crash
@@ -1545,11 +1590,15 @@ type PlayerContext struct {
 	VideoPlaybackUstreamerConfig string `json:"video_playback_ustreamer_config"`
 	VisitorData                  string `json:"visitor_data"`
 	ClientVersion                string `json:"client_version"`
-	Title                        string `json:"title"`
-	Author                       string `json:"author"`
-	LengthSeconds                int    `json:"length_seconds"`
-	ChannelID                    string `json:"channel_id"`  // videoDetails.channelId, the "UC..." owner id
-	Description                  string `json:"description"` // videoDetails.shortDescription
+	// UserAgent is the browser identity the context was minted under, the
+	// session's navigator.userAgent as /session exports it, so a consumer can
+	// stream under the same identity the URL was issued to.
+	UserAgent     string `json:"user_agent"`
+	Title         string `json:"title"`
+	Author        string `json:"author"`
+	LengthSeconds int    `json:"length_seconds"`
+	ChannelID     string `json:"channel_id"`  // videoDetails.channelId, the "UC..." owner id
+	Description   string `json:"description"` // videoDetails.shortDescription
 	// Thumbnails is videoDetails.thumbnail.thumbnails in the player response's own
 	// order, which is smallest first. It is not reordered here because consumers
 	// sort it themselves. Never nil on the wire: an empty ladder is [].
@@ -1748,16 +1797,27 @@ type playerContextRaw struct {
 }
 
 // confirmTerminal returns a terminal error only when the evidence belongs to
-// videoID. The generation and video ID checks reject late errors from a previous
-// load.
-func confirmTerminal(raw playerContextRaw, videoID string) (*UnplayableError, bool) {
+// videoID, and nil when nothing terminal was reported. The generation and video
+// ID checks reject late errors from a previous load. A bot check comes back as
+// ErrBotCheck rather than ErrUnplayable because it is the session that is
+// blocked, not the video.
+//
+// The bot check is read first and under neither guard, because both guards exist
+// to tie evidence to one video and a wall is not about a video. YouTube refuses
+// this way without videoDetails, which leaves VideoIDMatch false, and the wall
+// can trip a terminal onError code on the way; under the guards either shape
+// would be graded per-video and the session would never be relaunched.
+func confirmTerminal(raw playerContextRaw, videoID string) error {
+	if isBotCheck(raw.Reason) {
+		return &BotCheckError{Status: raw.PlayabilityStatus, Reason: raw.Reason}
+	}
 	if raw.ErrGenMatch && raw.ErrVideoID == videoID && isUnavailableCode(raw.ErrCode) {
-		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}, true
+		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}
 	}
 	if raw.PlayabilityStatus != "" && raw.PlayabilityStatus != "OK" && raw.VideoIDMatch {
-		return &UnplayableError{Status: raw.PlayabilityStatus, Detail: raw.Reason}, true
+		return &UnplayableError{Status: raw.PlayabilityStatus, Detail: raw.Reason}
 	}
-	return nil, false
+	return nil
 }
 
 // isUnavailableCode reports whether a movie_player onError code describes a video
@@ -1778,10 +1838,11 @@ func isUnavailableCode(code int) bool {
 // The returned SABR URL still contains a throttling nonce for the consumer to
 // descramble with PlayerURL.
 //
-// A terminal playabilityStatus returns ErrUnplayable. If confirmation cannot
-// clear the status-2 preview cap before the deadline, PlayerContext returns
-// ErrStatus2Unconfirmed instead of a possibly capped URL. Playback and visibility
-// changes are reverted before the shared page is reused.
+// A terminal playabilityStatus returns ErrUnplayable, except a bot check, which
+// returns ErrBotCheck because it blocks the session rather than the video. If
+// confirmation cannot clear the status-2 preview cap before the deadline,
+// PlayerContext returns ErrStatus2Unconfirmed instead of a possibly capped URL.
+// Playback and visibility changes are reverted before the shared page is reused.
 func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
 	// A cold status-2 stream can buffer within the preview window. Seek past the
 	// cap before returning a context claimed to support full-length streaming.
@@ -1804,6 +1865,14 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 	// consumer's GVS token binds to the same session.
 	if raw.VisitorData == "" {
 		raw.VisitorData = s.id.VisitorData
+	}
+	// The UA comes from the captured identity rather than the page: the extract JS
+	// has no reason to read navigator.userAgent, and the identity already holds the
+	// post-override value /session exports. A client version the page left empty is
+	// backfilled from the same place, as visitor_data is above.
+	raw.UserAgent = s.id.UserAgent
+	if raw.ClientVersion == "" {
+		raw.ClientVersion = s.id.ClientVersion
 	}
 	// Filter unselectable formats before validation. If no audio formats remain,
 	// validatePlayerContext returns ErrIncompleteContext.
@@ -1966,8 +2035,8 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 		if err := json.Unmarshal([]byte(obj.Str()), &raw); err != nil {
 			return playerContextRaw{}, fmt.Errorf("waxseal: player-context parse: %w", err)
 		}
-		if ue, ok := confirmTerminal(raw, videoID); ok {
-			return playerContextRaw{}, ue
+		if err := confirmTerminal(raw, videoID); err != nil {
+			return playerContextRaw{}, err
 		}
 		if raw.Error == "" {
 			return raw, nil // established context captured
@@ -2113,7 +2182,9 @@ var proofCandidates = []string{
 // establishFromCandidates tries candidates until one proves full-length
 // playback. It retries only when a candidate is unavailable or too short. Any
 // other outcome or error is returned immediately because it reflects session
-// health rather than candidate suitability. Empty and duplicate IDs are ignored.
+// health rather than candidate suitability; a bot check is the clearest case,
+// since every remaining candidate would meet the same wall. Empty and duplicate
+// IDs are ignored.
 //
 // When all candidates are exhausted, the returned error records each retryable
 // failure without wrapping ErrUnplayable. These videos are internal probes, not
@@ -2162,7 +2233,8 @@ func establishFromCandidates(ctx context.Context, prove func(string) (FullLength
 //
 // The proof uses the landing video first, then tries proofCandidates when a video
 // is unavailable or too short. Successful establishment applies to later videos
-// requested through the same session.
+// requested through the same session. A bot check returns ErrBotCheck without
+// trying another candidate.
 //
 // proveFullLength restores the shared page before returning.
 func (s *Session) EnsureEstablished(ctx context.Context) error {
@@ -2240,10 +2312,11 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 		if ctx.Err() != nil {
 			return probe, ctx.Err()
 		}
-		// A terminal playability status describes the video, not the session.
-		// Return it so callers can select another proof candidate or report that the
-		// requested video is unavailable.
-		if errors.Is(err, ErrUnplayable) {
+		// A terminal playability status describes the video, not the session, so
+		// return it and let callers select another proof candidate or report the
+		// requested video unavailable. A bot check goes up for the opposite reason:
+		// it is the session, and no other candidate can get past it.
+		if errors.Is(err, ErrUnplayable) || errors.Is(err, ErrBotCheck) {
 			return probe, err
 		}
 		return probe, nil
@@ -2657,8 +2730,9 @@ func (s *Session) reReadContext(ctx context.Context, page pageDriver, videoID st
 			}
 			// A video that went terminal between confirm and re-read must surface as
 			// ErrUnplayable, not a generic re-read failure, so it is negative-cached.
-			if ue, ok := confirmTerminal(raw, videoID); ok {
-				return playerContextRaw{}, ue
+			// A bot check surfaces as ErrBotCheck and is not cached at all.
+			if err := confirmTerminal(raw, videoID); err != nil {
+				return playerContextRaw{}, err
 			}
 			if raw.Error == "" {
 				return raw, nil

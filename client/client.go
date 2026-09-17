@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -63,11 +64,14 @@ type PlayerContext struct {
 	VideoPlaybackUstreamerConfig string `json:"video_playback_ustreamer_config"`
 	VisitorData                  string `json:"visitor_data"`
 	ClientVersion                string `json:"client_version"`
-	Title                        string `json:"title"`
-	Author                       string `json:"author"`
-	LengthSeconds                int    `json:"length_seconds"`
-	ChannelID                    string `json:"channel_id"`  // the "UC..." owner id
-	Description                  string `json:"description"` // the video's full description text
+	// UserAgent is the browser identity the context was minted under, the same
+	// value /session reports. Stream under it.
+	UserAgent     string `json:"user_agent"`
+	Title         string `json:"title"`
+	Author        string `json:"author"`
+	LengthSeconds int    `json:"length_seconds"`
+	ChannelID     string `json:"channel_id"`  // the "UC..." owner id
+	Description   string `json:"description"` // the video's full description text
 	// Thumbnails is the ladder in the player response's own order, smallest first.
 	// Sort it if you need a particular rung.
 	Thumbnails []Thumbnail `json:"thumbnails"`
@@ -380,6 +384,15 @@ type APIError struct {
 	Code       string // stable machine-readable code, when present
 	Message    string // error message or unrecognized raw response body
 	Details    string // optional machine-readable context
+	// RetryAfter is the wait the daemon asked for, from the Retry-After header or
+	// the body's retry_after_seconds. Zero when it sent neither, which means the
+	// daemon could not put a number on it, not that a retry is pointless.
+	RetryAfter time.Duration
+	// Envelope reports that the body was a recognized WaxSeal error envelope, so
+	// Message is the daemon's own text. When it is false Message holds raw
+	// response bytes from whatever answered instead, which may be an intermediary:
+	// keep those for local diagnosis and do not forward them.
+	Envelope bool
 }
 
 func (e *APIError) Error() string {
@@ -400,19 +413,53 @@ func (c *Client) statusErr(path string, resp *http.Response) error {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	body := bytes.TrimSpace(b)
 	apiErr := &APIError{Path: path, StatusCode: resp.StatusCode}
+	// The header is read whatever the body turns out to be: a proxy that states a
+	// wait and sends no body at all is exactly the case the header exists for.
+	header := resp.Header.Get("Retry-After")
 	if len(body) == 0 {
+		apiErr.RetryAfter = retryAfter(header, 0)
 		return apiErr
 	}
 	var env struct {
-		Error   string `json:"error"`
-		Code    string `json:"code"`
-		Details string `json:"details"`
+		Error             string `json:"error"`
+		Code              string `json:"code"`
+		Details           string `json:"details"`
+		RetryAfterSeconds int    `json:"retry_after_seconds"`
 	}
 	if err := json.Unmarshal(body, &env); err == nil && (env.Error != "" || env.Code != "") {
 		apiErr.Message, apiErr.Code, apiErr.Details = env.Error, env.Code, env.Details
+		apiErr.RetryAfter = retryAfter(header, env.RetryAfterSeconds)
+		apiErr.Envelope = true
 		return apiErr
 	}
 	// Preserve proxy errors and other unrecognized bodies for diagnostics.
 	apiErr.Message = string(body)
+	apiErr.RetryAfter = retryAfter(header, 0)
 	return apiErr
 }
+
+// retryAfter reads the stated wait, header first: a proxy can set the header
+// where it cannot change the body. The header is delta-seconds or an HTTP-date.
+// It wins only when it yields a wait still ahead; a header that is unparseable,
+// or a date already past, falls through to the body rather than discarding a
+// value the daemon did send.
+func retryAfter(header string, bodySeconds int) time.Duration {
+	if header != "" {
+		if secs, err := strconv.Atoi(header); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		if at, err := http.ParseTime(header); err == nil {
+			if d := time.Until(at); d > 0 {
+				return d
+			}
+		}
+	}
+	if bodySeconds > 0 {
+		return time.Duration(bodySeconds) * time.Second
+	}
+	return 0
+}
+
+// BaseURL is the daemon address this client was built with, normalised the way
+// New stores it. A consumer labels its own errors with it.
+func (c *Client) BaseURL() string { return c.baseURL }

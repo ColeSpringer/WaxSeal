@@ -373,6 +373,9 @@ func TestExitCodeFor(t *testing.T) {
 		{context.Canceled, 130},
 		{browser.ErrUnplayable, 3},
 		{&browser.UnplayableError{Status: "LOGIN_REQUIRED"}, 3},
+		// A bot check shares LOGIN_REQUIRED with an age gate but is not a verdict on
+		// the video, so it must not claim exit 3. It is an ordinary runtime failure.
+		{&browser.BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you're not a bot"}, 1},
 		{errors.New("other"), 1},
 	}
 	for _, tt := range cases {

@@ -354,12 +354,20 @@ func TestPlayerContextTagDrift(t *testing.T) {
 	}
 }
 
+// sessionFilledContextKeys are the PlayerContext keys Session.PlayerContext
+// fills from the captured identity rather than the page, so the extraction
+// snippet is not expected to emit them.
+var sessionFilledContextKeys = map[string]string{
+	"user_agent": "the identity holds the post-override navigator.userAgent already",
+}
+
 // TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
-// every documented key in the object literal it returns on success. The JS runs
-// only in Chromium, so a key dropped from that literal would otherwise surface as
-// an empty field in a live run. Only that literal is searched, and only for a
-// whole property name, so a key that survives elsewhere in the snippet, or as the
-// tail of another key, cannot satisfy the check.
+// every documented key in the object literal it returns on success, bar the ones
+// the session fills itself. The JS runs only in Chromium, so a key dropped from
+// that literal would otherwise surface as an empty field in a live run. Only that
+// literal is searched, and only for a whole property name, so a key that survives
+// elsewhere in the snippet, or as the tail of another key, cannot satisfy the
+// check.
 func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	const open = "return JSON.stringify({\n"
 	start := strings.Index(playerContextExtractJS, open)
@@ -375,6 +383,9 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	typ := reflect.TypeOf(PlayerContext{})
 	for i := range typ.NumField() {
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if _, ok := sessionFilledContextKeys[name]; ok {
+			continue
+		}
 		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(name) + `:`).MatchString(literal) {
 			t.Errorf("playerContextExtractJS success literal never emits %q", name)
 		}
@@ -382,7 +393,8 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 }
 
 // TestConfirmTerminal covers stale evidence that must not mark the current video
-// unavailable.
+// unavailable, and the split between a verdict about the video and a bot check,
+// which describes the session instead.
 func TestConfirmTerminal(t *testing.T) {
 	const want = "vid123"
 	raw := func(mut func(*playerContextRaw)) playerContextRaw {
@@ -390,39 +402,111 @@ func TestConfirmTerminal(t *testing.T) {
 		mut(&r)
 		return r
 	}
+	status := func(st, reason string) playerContextRaw {
+		return raw(func(r *playerContextRaw) { r.PlayabilityStatus = st; r.Reason = reason; r.VideoIDMatch = true })
+	}
 	tests := []struct {
-		name         string
-		raw          playerContextRaw
-		wantTerminal bool
-		wantStatus   string
+		name       string
+		raw        playerContextRaw
+		wantErr    error // nil, ErrUnplayable, or ErrBotCheck
+		wantStatus string
 	}{
-		{"gen-matched onError 100, id match", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = want }), true, "ERROR"},
-		{"gen-matched onError 150, id match", raw(func(r *playerContextRaw) { r.ErrCode = 150; r.ErrGenMatch = true; r.ErrVideoID = want }), true, "ERROR"},
-		{"gen-matched onError 100, stale video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "othervid" }), false, ""},
-		{"gen-matched onError 100, empty video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "" }), false, ""},
-		{"non-OK status + id match", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "LOGIN_REQUIRED"; r.VideoIDMatch = true }), true, "LOGIN_REQUIRED"},
-		{"non-OK status for another video", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "ERROR"; r.VideoIDMatch = false }), false, ""},
-		{"onError 100 with gen mismatch", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = false; r.ErrVideoID = want }), false, ""},
-		{"onError 5 (non-terminal code)", raw(func(r *playerContextRaw) { r.ErrCode = 5; r.ErrGenMatch = true; r.ErrVideoID = want }), false, ""},
-		{"status OK + id match", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "OK"; r.VideoIDMatch = true }), false, ""},
-		{"no evidence", raw(func(r *playerContextRaw) {}), false, ""},
+		{"gen-matched onError 100, id match", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = want }), ErrUnplayable, "ERROR"},
+		{"gen-matched onError 150, id match", raw(func(r *playerContextRaw) { r.ErrCode = 150; r.ErrGenMatch = true; r.ErrVideoID = want }), ErrUnplayable, "ERROR"},
+		{"gen-matched onError 100, stale video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "othervid" }), nil, ""},
+		{"gen-matched onError 100, empty video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "" }), nil, ""},
+		{"non-OK status + id match", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "LOGIN_REQUIRED"; r.VideoIDMatch = true }), ErrUnplayable, "LOGIN_REQUIRED"},
+		{"non-OK status for another video", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "ERROR"; r.VideoIDMatch = false }), nil, ""},
+		{"onError 100 with gen mismatch", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = false; r.ErrVideoID = want }), nil, ""},
+		{"onError 5 (non-terminal code)", raw(func(r *playerContextRaw) { r.ErrCode = 5; r.ErrGenMatch = true; r.ErrVideoID = want }), nil, ""},
+		{"status OK + id match", raw(func(r *playerContextRaw) { r.PlayabilityStatus = "OK"; r.VideoIDMatch = true }), nil, ""},
+		{"no evidence", raw(func(r *playerContextRaw) {}), nil, ""},
+		// The wall YouTube ships uses a curly apostrophe; fixtures and logs often
+		// carry the ASCII one. Both are the same wall.
+		{"bot check, curly apostrophe", status("LOGIN_REQUIRED", "Sign in to confirm you\u2019re not a bot"), ErrBotCheck, "LOGIN_REQUIRED"},
+		{"bot check, ASCII apostrophe", status("LOGIN_REQUIRED", "Sign in to confirm you're not a bot"), ErrBotCheck, "LOGIN_REQUIRED"},
+		{"bot check under another status", status("UNPLAYABLE", "Sign in to confirm you're not a bot"), ErrBotCheck, "UNPLAYABLE"},
+		// These two share LOGIN_REQUIRED with the wall and stay per-video verdicts.
+		{"private video", status("LOGIN_REQUIRED", "This video is private"), ErrUnplayable, "LOGIN_REQUIRED"},
+		{"age gate", status("LOGIN_REQUIRED", "Sign in to confirm your age"), ErrUnplayable, "LOGIN_REQUIRED"},
+		// YouTube omits videoDetails when it refuses this way, which leaves
+		// video_id_match false. Gating the wall on that match would hide it behind a
+		// poll timeout, so the feature would never fire in production.
+		{"bot check without videoDetails", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Sign in to confirm you're not a bot"
+			r.VideoIDMatch = false
+		}), ErrBotCheck, "LOGIN_REQUIRED"},
+		// A wall that also trips a terminal onError code is still the session's
+		// problem: the phrase decides, and it is read before the code.
+		{"bot check alongside a terminal onError code", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Sign in to confirm you're not a bot"
+			r.VideoIDMatch = true
+		}), ErrBotCheck, "LOGIN_REQUIRED"},
+		// A per-video reason never outranks the onError evidence, so the ordering
+		// change is confined to the wall.
+		{"private video alongside a terminal onError code", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "This video is private"
+			r.VideoIDMatch = true
+		}), ErrUnplayable, "ERROR"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ue, ok := confirmTerminal(tt.raw, want)
-			if ok != tt.wantTerminal {
-				t.Fatalf("terminal = %v, want %v", ok, tt.wantTerminal)
-			}
-			if !ok {
-				if ue != nil {
-					t.Errorf("non-terminal returned a non-nil error: %v", ue)
+			err := confirmTerminal(tt.raw, want)
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil (not terminal)", err)
 				}
 				return
 			}
-			if ue.Status != tt.wantStatus {
-				t.Errorf("status = %q, want %q", ue.Status, tt.wantStatus)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tt.wantErr)
+			}
+			if errors.Is(err, ErrBotCheck) && errors.Is(err, ErrUnplayable) {
+				t.Fatal("a bot check unwrapped to ErrUnplayable; the minter would negative-cache the video")
+			}
+			var gotStatus string
+			if bc, ok := errors.AsType[*BotCheckError](err); ok {
+				gotStatus = bc.Status
+			} else if ue, ok := errors.AsType[*UnplayableError](err); ok {
+				gotStatus = ue.Status
+			} else {
+				t.Fatalf("err = %v, want a typed terminal error", err)
+			}
+			if gotStatus != tt.wantStatus {
+				t.Errorf("status = %q, want %q", gotStatus, tt.wantStatus)
 			}
 		})
+	}
+}
+
+func TestIsBotCheck(t *testing.T) {
+	for _, reason := range []string{
+		"Sign in to confirm you\u2019re not a bot",
+		"Sign in to confirm you're not a bot",
+		"SIGN IN TO CONFIRM YOU'RE NOT A BOT",
+	} {
+		if !isBotCheck(reason) {
+			t.Errorf("isBotCheck(%q) = false, want true", reason)
+		}
+	}
+	for _, reason := range []string{
+		"",
+		"This video is private",
+		"Sign in to confirm your age",
+		"Video unavailable",
+	} {
+		if isBotCheck(reason) {
+			t.Errorf("isBotCheck(%q) = true, want false", reason)
+		}
 	}
 }
 
@@ -713,6 +797,7 @@ func TestEstablishFromCandidates(t *testing.T) {
 	// A real proveFullLength reports an unplayable video as OutcomeNotEstablished
 	// with a non-nil ErrUnplayable; the helper keys off the error, not the outcome.
 	unplayable := res{FullLengthProbe{Outcome: OutcomeNotEstablished}, &UnplayableError{Status: "ERROR"}}
+	botCheck := res{FullLengthProbe{Outcome: OutcomeNotEstablished}, &BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you\u2019re not a bot"}}
 
 	tests := []struct {
 		name        string
@@ -778,6 +863,17 @@ func TestEstablishFromCandidates(t *testing.T) {
 			wantErrText: []string{"no usable proof video", "dead1", "dead2"},
 			errIsNot:    ErrUnplayable,
 			wantCalls:   []string{"dead1", "dead2"},
+		},
+		{
+			// A bot check is about the session, so another candidate would meet the
+			// same wall.
+			name:       "bot check stops the candidate walk",
+			candidates: []string{"walled", "good"},
+			results:    map[string]res{"walled": botCheck, "good": {full, nil}},
+			wantErr:    true,
+			errIs:      ErrBotCheck,
+			errIsNot:   ErrUnplayable,
+			wantCalls:  []string{"walled"},
 		},
 		{
 			name:       "duplicate and empty candidates are skipped",

@@ -607,6 +607,22 @@ func TestPlayerContextMetadataLive(t *testing.T) {
 			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
 		}
 	}
-	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d",
-		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails))
+	// The context's identity must be the one /session exports, or a consumer that
+	// streams under the context would present a different browser than the one the
+	// URL was issued to.
+	if pc.UserAgent == "" {
+		t.Error("user_agent is empty; the session identity was not carried onto the context")
+	}
+	sess, err := c.Session(ctx)
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	if pc.UserAgent != sess.UserAgent {
+		t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+	}
+	if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
+		t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+	}
+	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
+		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
 }

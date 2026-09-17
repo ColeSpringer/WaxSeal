@@ -444,6 +444,87 @@ func TestEstablishUnplayableIsTerminal(t *testing.T) {
 	}
 }
 
+// A bot check reaches establish the same way a per-video verdict does, but it
+// describes the browser session, so it must not unwrap to ErrUnplayable: the
+// minter relaunches on it instead of negative-caching the video.
+func TestEstablishBotCheckIsSessionLevel(t *testing.T) {
+	payload := map[string]any{
+		"error": "unplayable: LOGIN_REQUIRED", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Sign in to confirm you\u2019re not a bot", "video_id_match": true,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{
+		playerContextExtractJS: {jsStringified(t, payload)},
+	})
+	s := newFakeSession(page)
+
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
+	if !errors.Is(err, ErrBotCheck) {
+		t.Fatalf("establish error = %v, want ErrBotCheck", err)
+	}
+	if errors.Is(err, ErrUnplayable) {
+		t.Fatal("the bot check unwrapped to ErrUnplayable; the video would be negative-cached")
+	}
+	bc, ok := errors.AsType[*BotCheckError](err)
+	if !ok || bc.Status != "LOGIN_REQUIRED" {
+		t.Errorf("error = %v, want a BotCheckError carrying LOGIN_REQUIRED", err)
+	}
+	if got := page.evalCount(playerContextExtractJS); got != 1 {
+		t.Errorf("extract ran %d times, want 1 (a terminal status must not be polled)", got)
+	}
+}
+
+// The shape YouTube actually refuses with: a LOGIN_REQUIRED playability status
+// and no videoDetails, so the extract reports video_id_match false and the page
+// looks like it is still loading. The wall must still be recognised on the first
+// poll, or it hides behind the establish deadline and the session is never
+// relaunched.
+func TestEstablishBotCheckWithoutVideoDetails(t *testing.T) {
+	payload := map[string]any{
+		"error": "pending: player response not yet for vid", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Sign in to confirm you\u2019re not a bot", "video_id_match": false,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{
+		playerContextExtractJS: {jsStringified(t, payload)},
+	})
+	s := newFakeSession(page)
+
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
+	if !errors.Is(err, ErrBotCheck) {
+		t.Fatalf("establish error = %v, want ErrBotCheck", err)
+	}
+	if got := page.evalCount(playerContextExtractJS); got != 1 {
+		t.Errorf("extract ran %d times, want 1 (the wall must not be polled through)", got)
+	}
+}
+
+// A bot check met while proving comes back as an error, not a nil error with a
+// not-established outcome, so the caller can tell a walled session apart from
+// one that merely failed to establish.
+func TestProveFullLengthReturnsBotCheck(t *testing.T) {
+	payload := map[string]any{
+		"error": "unplayable: LOGIN_REQUIRED", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Sign in to confirm you\u2019re not a bot", "video_id_match": true,
+	}
+	page := newFakePageFor("long", map[string][]fakeStep{
+		playerContextExtractJS: {jsStringified(t, payload)},
+	})
+	s := newFakeSession(page)
+
+	probe, err := s.VerifyFullLength(context.Background(), "long")
+	if !errors.Is(err, ErrBotCheck) {
+		t.Fatalf("VerifyFullLength error = %v, want ErrBotCheck", err)
+	}
+	if errors.Is(err, ErrUnplayable) {
+		t.Fatal("the bot check unwrapped to ErrUnplayable")
+	}
+	if probe.Outcome != OutcomeNotEstablished {
+		t.Errorf("outcome = %q, want %q", probe.Outcome, OutcomeNotEstablished)
+	}
+	if s.Established() {
+		t.Error("a walled proof marked the session established")
+	}
+}
+
 // A deadline reached while the page is still pending reports the page's own last
 // reason, not a bare context error: that string is what an operator reads.
 func TestEstablishDeadlineReportsLastError(t *testing.T) {
@@ -844,6 +925,47 @@ func TestSessionPlayerContextFromFakePage(t *testing.T) {
 	if len(pc.Thumbnails) != 1 || pc.Thumbnails[0].Width != 120 || pc.Thumbnails[0].Height != 90 {
 		t.Errorf("thumbnails = %+v", pc.Thumbnails)
 	}
+
+	t.Run("identity fills the user agent and an empty client version", func(t *testing.T) {
+		bare := establishedPayload("vid", 635)
+		bare["client_version"] = "" // a page that answered before ytcfg was readable
+		page := newFakePageFor("vid", map[string][]fakeStep{
+			playerContextExtractJS: {jsStringified(t, bare)},
+			playerBufferedJS:       {jsStringified(t, bufferedPayload(103, 140, true))},
+		})
+		s := newFakeSession(page)
+		s.establishedStreaming = true
+		s.id = Identity{UserAgent: "Mozilla/5.0 (test)", ClientVersion: "2.captured", VisitorData: "VD"}
+
+		pc, err := s.PlayerContext(context.Background(), "vid")
+		if err != nil {
+			t.Fatalf("PlayerContext: %v", err)
+		}
+		if pc.UserAgent != s.id.UserAgent {
+			t.Errorf("user_agent = %q, want the session identity's %q", pc.UserAgent, s.id.UserAgent)
+		}
+		if pc.ClientVersion != "2.captured" {
+			t.Errorf("client_version = %q, want the identity backfill", pc.ClientVersion)
+		}
+	})
+
+	t.Run("a page-reported client version wins over the identity", func(t *testing.T) {
+		page := newFakePageFor("vid", map[string][]fakeStep{
+			playerContextExtractJS: {jsStringified(t, establishedPayload("vid", 635))},
+			playerBufferedJS:       {jsStringified(t, bufferedPayload(103, 140, true))},
+		})
+		s := newFakeSession(page)
+		s.establishedStreaming = true
+		s.id = Identity{UserAgent: "Mozilla/5.0 (test)", ClientVersion: "2.captured"}
+
+		pc, err := s.PlayerContext(context.Background(), "vid")
+		if err != nil {
+			t.Fatalf("PlayerContext: %v", err)
+		}
+		if pc.ClientVersion != "2.x" {
+			t.Errorf("client_version = %q, want the page's own value", pc.ClientVersion)
+		}
+	})
 
 	t.Run("nil ladder becomes an empty slice", func(t *testing.T) {
 		bare := establishedPayload("vid", 635)

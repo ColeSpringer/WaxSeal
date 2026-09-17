@@ -167,6 +167,7 @@ status-1 protection code embedded in the signed URL.
   "video_playback_ustreamer_config": "<base64>",
   "visitor_data": "<base64>",
   "client_version": "2.YYYYMMDD.NN.NN",
+  "user_agent": "Mozilla/5.0 ...",        // the identity the context was minted under; the same value /session exports
   "title": "<video title>",
   "author": "<channel name>",
   "length_seconds": 634,
@@ -228,11 +229,20 @@ itself grade the URL it hands out. The startup self-test performs the proof
 before the daemon accepts traffic. `WAXSEAL_MINT_SEPARATION` overrides the
 spacing with any positive Go duration, for example `20s`.
 
+A bot check ("Sign in to confirm you're not a bot") describes the browser
+session, not the video, so it is never answered as `video-unavailable` and the
+video is never negative-cached. The wall keys on the visitor identity, and the
+only thing that lifts it is a fresh one: the daemon relaunches once per 10
+minutes on a bot check and serves the request from the replacement, which is the
+common case. A check on the replacement, or one inside that window, is refused as
+`player-context-failed` (502) with a 2 minute `Retry-After`.
+
 ### `GET /session`
 
 Exports the guest identity for the session-adoption path (`--session-url` plus
 `--potoken-url`), after verifying full-length streaming with the same cool-down
-and one-relaunch-per-streak policy described under `/player-context`. No request
+and one-relaunch-per-streak policy described under `/player-context`, including
+its bot-check relaunch. No request
 body, and no Google login. If the startup self-test already proved the session
 this call is immediate; if it did not, this call performs the proof itself, and
 unlike a served context it is not held back by the mint-separation window, since
@@ -270,8 +280,8 @@ Report a degraded stream by the `session_generation` from `/session` or
 `reason` must be 1-64 characters from `[A-Za-z0-9_-]`. Reports are scoped and
 rate-limited per tenant: report-driven recycles draw from a budget of 4 that
 refills at one per `--report-debounce` (default `5m`). A report past the budget
-is rejected with `retry_after_seconds`, and stale or future generations are
-ignored.
+is rejected with `retry_after_seconds` and a `Retry-After` header, and stale or
+future generations are ignored.
 
 ```jsonc
 // request
@@ -366,6 +376,9 @@ These counters are worth knowing exactly:
   negative cache without touching the browser. They are counted apart because one
   caller looping on a single unplayable video can drive this by six orders of
   magnitude while every real request succeeds, which would bury the failure rate.
+- `bot_checks` counts each bot check the browser answered, at a proof or at a
+  context. The refusal that follows a bot-check cool-down counts under
+  `unproven_rejections`, as a proof cool-down's does.
 - `probe_failures` counts the sessions a tenant-level `/ping` confirmed
   unresponsive and retired, one per session. `crashes` also counts CDP-event
   deaths, so the two together separate probe-detected loss from the rest. A
@@ -409,6 +422,13 @@ adds a `details` field with the playability status. `/ping` health bodies do
 not use this envelope; they report health directly (see
 [Operations](#operations)). Only its `400` and `401` rejections do.
 
+A refusal the daemon expects to lift on its own also sends `Retry-After` and
+`retry_after_seconds` with the remaining wait: `player-context-failed` and
+`no-session` during a cool-down after a failed proof or a bot check, and
+`mint-failed`, `player-context-failed`, or `no-session` while the shared
+browser's relaunch is backing off. A 502 without them is worth one quick retry;
+a 422 is not.
+
 | Code | HTTP | Meaning |
 |---|---:|---|
 | `invalid-request` | 400 | Malformed or invalid input |
@@ -416,8 +436,8 @@ not use this envelope; they report health directly (see
 | `not-found` | 404 | Unknown path or endpoint |
 | `method-not-allowed` | 405 | Unsupported HTTP method |
 | `video-unavailable` | 422 | Terminal playability status |
-| `mint-failed`, `player-context-failed` | 502 | Upstream operation failed |
-| `no-session` | 503 | No attested session is available |
+| `mint-failed`, `player-context-failed` | 502 | Upstream operation failed; may carry `retry_after_seconds` |
+| `no-session` | 503 | No attested session is available; may carry `retry_after_seconds` |
 | `timeout` | 504 | Deadline elapsed for `/get_pot`, `/player-context`, or `/session` |
 
 Two cases skip the envelope, both handled by `http.ServeMux` before any WaxSeal
@@ -592,7 +612,8 @@ The `client` package is a reusable, consumer-agnostic HTTP client; the
 consumer expects.
 
 CLI exit codes: `0` success, `1` runtime failure, `2` usage error, `3` unavailable
-video, `130` interruption.
+video, `130` interruption. A bot check is a runtime failure (`1`), not an
+unavailable video: it describes the browser session rather than the video.
 
 Some coverage stays out of `go test ./...` because it needs a display or a long
 run: **headful mode** (`go run ./cmd/waxseal server --headful`) to watch a real

@@ -304,7 +304,7 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		if s.writeCtxErr(w, r, ctx, label) {
 			return
 		}
-		writeErr(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error())
+		writeRefusal(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error(), err)
 		return
 	}
 	// Use the token's real expiry (fixed at attest time, preserved through the
@@ -363,7 +363,7 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 			}
 			writeErrDetails(w, http.StatusUnprocessableEntity, CodeVideoUnavailable, err.Error(), status)
 		default:
-			writeErr(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error())
+			writeRefusal(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error(), err)
 		}
 		return
 	}
@@ -648,8 +648,20 @@ func writePing(w http.ResponseWriter, strict bool, reason string, err error, bod
 	writeJSON(w, status, body)
 }
 
-// sessionCookie is the wire representation of one youtube.com cookie.
-type sessionCookie struct {
+// SessionResponse is the /session response. It is exported, with SessionCookie,
+// so the README block stays a checkable contract (TestSessionShapeContract) and
+// so a reader of the wire format has one place to look.
+type SessionResponse struct {
+	VisitorData       string          `json:"visitor_data"`
+	UserAgent         string          `json:"user_agent"`
+	ClientVersion     string          `json:"client_version"`
+	Cookies           []SessionCookie `json:"cookies"`
+	CookieHeader      string          `json:"cookie_header"`
+	SessionGeneration uint64          `json:"session_generation"`
+}
+
+// SessionCookie is the wire representation of one youtube.com cookie.
+type SessionCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
 	Domain   string `json:"domain"`
@@ -693,13 +705,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		if s.writeCtxErr(w, r, ctx, label) {
 			return
 		}
-		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
+		writeRefusal(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error(), err)
 		return
 	}
-	cookies := make([]sessionCookie, 0, len(raw))
+	cookies := make([]SessionCookie, 0, len(raw))
 	pairs := make([]string, 0, len(raw))
 	for _, c := range raw {
-		sc := sessionCookie{
+		sc := SessionCookie{
 			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
 			Secure: c.Secure, HTTPOnly: c.HttpOnly, SameSite: sameSiteWire(c.SameSite),
 		}
@@ -710,13 +722,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		pairs = append(pairs, c.Name+"="+c.Value)
 	}
 	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies), "generation", gen)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"visitor_data":       id.VisitorData,
-		"user_agent":         id.UserAgent,
-		"client_version":     id.ClientVersion,
-		"cookies":            cookies,
-		"cookie_header":      strings.Join(pairs, "; "),
-		"session_generation": gen,
+	writeJSON(w, http.StatusOK, SessionResponse{
+		VisitorData:       id.VisitorData,
+		UserAgent:         id.UserAgent,
+		ClientVersion:     id.ClientVersion,
+		Cookies:           cookies,
+		CookieHeader:      strings.Join(pairs, "; "),
+		SessionGeneration: gen,
 	})
 }
 
@@ -906,19 +918,36 @@ type errEnvelope struct {
 	Error   string `json:"error"`
 	Code    string `json:"code"`
 	Details string `json:"details,omitempty"`
+	// RetryAfterSeconds mirrors the Retry-After header for a JSON consumer that
+	// never sees it. Absent when the daemon cannot put a number on the wait.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // maxErrTextBytes bounds each error-envelope text field. err.Error() can include
 // multi-KiB CDP/V8 stack traces; if an envelope crosses the client's 64 KiB read
-// cap, the client may fail to parse Code and Details. All error envelopes pass
-// through writeErrDetails, so clamping here covers future endpoints too. JSON
-// escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields still fit
-// comfortably under the client cap.
+// cap, the client may fail to parse Code and Details. Every error envelope is
+// built through writeErrEnvelope, so clamping there covers future endpoints too.
+// JSON escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields
+// still fit comfortably under the client cap.
 const maxErrTextBytes = 4 << 10
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	// Keep the clamp in writeErrDetails, the common path.
 	writeErrDetails(w, status, code, msg, "")
+}
+
+// writeRefusal is writeErr for a refusal the daemon expects to lift on its own:
+// a cool-down after a failed proof or a bot check, or the shared browser's
+// relaunch backoff. The minter states the wait on the error, and it goes out both
+// ways, since a generic HTTP client reads the header and a JSON consumer reads
+// the field. An error carrying no wait writes neither. /report keeps its own
+// writer: it answers 200, not a refusal.
+func writeRefusal(w http.ResponseWriter, status int, code, msg string, err error) {
+	secs := 0
+	if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
+		secs = ra.Seconds()
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	writeErrEnvelope(w, status, errEnvelope{Error: msg, Code: code, RetryAfterSeconds: secs})
 }
 
 // clampErrText caps s at maxErrTextBytes and appends a marker. It may split a
@@ -1021,7 +1050,14 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
-	writeJSON(w, status, errEnvelope{Error: presentErr(msg), Code: code, Details: presentErr(details)})
+	writeErrEnvelope(w, status, errEnvelope{Error: msg, Code: code, Details: details})
+}
+
+// writeErrEnvelope is the one path every error response takes, so the text clamp
+// applies wherever an envelope is built.
+func writeErrEnvelope(w http.ResponseWriter, status int, env errEnvelope) {
+	env.Error, env.Details = presentErr(env.Error), presentErr(env.Details)
+	writeJSON(w, status, env)
 }
 
 // MetricsKeyCollision reports the tenant label that shares an API key with

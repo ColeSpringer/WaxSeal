@@ -8,12 +8,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/provider"
+	waxtap "github.com/colespringer/waxtap/v3"
 	"github.com/colespringer/waxtap/v3/potoken"
 )
 
@@ -129,7 +133,19 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 			"title":                           "Big Buck Bunny",
 			"author":                          "Blender",
 			"length_seconds":                  634,
+			"user_agent":                      "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0",
 			"session_generation":              7,
+			"channel_id":                      "UCabc",
+			"description":                     "line one\nline two",
+			"is_live_content":                 true,
+			"is_live_now":                     true,
+			"is_upcoming":                     true,
+			"publish_date":                    "2015-04-10T00:00:00-07:00",
+			"thumbnails": []map[string]any{
+				{"url": "https://i.ytimg.com/vi/VID/default.jpg", "width": 120, "height": 90},
+				{"url": "", "width": 320, "height": 180},
+				{"url": "https://i.ytimg.com/vi/VID/maxresdefault.jpg", "width": 1280, "height": 720},
+			},
 			"audio_formats": []map[string]any{{
 				"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
 				"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
@@ -158,6 +174,23 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 	// so a capped stream would have no escape.
 	if pc.Generation != 7 {
 		t.Errorf("generation = %d, want 7", pc.Generation)
+	}
+	if pc.ChannelID != "UCabc" || pc.Description != "line one\nline two" || pc.PublishDate != "2015-04-10T00:00:00-07:00" {
+		t.Errorf("metadata: channel=%q description=%q publish=%q", pc.ChannelID, pc.Description, pc.PublishDate)
+	}
+	// All three are set in the fixture, so a dropped mapping fails here. A fixture
+	// of false would pass whether or not the field was ever read.
+	if !pc.IsLiveContent || !pc.IsLiveNow || !pc.IsUpcoming {
+		t.Errorf("live flags = %v/%v/%v, want all true", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+	}
+	// The ladder keeps the response's own order (WaxTap sorts it itself), and a
+	// rung with no URL is dropped rather than handed on as an unusable entry.
+	if len(pc.Thumbnails) != 2 {
+		t.Fatalf("thumbnails = %+v, want the two rungs that carry a URL", pc.Thumbnails)
+	}
+	if pc.Thumbnails[0].Width != 120 || pc.Thumbnails[0].Height != 90 ||
+		pc.Thumbnails[1].Width != 1280 || pc.Thumbnails[1].Height != 720 {
+		t.Errorf("thumbnails = %+v, want the wire order with widths and heights", pc.Thumbnails)
 	}
 	if len(pc.AudioFormats) != 1 {
 		t.Fatalf("audio formats = %d, want 1", len(pc.AudioFormats))
@@ -218,6 +251,8 @@ func TestSessionAdapts(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"visitor_data":       "VD",
+			"user_agent":         "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0",
+			"client_version":     "2.0",
 			"cookies":            []map[string]any{{"name": "YSC", "value": "a", "secure": true, "http_only": true}},
 			"session_generation": 4,
 		})
@@ -230,6 +265,11 @@ func TestSessionAdapts(t *testing.T) {
 	}
 	if s.VisitorData != "VD" || len(s.Cookies) != 1 || s.Cookies[0].Name != "YSC" {
 		t.Fatalf("session = %+v", s)
+	}
+	// WaxTap applies both to every WEB request under this session, so the cookies,
+	// the visitor id, and the requests present one browser.
+	if s.UserAgent != "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0" || s.ClientVersion != "2.0" {
+		t.Errorf("identity: user_agent=%q client_version=%q", s.UserAgent, s.ClientVersion)
 	}
 	// The generation is what a later InvalidateSession names, so an adopted session
 	// googlevideo caps can be retired instead of stranding the download.
@@ -474,6 +514,8 @@ func TestProvideSessionCarriesGeneration(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"visitor_data":       "VD",
+			"user_agent":         "UA",
+			"client_version":     "2.0",
 			"cookies":            []map[string]any{{"name": "YSC", "value": "a"}},
 			"session_generation": 4,
 		})
@@ -486,6 +528,12 @@ func TestProvideSessionCarriesGeneration(t *testing.T) {
 	}
 	if s.VisitorData != "VD" || len(s.Cookies) != 1 || s.Generation != 4 {
 		t.Fatalf("session = %+v, want VD with one cookie and generation 4", s)
+	}
+	// Both are mapped here too, so this test fails on a dropped mapping rather
+	// than only TestSessionAdapts. Asserting empty against an empty fixture would
+	// pass whether or not the fields were read.
+	if s.UserAgent != "UA" || s.ClientVersion != "2.0" {
+		t.Errorf("identity = %q/%q, want the daemon's", s.UserAgent, s.ClientVersion)
 	}
 	// The pairing is the point: a provider WaxTap can pull from must also be one it
 	// can report to.
@@ -503,5 +551,455 @@ func TestProvideSessionPropagatesError(t *testing.T) {
 
 	if _, err := p.ProvideSession(context.Background()); err == nil {
 		t.Fatal("want the daemon error to surface")
+	}
+}
+
+// sidecarErr holds the *waxtap.SidecarResponseError inside err, or fails.
+func sidecarResponseErr(t *testing.T, err error) *waxtap.SidecarResponseError {
+	t.Helper()
+	sre, ok := errors.AsType[*waxtap.SidecarResponseError](err)
+	if !ok {
+		t.Fatalf("err = %v (%T), want a *waxtap.SidecarResponseError", err, err)
+	}
+	return sre
+}
+
+// The adapter speaks WaxTap's own sidecar error types, so WaxTap's classifier,
+// its WEB-context skip window, its CLI hints, and its doctor output all work
+// through this provider unchanged.
+func TestProviderTranslatesRefusals(t *testing.T) {
+	t.Run("video-unavailable classifies as the playability verdict", func(t *testing.T) {
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   `video unplayable: This video is private (playabilityStatus "LOGIN_REQUIRED")`,
+				"code":    "video-unavailable",
+				"details": "LOGIN_REQUIRED",
+			})
+		})
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		sre := sidecarResponseErr(t, err)
+		if sre.Code != waxtap.SidecarCodeVideoUnavailable || sre.Details != "LOGIN_REQUIRED" || sre.StatusCode != http.StatusUnprocessableEntity {
+			t.Errorf("error = %+v", sre)
+		}
+		if !strings.Contains(sre.Reason, "This video is private") {
+			t.Errorf("reason = %q, want the daemon's own text", sre.Reason)
+		}
+		if !errors.Is(err, waxtap.ErrVideoRestricted) {
+			t.Errorf("err = %v, want it to classify as a playability verdict", err)
+		}
+		// The endpoint is redacted by the error's own Error method.
+		if strings.Contains(err.Error(), "?") {
+			t.Errorf("error text = %q, want the endpoint redacted", err)
+		}
+	})
+
+	t.Run("a refusal about the daemon states its wait and is not a verdict", func(t *testing.T) {
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "61")
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "player-context failed: browser session hit a bot check", "code": "player-context-failed",
+				"retry_after_seconds": 61,
+			})
+		})
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		sre := sidecarResponseErr(t, err)
+		if sre.RetryAfter != 61*time.Second {
+			t.Errorf("RetryAfter = %v, want 61s", sre.RetryAfter)
+		}
+		if sre.Code != "player-context-failed" {
+			t.Errorf("code = %q", sre.Code)
+		}
+		if errors.Is(err, waxtap.ErrVideoUnavailable) {
+			t.Error("a refusal about the daemon classified as a verdict on the video")
+		}
+	})
+
+	t.Run("a long reason is capped", func(t *testing.T) {
+		long := strings.Repeat("é", 4<<10)
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": long, "code": "player-context-failed"})
+		})
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		sre := sidecarResponseErr(t, err)
+		if n := len([]rune(sre.Reason)); n != 201 { // 200 runes plus the ellipsis
+			t.Errorf("reason runes = %d, want 200 plus an ellipsis", n)
+		}
+		if !strings.HasSuffix(sre.Reason, "…") {
+			t.Errorf("reason = %q, want it to end in an ellipsis", sre.Reason)
+		}
+	})
+
+	t.Run("an unreachable daemon is a transport failure", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		addr := srv.URL
+		srv.Close() // nothing is listening now
+		p := provider.New(client.New(addr))
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		if _, ok := errors.AsType[*waxtap.SidecarError](err); !ok {
+			t.Fatalf("err = %v (%T), want a *waxtap.SidecarError", err, err)
+		}
+	})
+
+	t.Run("a cancelled caller gets its own error, not an unreachable daemon", func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			close(started)
+			<-release
+		})
+		defer done()
+		defer close(release)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { <-started; cancel() }()
+		_, err := p.ProvidePlayerContext(ctx, "VID")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want the cancellation", err)
+		}
+		if _, ok := errors.AsType[*waxtap.SidecarError](err); ok {
+			t.Error("a departed caller was reported as an unreachable daemon")
+		}
+	})
+
+	t.Run("a 200 naming a non-OK status is the same verdict a 422 carries", func(t *testing.T) {
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"playability_status": "ERROR", "player_url": "https://p/base.js",
+				"server_abr_streaming_url": "https://r/v", "video_playback_ustreamer_config": "U",
+				"visitor_data": "VD", "audio_formats": []map[string]any{{"itag": 251}},
+			})
+		})
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		sre := sidecarResponseErr(t, err)
+		if sre.Code != waxtap.SidecarCodeVideoUnavailable || sre.Details != "ERROR" {
+			t.Errorf("error = %+v, want the video-unavailable code with the status in details", sre)
+		}
+		if sre.StatusCode != 0 {
+			t.Errorf("status = %d, want 0: the daemon answered 200", sre.StatusCode)
+		}
+	})
+
+	// An incomplete 200 is a contract mismatch whichever layer catches it: the
+	// client rejects a context with no SABR URL, the provider rejects the rest of
+	// what SABR setup needs. Both must reach WaxTap as a zero-status refusal, which
+	// it never retries.
+	for _, tt := range []struct {
+		name, want string
+		body       map[string]any
+	}{
+		{
+			name: "caught by the client",
+			want: "no server_abr_streaming_url",
+			body: map[string]any{"playability_status": "OK"},
+		},
+		{
+			name: "caught by the provider",
+			want: "missing server_abr_streaming_url",
+			body: map[string]any{
+				"playability_status": "OK", "server_abr_streaming_url": "https://r/v",
+				"video_playback_ustreamer_config": "U", "visitor_data": "VD",
+				"audio_formats": []map[string]any{{"itag": 251}},
+			}, // no player_url
+		},
+	} {
+		t.Run("an incomplete 200 is a contract mismatch, "+tt.name, func(t *testing.T) {
+			p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(tt.body)
+			})
+			defer done()
+
+			_, err := p.ProvidePlayerContext(context.Background(), "VID")
+			sre := sidecarResponseErr(t, err)
+			if sre.StatusCode != 0 || sre.Code != "" {
+				t.Errorf("error = %+v, want an uncoded zero-status refusal", sre)
+			}
+			if !strings.Contains(sre.Reason, tt.want) {
+				t.Errorf("reason = %q, want it to contain %q", sre.Reason, tt.want)
+			}
+			if _, retry := provider.RetryWaitForTest(err); retry {
+				t.Error("a contract mismatch earned a retry")
+			}
+		})
+	}
+}
+
+// The rate-limited report is a refusal with a wait, like every other one, so a
+// consumer reads it the same way.
+func TestInvalidateSessionRateLimited(t *testing.T) {
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": false, "generation": 9, "retry_after_seconds": 20})
+	})
+	defer done()
+
+	err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{Generation: 9})
+	sre := sidecarResponseErr(t, err)
+	if sre.RetryAfter != 20*time.Second {
+		t.Errorf("RetryAfter = %v, want 20s", sre.RetryAfter)
+	}
+	if !strings.Contains(sre.Reason, "rate-limited") {
+		t.Errorf("reason = %q", sre.Reason)
+	}
+}
+
+// The adapter retries once on WaxTap's own sidecar rule, so a consumer behaves
+// the same whichever adapter it wires: after the daemon's stated wait on a
+// transient refusal, after a short poke on one that stated none, and never at
+// all on a verdict or a stated wait too long to serve.
+func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
+	// slept records the waits served instead of serving them, so the table runs at
+	// full speed and can assert on the wait itself.
+	var slept []time.Duration
+	restore := provider.SetSleepForTest(func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	})
+	defer restore()
+
+	// reply is one scripted response; the last entry repeats.
+	type reply struct {
+		status     int
+		retryAfter string
+		body       map[string]any
+	}
+	ok200 := reply{status: 200, body: map[string]any{
+		"playability_status": "OK", "player_url": "https://p/base.js",
+		"server_abr_streaming_url": "https://r/v", "video_playback_ustreamer_config": "U",
+		"visitor_data": "VD", "audio_formats": []map[string]any{{"itag": 251}},
+	}}
+	refusal := func(status int, retryAfter string, code string) reply {
+		body := map[string]any{"error": "refused", "code": code}
+		return reply{status: status, retryAfter: retryAfter, body: body}
+	}
+
+	tests := []struct {
+		name      string
+		replies   []reply
+		wantCalls int
+		wantWaits []time.Duration
+		wantErr   bool
+	}{
+		{
+			name:      "a stated wait is served, then the call succeeds",
+			replies:   []reply{refusal(502, "1", "player-context-failed"), ok200},
+			wantCalls: 2, wantWaits: []time.Duration{time.Second},
+		},
+		{
+			name:      "a 5xx that stated no wait earns the poke",
+			replies:   []reply{refusal(503, "", "no-session"), ok200},
+			wantCalls: 2, wantWaits: []time.Duration{500 * time.Millisecond},
+		},
+		{
+			name:      "a stated wait past the maximum is reported, not slept through",
+			replies:   []reply{refusal(502, "61", "player-context-failed")},
+			wantCalls: 1, wantErr: true,
+		},
+		{
+			name:      "a verdict is never retried",
+			replies:   []reply{refusal(422, "", "video-unavailable")},
+			wantCalls: 1, wantErr: true,
+		},
+		{
+			name:      "a bare 429 says back off rather than retry",
+			replies:   []reply{refusal(429, "", "")},
+			wantCalls: 1, wantErr: true,
+		},
+		{
+			name:      "a 429 with a wait is retried",
+			replies:   []reply{refusal(429, "2", ""), ok200},
+			wantCalls: 2, wantWaits: []time.Duration{2 * time.Second},
+		},
+		{
+			name:      "only once: a second refusal is returned",
+			replies:   []reply{refusal(502, "1", "player-context-failed"), refusal(502, "1", "player-context-failed")},
+			wantCalls: 2, wantWaits: []time.Duration{time.Second}, wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slept = nil
+			var calls int
+			p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+				r := tt.replies[min(calls, len(tt.replies)-1)]
+				calls++
+				if r.retryAfter != "" {
+					w.Header().Set("Retry-After", r.retryAfter)
+				}
+				w.WriteHeader(r.status)
+				_ = json.NewEncoder(w).Encode(r.body)
+			})
+			defer done()
+
+			_, err := p.ProvidePlayerContext(context.Background(), "VID")
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if calls != tt.wantCalls {
+				t.Errorf("requests = %d, want %d", calls, tt.wantCalls)
+			}
+			if !slices.Equal(slept, tt.wantWaits) {
+				t.Errorf("waits = %v, want %v", slept, tt.wantWaits)
+			}
+		})
+	}
+
+	t.Run("a transport failure earns the poke", func(t *testing.T) {
+		slept = nil
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		addr := srv.URL
+		srv.Close()
+		p := provider.New(client.New(addr))
+
+		if _, err := p.ProvidePlayerContext(context.Background(), "VID"); err == nil {
+			t.Fatal("want the transport failure")
+		}
+		if !slices.Equal(slept, []time.Duration{500 * time.Millisecond}) {
+			t.Errorf("waits = %v, want one 500ms poke", slept)
+		}
+	})
+
+	t.Run("a budget too short for the wait gets the refusal now", func(t *testing.T) {
+		slept = nil
+		var calls int
+		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "player-context-failed"})
+		})
+		defer done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := p.ProvidePlayerContext(ctx, "VID")
+		if _, ok := errors.AsType[*waxtap.SidecarResponseError](err); !ok {
+			t.Fatalf("err = %v (%T), want the refusal itself", err, err)
+		}
+		if calls != 1 || len(slept) != 0 {
+			t.Errorf("requests = %d, waits = %v, want one request and no wait", calls, slept)
+		}
+	})
+
+	t.Run("the session endpoint retries too, the report never does", func(t *testing.T) {
+		slept = nil
+		var sessionCalls, reportCalls int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/session":
+				sessionCalls++
+				if sessionCalls == 1 {
+					w.Header().Set("Retry-After", "1")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "no-session", "retry_after_seconds": 1})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"visitor_data": "VD", "session_generation": 4})
+			case "/report":
+				reportCalls++
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "no-session"})
+			}
+		}))
+		defer srv.Close()
+		p := provider.New(client.New(srv.URL))
+
+		if _, err := p.Session(context.Background()); err != nil {
+			t.Fatalf("Session: %v", err)
+		}
+		if sessionCalls != 2 || !slices.Equal(slept, []time.Duration{time.Second}) {
+			t.Errorf("session requests = %d, waits = %v, want 2 and one 1s wait", sessionCalls, slept)
+		}
+		slept = nil
+		if err := p.InvalidateSession(context.Background(), potoken.SessionInvalidation{Generation: 9}); err == nil {
+			t.Fatal("want the report's refusal")
+		}
+		if reportCalls != 1 || len(slept) != 0 {
+			t.Errorf("report requests = %d, waits = %v, want one request and no wait: a report is sent once", reportCalls, slept)
+		}
+	})
+}
+
+// net/http reports its own client timeout as context.DeadlineExceeded, so a
+// merely slow daemon must still be translated and retried. Only a caller that
+// actually walked away gets its own error back untouched.
+func TestSlowDaemonIsATransportFailureNotACancellation(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	// The client's own timeout fires while the caller's context is still live.
+	hc := &http.Client{Timeout: 50 * time.Millisecond}
+	p := provider.New(client.New(srv.URL, client.WithHTTPClient(hc)))
+
+	_, err := p.ProvidePlayerContext(context.Background(), "VID")
+	if err == nil {
+		t.Fatal("want the timeout")
+	}
+	if _, ok := errors.AsType[*waxtap.SidecarError](err); !ok {
+		t.Fatalf("err = %v (%T), want a *waxtap.SidecarError: the caller never went away", err, err)
+	}
+}
+
+// A body that is not a WaxSeal error envelope is never echoed into the sidecar
+// error. WaxTap prints Reason in its CLI hints and deliberately never forwards
+// raw bytes, which may carry tokens or cookies from an intermediary.
+func TestNonEnvelopeBodyIsNotEchoed(t *testing.T) {
+	const secret = "<html>proxy at internal-host.corp: session=SUPERSECRET</html>"
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(secret))
+	})
+	defer done()
+
+	_, err := p.ProvidePlayerContext(context.Background(), "VID")
+	sre := sidecarResponseErr(t, err)
+	if strings.Contains(sre.Reason, "SUPERSECRET") || strings.Contains(sre.Reason, "internal-host") {
+		t.Errorf("reason = %q, want no raw response bytes", sre.Reason)
+	}
+	if strings.Contains(err.Error(), "SUPERSECRET") {
+		t.Errorf("error text = %q, want no raw response bytes", err)
+	}
+	if sre.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 kept", sre.StatusCode)
+	}
+	// A recognised envelope still carries its own text, which is the daemon's.
+	p2, done2 := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "player-context failed: boom", "code": "player-context-failed"})
+	})
+	defer done2()
+	_, err = p2.ProvidePlayerContext(context.Background(), "VID")
+	if sre := sidecarResponseErr(t, err); !strings.Contains(sre.Reason, "boom") {
+		t.Errorf("reason = %q, want the daemon's own envelope text", sre.Reason)
+	}
+}
+
+// The tripwire docs/upstream-requests.md names for the open user_agent ask.
+// /player-context sends the field and potoken.PlayerContext has nowhere to put
+// it, so the adapter drops it. When upstream grows the field this fails, which
+// is the signal to map it and close the entry.
+func TestPlayerContextUserAgentHasNowhereToGoUpstream(t *testing.T) {
+	if _, ok := reflect.TypeOf(potoken.PlayerContext{}).FieldByName("UserAgent"); ok {
+		t.Error("potoken.PlayerContext now has a UserAgent field: map client.PlayerContext.UserAgent onto it, " +
+			"pin it in TestProvidePlayerContextMapping, and close the entry in docs/upstream-requests.md and docs/deferred-work.md")
+	}
+	// The daemon does send it, so the only thing missing is somewhere to put it.
+	if _, ok := reflect.TypeOf(client.PlayerContext{}).FieldByName("UserAgent"); !ok {
+		t.Error("client.PlayerContext lost its UserAgent field; /player-context exports user_agent")
 	}
 }

@@ -144,6 +144,7 @@ func TestPlayerContext(t *testing.T) {
 			"server_abr_streaming_url": "https://r1.googlevideo.com/videoplayback?n=scram",
 			"visitor_data":             "VD",
 			"client_version":           "2.0",
+			"user_agent":               "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0",
 			"session_generation":       3,
 			"channel_id":               "UCabc",
 			"description":              "line one\nline two",
@@ -172,6 +173,9 @@ func TestPlayerContext(t *testing.T) {
 	}
 	if pc.ServerAbrStreamingURL != "https://r1.googlevideo.com/videoplayback?n=scram" || pc.PlayerURL == "" {
 		t.Errorf("context = %+v", pc)
+	}
+	if pc.UserAgent != "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0" {
+		t.Errorf("user_agent = %q, want the identity the context was minted under", pc.UserAgent)
 	}
 	if pc.SessionGeneration != 3 {
 		t.Errorf("session_generation = %d, want 3", pc.SessionGeneration)
@@ -260,7 +264,79 @@ func TestAPIErrorShapes(t *testing.T) {
 			if apiErr.Details != tt.wantDetails {
 				t.Errorf("Details = %q, want %q", apiErr.Details, tt.wantDetails)
 			}
+			// Envelope separates the daemon's own text from raw bytes an
+			// intermediary sent, which a consumer must not forward.
+			if want := tt.wantCode != "" || tt.name == "old-server"; apiErr.Envelope != want {
+				t.Errorf("Envelope = %v, want %v", apiErr.Envelope, want)
+			}
 		})
+	}
+}
+
+// A refusal that states a wait is read back as one, from the header or the
+// envelope. The header wins where both are present, because a proxy can set the
+// header and cannot rewrite the body.
+func TestAPIErrorRetryAfter(t *testing.T) {
+	httpDate := time.Now().Add(45 * time.Second).UTC().Format(http.TimeFormat)
+	tests := []struct {
+		name   string
+		header string
+		body   string
+		want   time.Duration // 0 means none stated
+		approx bool          // compare loosely: an HTTP-date is resolved against now
+	}{
+		{name: "header only", header: "12", body: `{"error":"x","code":"no-session"}`, want: 12 * time.Second},
+		{name: "body only", body: `{"error":"x","code":"no-session","retry_after_seconds":7}`, want: 7 * time.Second},
+		{name: "header wins", header: "12", body: `{"error":"x","code":"no-session","retry_after_seconds":7}`, want: 12 * time.Second},
+		{name: "http date", header: httpDate, body: `{"error":"x","code":"no-session"}`, want: 45 * time.Second, approx: true},
+		{name: "past http date is never negative", header: time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat), body: `{"error":"x","code":"no-session"}`},
+		// A header that yields no wait still ahead must not discard a value the
+		// daemon did send in the body.
+		{name: "past http date falls back to the body", header: time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat), body: `{"error":"x","code":"no-session","retry_after_seconds":7}`, want: 7 * time.Second},
+		{name: "empty body still reads the header", header: "12", want: 12 * time.Second},
+		{name: "garbage header falls back to the body", header: "soon", body: `{"error":"x","code":"no-session","retry_after_seconds":7}`, want: 7 * time.Second},
+		{name: "garbage header, no body value", header: "soon", body: `{"error":"x","code":"no-session"}`},
+		{name: "neither", body: `{"error":"x","code":"no-session"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.header != "" {
+					w.Header().Set("Retry-After", tt.header)
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			_, err := client.New(srv.URL).PlayerContext(context.Background(), "VID")
+			apiErr, ok := errors.AsType[*client.APIError](err)
+			if !ok {
+				t.Fatalf("err = %v (%T), want *client.APIError", err, err)
+			}
+			if want := tt.body != ""; apiErr.Envelope != want {
+				t.Errorf("Envelope = %v, want %v", apiErr.Envelope, want)
+			}
+			switch {
+			case tt.approx:
+				if d := apiErr.RetryAfter - tt.want; d > 2*time.Second || d < -2*time.Second {
+					t.Errorf("RetryAfter = %v, want about %v", apiErr.RetryAfter, tt.want)
+				}
+			case apiErr.RetryAfter != tt.want:
+				t.Errorf("RetryAfter = %v, want %v", apiErr.RetryAfter, tt.want)
+			}
+			if apiErr.RetryAfter < 0 {
+				t.Errorf("RetryAfter = %v, want never negative", apiErr.RetryAfter)
+			}
+		})
+	}
+}
+
+// BaseURL reports the address New normalised, which is what a consumer labels
+// its own errors with.
+func TestBaseURL(t *testing.T) {
+	if got := client.New("http://127.0.0.1:4416/").BaseURL(); got != "http://127.0.0.1:4416" {
+		t.Errorf("BaseURL = %q, want the trailing slash trimmed", got)
 	}
 }
 

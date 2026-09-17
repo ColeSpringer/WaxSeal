@@ -17,40 +17,28 @@ Gate tags:
 - `[upstream]` needs sibling-repo work first; the ask is in
   upstream-requests.md.
 
-## HTTP API
+## Browser
 
-- `[upstream]` **`provider.ProvidePlayerContext` drops the metadata
-  `/player-context` now sends.** The endpoint carries `channel_id`,
-  `description`, the `thumbnails` ladder, `is_live_content`,
-  `is_live_now`, `is_upcoming`, and `publish_date` beside the title,
-  author, and length (2026-09-16, answering WaxTap's ask), and a sidecar
-  consumer reads them straight off the JSON. The Go adapter cannot pass
-  them on: `potoken.PlayerContext` has fields for the title, author, and
-  length only (upstream-requests.md, WaxTap: the web-context metadata
-  fields), so `ProvidePlayerContext` maps those three and discards the
-  rest. When the upstream type grows the fields, map them and pin the
-  mapping in `provider_test.go`. Opened 2026-09-16 with the ask.
-
-- `[upstream]` **The retryable refusals carry no `Retry-After`.**
-  `player-context-failed` (502) during the 30 s proof cool-down
-  (`proofRetryCooldown`, `internal/minter/minter.go`) and `no-session`
-  (503) in the lazy re-establishment window are documented as safe to
-  retry, but only `/report`'s rate limit sends `Retry-After` and
-  `retry_after_seconds` (`server/server.go`); the two refusals name the
-  cause in `error` text alone. A consumer cannot honour a wait it is not
-  told about, which is half of the sidecar error-code ask
-  (upstream-requests.md, WaxTap). When that ask is taken up, send the
-  remaining cool-down (the minter already computes it for its log line)
-  on both refusals and document it under Errors. On its own the header
-  would go to a consumer that ignores it, which is why this waits.
-  Opened 2026-09-06 with the ask.
+- `[in-repo]` **A bot check is recognised by an English phrase.**
+  `isBotCheck` (`internal/browser/browser.go`) matches "not a bot" in
+  `playabilityStatus.reason`, which is localized user-facing text, and
+  WaxSeal pins no browser locale or `hl`. A wall phrased in another
+  language falls through to the per-video path: the video is
+  negative-cached, the session is not relaunched, and the daemon looks
+  like it is refusing every video in turn. The status cannot decide this
+  instead, because a private video and an age gate share
+  `LOGIN_REQUIRED` with the wall. Options when picked up: pin the
+  browser's language (this changes the launch argv the goldens hold and
+  the fingerprint, so it needs its own verification), or carry the known
+  translations. Opened 2026-09-17, from a review of the bot-check change.
 
 ## Provider (the WaxTap adapter)
 
-- `[upstream]` **`Session` drops the exported user agent and client
-  version.** `provider.Session` builds a `potoken.Session` from
-  `VisitorData`, `Cookies`, and `SessionGeneration` because the WaxTap
-  type has no field for `client.Session.UserAgent` or `ClientVersion`
-  (upstream-requests.md, WaxTap: the adopted session's identity fields).
-  When the fields exist, map both and pin the mapping in
-  `provider_test.go`. Opened 2026-09-06 with the ask.
+- `[upstream]` **`ProvidePlayerContext` drops the context's
+  `user_agent`.** `/player-context` exports it (2026-09-16, answering
+  WaxTap's ask) so a consumer streams under the identity the URL was
+  issued to. `potoken.PlayerContext` has no field for it
+  (upstream-requests.md, WaxTap: the context's user agent), so the
+  adapter maps `ClientVersion` and drops the UA. When the field exists,
+  map it and pin it in `provider_test.go`. Opened 2026-09-17 with the
+  ask.

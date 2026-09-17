@@ -12,6 +12,7 @@ import (
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/colespringer/waxseal/server"
 )
 
 // TestPlayerContextShapeContract holds the three descriptions of the
@@ -34,8 +35,18 @@ func TestPlayerContextShapeContract(t *testing.T) {
 	if diff := shapeDiff(want, clientShape); diff != "" {
 		t.Errorf("client.PlayerContext drifted from browser.PlayerContext plus session_generation:\n%s", diff)
 	}
-	if diff := shapeDiff(want, readmePlayerContextShape(t)); diff != "" {
+	if diff := shapeDiff(want, readmeResponseShape(t, "/player-context")); diff != "" {
 		t.Errorf("the README /player-context block drifted from the structs (the README shape is the contract):\n%s", diff)
+	}
+}
+
+// TestSessionShapeContract holds the /session response struct and the README
+// block that documents it together, the way TestPlayerContextShapeContract does
+// for /player-context. WaxTap reads the identity from this response, so a key
+// renamed on one side and not the other fails here.
+func TestSessionShapeContract(t *testing.T) {
+	if diff := shapeDiff(structShape(reflect.TypeOf(server.SessionResponse{})), readmeResponseShape(t, "/session")); diff != "" {
+		t.Errorf("the README /session block drifted from server.SessionResponse (the README shape is the contract):\n%s", diff)
 	}
 }
 
@@ -159,12 +170,12 @@ func shapeDiff(want, got shape) string {
 	return b.String()
 }
 
-// readmePlayerContextShape returns the shape of the README's /player-context
-// response example. It locates the block by the heading and by the "// response"
-// line that opens it, so the section's request example and the neighbouring
-// /session block cannot leak keys in, then decodes the example with its comments
-// stripped.
-func readmePlayerContextShape(t *testing.T) shape {
+// readmeResponseShape returns the shape of the README response example under the
+// first "###" heading containing heading. It locates the block by that heading
+// and by the "// response" line that opens it, so the section's request example
+// and a neighbouring endpoint's block cannot leak keys in, then decodes the
+// example with its comments stripped.
+func readmeResponseShape(t *testing.T, heading string) shape {
 	t.Helper()
 	raw, err := os.ReadFile("../README.md")
 	if err != nil {
@@ -173,18 +184,18 @@ func readmePlayerContextShape(t *testing.T) shape {
 	lines := strings.Split(string(raw), "\n")
 	i := 0
 	for ; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "###") && strings.Contains(lines[i], "/player-context") {
+		if strings.HasPrefix(lines[i], "###") && strings.Contains(lines[i], heading) {
 			break
 		}
 	}
 	if i == len(lines) {
-		t.Fatal("README has no /player-context heading")
+		t.Fatalf("README has no %s heading", heading)
 	}
 	// The first fenced block after the heading whose first line is "// response"
 	// is the documented response shape.
 	for ; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "##") && !strings.Contains(lines[i], "/player-context") {
-			t.Fatal("README /player-context section ends before a // response block")
+		if strings.HasPrefix(lines[i], "##") && !strings.Contains(lines[i], heading) {
+			t.Fatalf("README %s section ends before a // response block", heading)
 		}
 		if !strings.HasPrefix(lines[i], "```") {
 			continue
@@ -193,13 +204,13 @@ func readmePlayerContextShape(t *testing.T) shape {
 		for ; end < len(lines) && !strings.HasPrefix(lines[end], "```"); end++ {
 		}
 		if end == len(lines) {
-			t.Fatal("README has an unterminated fenced block after /player-context")
+			t.Fatalf("README has an unterminated fenced block after %s", heading)
 		}
 		body := lines[i+1 : end]
 		if len(body) > 0 && strings.TrimSpace(body[0]) == "// response" {
 			var top map[string]any
 			if err := json.Unmarshal([]byte(stripLineComments(strings.Join(body, "\n"))), &top); err != nil {
-				t.Fatalf("README /player-context response block is not JSON once its comments are stripped: %v", err)
+				t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
 			}
 			out := make(shape)
 			for k, v := range top {
@@ -209,7 +220,7 @@ func readmePlayerContextShape(t *testing.T) shape {
 		}
 		i = end
 	}
-	t.Fatal("README /player-context section has no // response block")
+	t.Fatalf("README %s section has no // response block", heading)
 	return nil
 }
 

@@ -4622,3 +4622,539 @@ func TestCrashWithoutAReportKeepsTheCachedTokens(t *testing.T) {
 		t.Errorf("cache_entries = %d after an unreported crash, want 2 (the tokens are still good)", got)
 	}
 }
+
+// A refusal the daemon expects to lift on its own carries the wait, and the
+// cause still classifies with errors.Is so the server's own routing is unmoved.
+func TestRetryAfterErrorCarriesTheWaitAndTheCause(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	// The refusal that starts the window states the whole window.
+	_, _, err := m.PlayerContext(ctx, "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("first refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != proofRetryCooldown {
+		t.Errorf("After = %v, want the whole window %v", ra.After, proofRetryCooldown)
+	}
+	if !errors.Is(err, ErrUnproven) {
+		t.Errorf("err = %v, want it to still be ErrUnproven", err)
+	}
+	if !strings.Contains(err.Error(), "full-length proof failed") {
+		t.Errorf("err = %q, want it to name the proof failure", err)
+	}
+
+	// A refusal from inside the window states what is LEFT of it, not the window
+	// again: age the record by a known amount and the stated wait must have moved
+	// by that much.
+	const elapsed = 10 * time.Second
+	m.RewindProofCooldownForTest(elapsed)
+	_, _, err = m.PlayerContext(ctx, "vid")
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("cool-down refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	want := proofRetryCooldown - elapsed
+	if ra.After > want || ra.After < want-time.Second {
+		t.Errorf("After = %v, want about %v (the window less the %v already elapsed)", ra.After, want, elapsed)
+	}
+	if !errors.Is(err, ErrUnproven) || !strings.Contains(err.Error(), "full-length proof failed") {
+		t.Errorf("cool-down refusal = %v, want ErrUnproven naming the original proof failure", err)
+	}
+
+	// /session refuses from the same record with the same remaining wait.
+	_, _, _, err = m.SessionSnapshot(ctx)
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("session refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After > want || ra.After < want-time.Second {
+		t.Errorf("session After = %v, want about %v", ra.After, want)
+	}
+}
+
+// The two refusals that end a proof ladder, a spent relaunch and a replacement
+// that could not prove either, both state the fresh cool-down.
+func TestProofLadderRefusalsStateTheCooldown(t *testing.T) {
+	rewind := func(m *Minter) {
+		m.mu.Lock()
+		m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+		m.mu.Unlock()
+	}
+	wantWholeWindow := func(t *testing.T, err error) {
+		t.Helper()
+		ra, ok := errors.AsType[*RetryAfterError](err)
+		if !ok {
+			t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+		}
+		if ra.After != proofRetryCooldown {
+			t.Errorf("After = %v, want the whole window %v", ra.After, proofRetryCooldown)
+		}
+	}
+
+	t.Run("relaunched session could not prove", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		ctx := context.Background()
+		if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+			t.Fatalf("first request err = %v, want ErrUnproven", err)
+		}
+		rewind(m)
+		_, _, err := m.PlayerContext(ctx, "vid") // relaunches, the replacement fails too
+		wantWholeWindow(t, err)
+	})
+
+	t.Run("relaunch already spent", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		ctx := context.Background()
+		for range 2 {
+			if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+				t.Fatalf("setup request err = %v, want ErrUnproven", err)
+			}
+			rewind(m)
+		}
+		_, _, err := m.PlayerContext(ctx, "vid") // the streak's relaunch is spent
+		wantWholeWindow(t, err)
+	})
+}
+
+// The pool knows how long its relaunch is backing off, so every entry point that
+// needs a session passes that wait to the caller instead of a bare string.
+func TestLaunchBackoffCarriesTheWait(t *testing.T) {
+	const wait = 7 * time.Second
+	backoff := &browser.RelaunchBackoffError{Wait: wait, Streak: 2}
+	newM := func() *Minter {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) { return nil, backoff }
+		return m
+	}
+	check := func(t *testing.T, err error) {
+		t.Helper()
+		ra, ok := errors.AsType[*RetryAfterError](err)
+		if !ok {
+			t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+		}
+		if ra.After != wait {
+			t.Errorf("After = %v, want the pool's remaining backoff %v", ra.After, wait)
+		}
+		if !errors.Is(err, backoff) {
+			t.Errorf("err = %v, want it to wrap the pool's backoff error", err)
+		}
+	}
+	ctx := context.Background()
+
+	t.Run("player-context", func(t *testing.T) {
+		m := newM()
+		_, _, err := m.PlayerContext(ctx, "vid")
+		check(t, err)
+		if got := m.metrics.LaunchFailures.Load(); got != 1 {
+			t.Errorf("launch_failures = %d, want 1 (the wrap must not hide the failure)", got)
+		}
+	})
+	t.Run("session", func(t *testing.T) {
+		m := newM()
+		_, _, _, err := m.SessionSnapshot(ctx)
+		check(t, err)
+	})
+	t.Run("mint", func(t *testing.T) {
+		m := newM()
+		_, _, err := m.Mint(ctx, "gvs", "b")
+		check(t, err)
+	})
+}
+
+// Seconds is what the Retry-After header carries: whole seconds, rounded up, and
+// never zero, because a wait under a second is still later rather than now.
+func TestRetryAfterSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		after time.Duration
+		want  int
+	}{
+		{12200 * time.Millisecond, 13},
+		{400 * time.Millisecond, 1},
+		{30 * time.Second, 30},
+		{0, 1},
+		{-5 * time.Second, 1},
+	} {
+		ra := &RetryAfterError{Err: ErrUnproven, After: tc.after}
+		if got := ra.Seconds(); got != tc.want {
+			t.Errorf("(&RetryAfterError{After: %v}).Seconds() = %d, want %d", tc.after, got, tc.want)
+		}
+	}
+}
+
+// botCheck is the error a walled browser session answers with, at a proof or a
+// context. It is never about the video.
+func botCheck() error {
+	return &browser.BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you’re not a bot"}
+}
+
+// A bot check on the context path buys one fresh identity and serves the same
+// request from it: waiting cannot lift a wall that keys on the visitor, and the
+// video itself is fine, so it must not be negative-cached.
+func TestPlayerContextBotCheckRelaunchesAndServesFromReplacement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+				return browser.PlayerContext{}, botCheck()
+			}}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	pc, _, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("the replacement served an empty context")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the bot check relaunches once)", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1", got)
+	}
+	if err := m.negCacheGet("vid"); err != nil {
+		t.Errorf("negative cache holds %v; a bot check is not a verdict on the video", err)
+	}
+}
+
+// A wall the fresh identity meets too is refused with the bot-check wait, and the
+// replacement's own passing proof must not hand the window a second relaunch.
+func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
+	var logs bytes.Buffer
+	var launches int64
+	var pcCalls atomic.Int64
+	walled := func(string) (browser.PlayerContext, error) {
+		pcCalls.Add(1)
+		return browser.PlayerContext{}, botCheck()
+	}
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: walled}, nil
+	}
+	ctx := context.Background()
+
+	_, _, err := m.PlayerContext(ctx, "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != botCheckCooldown {
+		t.Errorf("After = %v, want the bot-check cool-down %v", ra.After, botCheckCooldown)
+	}
+	if !errors.Is(err, browser.ErrBotCheck) {
+		t.Errorf("err = %v, want it to wrap ErrBotCheck", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 2 {
+		t.Errorf("bot_checks = %d, want 2 (the context, then the replacement's)", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the window grants one relaunch)", got)
+	}
+
+	// The next request is refused from the cool-down without touching the browser,
+	// even though the replacement's proof passed: markProved must not clear the
+	// bot-check window.
+	before := pcCalls.Load()
+	preRejections := m.metrics.UnprovenRejections.Load()
+	m.RewindProofCooldownForTest(10 * time.Second)
+	_, _, err = m.PlayerContext(ctx, "vid")
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("cool-down refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if want := botCheckCooldown - 10*time.Second; ra.After > want || ra.After < want-time.Second {
+		t.Errorf("After = %v, want about %v (the window less the 10s aged off it)", ra.After, want)
+	}
+	if got := pcCalls.Load(); got != before {
+		t.Errorf("PlayerContext calls = %d, want %d (the cool-down must refuse without touching the browser)", got, before)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (a cool-down refusal never relaunches)", got)
+	}
+	if m.metrics.UnprovenRejections.Load() <= preRejections {
+		t.Error("unproven_rejections did not move for the cool-down refusal")
+	}
+	if !strings.Contains(logs.String(), "bot-check cool-down") {
+		t.Errorf("log = %q, want the refusal to name the bot-check cool-down", logs.String())
+	}
+}
+
+// A bot check at the proof skips the first-failure step a proof failure gets:
+// waiting cannot lift it, so the relaunch is immediate and the same request is
+// served from the fresh identity.
+func TestProofBotCheckRelaunchesAtOnce(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	pc, _, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("the replacement served an empty context")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 on the first request (no first-failure cool-down)", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0 (the request was served)", got)
+	}
+}
+
+// A replacement that meets the wall too is counted and named as a bot check, not
+// as a session that could not prove full-length streaming.
+func TestProofBotCheckOnReplacementIsCountedAndNamed(t *testing.T) {
+	var logs bytes.Buffer
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+	}
+
+	_, _, err := m.PlayerContext(context.Background(), "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != botCheckCooldown {
+		t.Errorf("After = %v, want the bot-check cool-down %v", ra.After, botCheckCooldown)
+	}
+	if !errors.Is(err, browser.ErrBotCheck) {
+		t.Errorf("err = %v, want it to wrap ErrBotCheck", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 2 {
+		t.Errorf("bot_checks = %d, want 2", got)
+	}
+	if !strings.Contains(logs.String(), "bot check as well") {
+		t.Errorf("log = %q, want the replacement's failure named as a bot check", logs.String())
+	}
+	if strings.Contains(logs.String(), "could not prove full-length streaming") {
+		t.Errorf("log = %q, want the bot check not reported as an unprovable session", logs.String())
+	}
+}
+
+// One fresh identity per window, however many proofs pass in between, and a
+// window that has rolled over grants the next one.
+func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			return browser.PlayerContext{}, botCheck()
+		}}, nil
+	}
+	ctx := context.Background()
+	clearCooldown := func() {
+		m.mu.Lock()
+		m.proofFailGen, m.proofFailedAt, m.proofFailCause, m.proofFailCooldown = 0, time.Time{}, nil, 0
+		m.mu.Unlock()
+	}
+
+	// The first bot check claims the window's relaunch.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("first request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Fatalf("launches = %d, want 2", got)
+	}
+
+	// A later bot check, past the cool-down, refuses without another launch.
+	clearCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("second request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the window's relaunch is spent)", got)
+	}
+
+	// Once the window has rolled over, the next bot check buys another identity.
+	m.mu.Lock()
+	m.botCheckRelaunchedAt = time.Now().Add(-botCheckRelaunchWindow - time.Second)
+	m.mu.Unlock()
+	clearCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("third request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 3 {
+		t.Errorf("launches = %d, want 3 (a fresh window grants another relaunch)", got)
+	}
+}
+
+// The startup self-test counts a bot check and warns, but records no cool-down:
+// a walled daemon would otherwise refuse its first requests without ever trying
+// a fresh identity. The self-test never relaunches on its own.
+func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
+	var logs bytes.Buffer
+	var launches int64
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("SelfTest = %v, want nil after a logged bot check", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (the self-test never relaunches)", got)
+	}
+	if !strings.Contains(logs.String(), "bot check") {
+		t.Errorf("log = %q, want the startup bot check named", logs.String())
+	}
+	m.mu.Lock()
+	recorded := !m.proofFailedAt.IsZero()
+	m.mu.Unlock()
+	if recorded {
+		t.Error("the self-test recorded a cool-down; the first request would be refused before meeting the wall itself")
+	}
+
+	// The first request meets the wall itself and relaunches at once.
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("PlayerContext after the self-test: %v", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the first request relaunches)", got)
+	}
+}
+
+// /session proves through the same ladder, so a bot check there relaunches too
+// and the caller gets the replacement's identity.
+func TestSessionSnapshotBotCheckRelaunches(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck(), id: browser.Identity{VisitorData: "walled"}}, nil
+		}
+		return &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "fresh"}}, nil
+	}
+
+	id, _, _, err := m.SessionSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("SessionSnapshot: %v", err)
+	}
+	if id.VisitorData != "fresh" {
+		t.Errorf("visitor_data = %q, want the replacement's identity", id.VisitorData)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+}
+
+// A bot check met on a replacement this request already took for another reason
+// must not consume the window's one relaunch: nothing relaunches on that path,
+// so claiming the grant there would spend it with no fresh identity to show for
+// it and refuse the next real bot check.
+func TestBotCheckOnAnUnrelatedReplacementKeepsTheGrant(t *testing.T) {
+	var launches int64
+	var pcCalls atomic.Int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			// The first request walks the ladder on a plain failure (attempt, retry,
+			// then the replacement); the wall appears only once it is already on that
+			// replacement.
+			if pcCalls.Add(1) < 3 {
+				return browser.PlayerContext{}, errors.New("extract failed")
+			}
+			return browser.PlayerContext{}, botCheck()
+		}}, nil
+	}
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("first request err = %v, want the replacement's bot check", err)
+	}
+	m.mu.Lock()
+	claimed := !m.botCheckRelaunchedAt.IsZero()
+	m.mu.Unlock()
+	if claimed {
+		t.Fatal("the bot-check window was claimed on a path that never relaunches for one")
+	}
+
+	// The next bot check is the first one that can act on a grant, so it must
+	// still get its fresh identity.
+	before := atomic.LoadInt64(&launches)
+	m.mu.Lock()
+	m.proofFailGen, m.proofFailedAt, m.proofFailCause, m.proofFailCooldown = 0, time.Time{}, nil, 0
+	m.mu.Unlock()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("second request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches) - before; got != 1 {
+		t.Errorf("launches on the bot check = %d, want 1 (the window's grant was still unspent)", got)
+	}
+}
+
+// The proof-failure streak and the bot-check window are separate rules. They
+// share one cool-down record, so the streak has to read the cause: a bot check
+// must not make the next proof failure on that generation count as its second
+// and claim the streak's relaunch.
+func TestBotCheckDoesNotSeedTheProofStreak(t *testing.T) {
+	const gen = 7
+
+	t.Run("a bot check does not count as a proof failure", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.recordBotCheck(gen, botCheck(), true)
+		second, relaunch := m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		if second {
+			t.Error("a proof failure after a bot check counted as the generation's second")
+		}
+		if relaunch {
+			t.Error("a proof failure after a bot check claimed the streak's relaunch")
+		}
+	})
+
+	t.Run("two proof failures still make a second", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		second, relaunch := m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		if !second || !relaunch {
+			t.Errorf("second = %v, relaunch = %v, want both true", second, relaunch)
+		}
+	})
+}
