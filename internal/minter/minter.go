@@ -698,24 +698,13 @@ func (m *Minter) markMinted() {
 	m.mu.Unlock()
 }
 
-// markEstablished records a completed context establishment. Its body is
-// identical to markPlayback's, which records an attempt: both arm the mint gate
-// through lastEstablishAt and nothing else. The two names are kept apart because
-// the call sites read differently, one on every attempt and one only on success.
-func (m *Minter) markEstablished() {
-	m.mu.Lock()
-	m.lastEstablishAt = time.Now()
-	m.mu.Unlock()
-}
-
 // markPlayback records that the page attempted in-page playback establishment,
 // successfully or not: sess.PlayerContext in PlayerContext and
 // sess.EnsureEstablished in ensureProven and SelfTest each call it after every
 // attempt. A failed establishment still touched the page, so it arms the mint
-// gate (waitBeforeMint) exactly like a successful one. The success paths also
-// call markEstablished, whose effect is the same, or markProved, which does the
-// extra bookkeeping: the context-gate anchor lastProofAt, and clearing the
-// proof-failure state.
+// gate (waitBeforeMint) exactly like a successful one. A proof's success path
+// also calls markProved, which does the extra bookkeeping: the context-gate
+// anchor lastProofAt, and clearing the proof-failure state.
 func (m *Minter) markPlayback() {
 	m.mu.Lock()
 	m.lastEstablishAt = time.Now()
@@ -1428,7 +1417,6 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	m.markPlayback() // any attempt, successful or not, arms the mint gate.
 	if err == nil {
 		m.metrics.PlayerContexts.Add(1)
-		m.markEstablished()
 		return pc, gen, nil
 	}
 	// A browser that died under the request is already retired and its failure
@@ -1456,7 +1444,6 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		m.markPlayback()
 		if err == nil {
 			m.metrics.PlayerContexts.Add(1)
-			m.markEstablished()
 			return pc, gen, nil
 		}
 		if m.playerContextDied(ctx, sess, gen, err) {
@@ -1536,7 +1523,6 @@ func (m *Minter) playerContextOnReplacement(ctx context.Context, videoID string)
 		return browser.PlayerContext{}, gen, fmt.Errorf("minter: player-context failed after relaunch: %w", err)
 	}
 	m.metrics.PlayerContexts.Add(1)
-	m.markEstablished()
 	return pc, gen, nil
 }
 

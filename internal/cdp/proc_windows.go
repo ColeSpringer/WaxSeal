@@ -127,7 +127,10 @@ func (g *procGuard) attach(cmd *exec.Cmd, cmdPipe, evtPipe *pipePair) {
 	job := syscall.Handle(h)
 	info := jobObjectExtendedLimitInfo{}
 	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
-	ret, _, serr := procSetInformationJobObject.Call(
+	// SyscallN rather than Call: a pointer converted to uintptr is kept alive and
+	// in place for the call only when the conversion sits in the argument list of
+	// a syscall.Syscall* function, and Call is an ordinary Go method in between.
+	ret, _, serr := syscall.SyscallN(procSetInformationJobObject.Addr(),
 		uintptr(job),
 		jobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)),

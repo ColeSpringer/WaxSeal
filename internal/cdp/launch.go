@@ -151,10 +151,10 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 		c.forceClose(fmt.Errorf("version handshake: %w", err))
 		// Wait for the reap before reporting the failure. The caller removes the
 		// profile directory on the next line, and a Chromium that has been killed
-		// but not yet reaped still holds it open. ctx is deliberately not used:
+		// but not yet reaped still holds it open. The wait ignores ctx by design:
 		// an expired caller deadline is one of the reasons the handshake fails, and
 		// it must not turn this wait into a no-op.
-		if !c.waitExited(context.Background()) {
+		if !c.waitExited() {
 			opts.Logger.Warn("cdp: chromium was not reaped after a failed handshake; the profile may not remove cleanly",
 				"budget", waitDelay, "pid", c.pid())
 		}

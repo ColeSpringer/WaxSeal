@@ -35,8 +35,9 @@ FROM debian:trixie-slim
 # The assertion guards the list, which is release specific (bookworm had
 # libllvm15, no mesa-libgallium) and fails silently: dpkg --purge exits 0 with a
 # warning for a package that is not installed. The globs catch a rename that
-# leaves its files, dpkg-query catches a remove that left a config record. If a
-# build trips either, fix the list rather than the assertion.
+# leaves its files, dpkg-query catches a package in any state short of
+# not-installed, such as a remove that left a config record. If a build trips
+# either, fix the list rather than the assertion.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
@@ -51,7 +52,7 @@ RUN apt-get update \
       ls -d /usr/lib/*/dri >&2; exit 1; fi \
  && left=$(dpkg-query -W -f '${Package} ${db:Status-Status}\n' \
       'libllvm*' 'mesa-libgallium*' 'libgl1-mesa-dri*' 'libz3-*' 2>/dev/null \
-      | awk '$2 == "installed" { print $1 }') \
+      | awk '$2 != "not-installed" { print $1 }') \
  && if [ -n "$left" ]; then \
       echo "ERROR: still installed after the purge: $left" >&2; exit 1; fi \
  && rm -rf /var/lib/apt/lists/*

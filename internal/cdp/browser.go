@@ -113,7 +113,7 @@ func (c *Conn) closeRoot(ctx context.Context) {
 		_, _ = c.rawCall(cctx, "", "Browser.close", nil)
 		cancel()
 		c.forceClose(errors.New("browser closed"))
-		if !c.waitExited(ctx) {
+		if !c.waitExited() {
 			c.log.Warn("cdp: chromium was not reaped before Close returned; a profile removal may find files still open",
 				"budget", waitDelay, "pid", c.pid())
 		}
@@ -126,9 +126,11 @@ func (c *Conn) closeRoot(ctx context.Context) {
 // Callers remove the profile directory right after teardown, and Chromium holds
 // its files open until the process object is gone: on Unix that leaves a stray
 // directory, on Windows the remove fails outright. The budget is waitDelay, which
-// is what cmd.Wait may legitimately take after the process itself is gone; ctx
-// bounds it from the other side.
-func (c *Conn) waitExited(ctx context.Context) bool {
+// is what cmd.Wait may legitimately take after the process itself is gone. No
+// caller context bounds it: the pool's teardown context is the same length and
+// the polite close has already spent part of it, so it could never cover the
+// budget the warning reports, and an expired one would make the wait a no-op.
+func (c *Conn) waitExited() bool {
 	if c == nil || c.cmd == nil {
 		return true
 	}
@@ -137,8 +139,6 @@ func (c *Conn) waitExited(ctx context.Context) bool {
 	select {
 	case <-c.exited:
 		return true
-	case <-ctx.Done():
-		return false
 	case <-timer.C:
 		return false
 	}

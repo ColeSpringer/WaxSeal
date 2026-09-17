@@ -91,7 +91,12 @@ func cleanupProfile(h profileHandle) {
 			return
 		}
 		if time.Now().After(deadline) {
-			return // the startup reaper collects it on the next run
+			// RemoveAll keeps going past a file it cannot delete, so by now it has
+			// taken creator.pid and left the directory markerless, which the reaper
+			// retains rather than collects. Put the marker back so the next startup
+			// sweep finds an unlocked, marked directory and removes it.
+			_ = writeMarker(h.dir)
+			return
 		}
 		time.Sleep(profileRemoveInterval)
 	}

@@ -4,12 +4,23 @@ name: Release
 # hand into a draft (`gh release create vX.Y.Z --draft --notes-file ...`), which
 # reserves the tag without creating it, and then publish: publishing is what
 # pushes the tag and triggers this workflow, whose jobs attach the binaries and
-# publish the image. VERSION strips the leading `v` so it matches the image tag
-# and the -X main.version stamp (v1.2.3 -> 1.2.3).
+# publish the image, each with a GitHub build provenance attestation. The tag
+# name is passed to make as VERSION, and the Makefile drops its leading `v` for
+# the image tag and the -X main.version stamp (v1.2.3 -> 1.2.3).
 on:
   push:
     tags:
       - 'v*'
+
+# Each job adds the write scopes it needs; everything else starts read-only.
+permissions:
+  contents: read
+
+# A re-run for the same tag queues behind the run in progress instead of racing
+# it for the same release assets and image tags.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Build the version-stamped Linux, macOS, and Windows binaries and attach them,
@@ -20,22 +31,34 @@ jobs:
   # writes the notes and publishes it; this workflow never publishes a release
   # on its own. The binaries embed the committed JS bundle but need a system
   # Chromium or Chrome at runtime. RELEASE_PLATFORMS in the Makefile is the list;
-  # the cross job in ci.yml compiles the same set on every push.
+  # the cross job in ci.yml runs the same `make release` on every push.
   binaries:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write      # upload the assets, and create the fallback draft
+      id-token: write      # sign the attestation as this workflow
+      attestations: write  # store the attestation on GitHub
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          # A release builds from clean module and build caches, so nothing
+          # restored from an earlier run can reach a published binary.
+          cache: false
       - name: build release binaries
-        run: make release VERSION="${GITHUB_REF_NAME#v}"
+        run: make release VERSION="$GITHUB_REF_NAME"
+      # Not a pipe into tee: a run step with no shell set runs `bash -e` without
+      # pipefail, which would let a sha256sum failure pass as tee's success.
       - name: checksums
         working-directory: dist
-        run: sha256sum waxseal-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+        run: |
+          sha256sum waxseal-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          { echo '```'; cat SHA256SUMS.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: publish binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,53 +84,61 @@ jobs:
           fi
           gh release upload "$GITHUB_REF_NAME" \
             dist/waxseal-* dist/SHA256SUMS.txt --clobber
+      # Provenance for every binary: the commit, workflow, and runner that built
+      # it. `gh attestation verify <file> --repo ColeSpringer/WaxSeal` checks a
+      # download against it.
+      - name: attest the binaries
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/waxseal-*
 
-  # One per-architecture tag per platform, each built and smoke-tested on its own
-  # native runner; the `manifest` job assembles the plain VERSION tag from them.
-  # `make docker-push` is not reused because its gh OAuth scope check rejects the
-  # Actions token, but `make docker-build` is, so the tagging lives in one place.
+  # One per-architecture tag per platform, each built, smoke-tested, and pushed
+  # on its own native runner by `make docker-push-authed`; the `manifest` job
+  # assembles the plain VERSION tag from them. The authed variant exists because
+  # `make docker-push` checks a human's gh OAuth scopes, which the Actions token
+  # cannot pass, so the login happens here instead.
   #
   # The smoke test matters here and not only in CI: CI never sees a tag push, and
   # this build resolves `apt-get install chromium` fresh, so without it a release
-  # could publish an image no workflow ever started. `--pull=never` keeps the
-  # probe on the local build now that this job is logged in to GHCR.
+  # could publish an image no workflow ever started.
   image:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     permissions:
-      packages: write
+      contents: read       # check out the source
+      packages: write      # push the per-arch tag to GHCR, and its attestation beside it
+      id-token: write      # sign the attestation as this workflow
+      attestations: write  # store the attestation on GitHub
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # GitHub Actions expressions have no substring-strip function, so VERSION
-      # cannot be a job-level env: value computed with ${{ }}; compute it once in
-      # a shell step instead and export it to every later step in the job.
-      - name: compute VERSION
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        with:
+          persist-credentials: false
       - name: log in to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: build the image
-        run: make docker-build VERSION="$VERSION"
-      - name: the built image can start a renderer and complete a navigation
-        env:
-          ARCH: ${{ matrix.arch }}
+      - name: build, smoke-test, and push the per-arch tag
+        run: make docker-push-authed VERSION="$GITHUB_REF_NAME"
+      # A per-arch tag resolves to its own manifest, not to the multi-arch one the
+      # manifest job attests, so a pull pinned to one platform gets its own
+      # attestation here. The Makefile names the image and the tag, so the
+      # workflow cannot attest a different reference than it pushed.
+      - name: resolve the pushed digest
+        id: pushed
         run: |
-          docker run --rm --network none --shm-size=1gb --pull=never \
-            --entrypoint waxseal "ghcr.io/colespringer/waxseal:$VERSION-$ARCH" \
-            doctor --stop-after-load
-      - name: push the per-arch tag
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: docker push "ghcr.io/colespringer/waxseal:$VERSION-$ARCH"
+          echo "name=$(make -s image-name)" >> "$GITHUB_OUTPUT"
+          echo "digest=$(make -s docker-digest VERSION="$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+      - name: attest the per-arch image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.pushed.outputs.name }}
+          subject-digest: ${{ steps.pushed.outputs.digest }}
+          push-to-registry: true
 
   # Assemble the plain VERSION tag from the per-arch tags, and move :latest for a
   # stable release. The prerelease gate lives here because this is the job that
@@ -119,12 +150,16 @@ jobs:
   manifest:
     needs: image
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      packages: write
+      contents: read       # check out the Makefile
+      packages: write      # push the VERSION and :latest manifests, and the attestation beside them
+      id-token: write      # sign the attestation as this workflow
+      attestations: write  # store the attestation on GitHub
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: compute VERSION
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        with:
+          persist-credentials: false
       - name: log in to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,11 +168,26 @@ jobs:
       - name: assemble the multi-arch tag
         run: |
           # Build metadata after + can contain hyphens and is not a prerelease; strip it first.
-          case "${VERSION%%+*}" in
-            *-*) push_latest=0; echo "prerelease $VERSION; :latest will not be moved" ;;
+          case "${GITHUB_REF_NAME%%+*}" in
+            *-*) push_latest=0; echo "prerelease $GITHUB_REF_NAME; :latest will not be moved" ;;
             *)   push_latest=1 ;;
           esac
           # docker-manifest itself would run make's docker-login, which checks a
           # human's gh OAuth scopes and would reject the Actions token. This job
           # has already logged in, so it calls the already-authenticated variant.
-          make docker-manifest-authed VERSION="$VERSION" PUSH_LATEST="$push_latest"
+          make docker-manifest-authed VERSION="$GITHUB_REF_NAME" PUSH_LATEST="$push_latest"
+      # The attestation names the multi-arch manifest, which is what the VERSION
+      # tag and :latest both resolve to, so it lives with the job that assembles
+      # it. `gh attestation verify oci://ghcr.io/colespringer/waxseal:<version>
+      # --repo ColeSpringer/WaxSeal` checks a pull against it.
+      - name: resolve the manifest digest
+        id: manifest
+        run: |
+          echo "name=$(make -s image-name)" >> "$GITHUB_OUTPUT"
+          echo "digest=$(make -s docker-manifest-digest VERSION="$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+      - name: attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.manifest.outputs.name }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true

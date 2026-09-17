@@ -22,13 +22,8 @@ import (
 
 func findChrome(t *testing.T) string {
 	t.Helper()
-	if b := os.Getenv("WAXSEAL_CHROME_BIN"); b != "" {
+	if b, ok := chromepath.Detect(); ok {
 		return b
-	}
-	for _, p := range chromepath.Candidates() {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p
-		}
 	}
 	// WAXSEAL_REQUIRE_CHROME turns a missing browser into a hard failure. CI sets
 	// it (=1) on the -tags live step so pipe-transport coverage is lost loudly, not

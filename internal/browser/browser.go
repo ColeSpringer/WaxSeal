@@ -1893,13 +1893,14 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 	tm := s.tuning()
 	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
 	// A single CDP hiccup here is tolerated on the same three-strike rule phase 2
-	// and reReadContext use; a crashed or closed page still fails fast.
+	// and reReadContext use; a closed connection fails on the first error, since
+	// no retry reaches a browser that is gone.
 	readyErrs := 0
 	for {
 		ready, err := page.Eval(playerReadyJS)
 		if err != nil {
 			readyErrs++
-			if readyErrs >= 3 || time.Now().After(deadline) {
+			if readyErrs >= 3 || errors.Is(err, cdp.ErrConnClosed) || time.Now().After(deadline) {
 				return playerContextRaw{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
 			}
 		} else {
@@ -1945,10 +1946,10 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 		_, _ = page.Eval(playerDriveJS)
 		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
 		if evalErr != nil {
-			// Tolerate a one-off CDP hiccup, but fail fast on a crashed/closed page
-			// (persistent errors) instead of spinning to the deadline.
+			// Tolerate a one-off CDP hiccup, but fail at once on a closed connection
+			// and after three errors in a row, instead of spinning to the deadline.
 			evalErrs++
-			if evalErrs >= 3 || time.Now().After(deadline) {
+			if evalErrs >= 3 || errors.Is(evalErr, cdp.ErrConnClosed) || time.Now().After(deadline) {
 				// The deadline can still pass inside an eval, and that eval then
 				// fails on the bound context. Report the page's own last reason for
 				// that one case only: any other error is a real extraction failure
@@ -2642,7 +2643,7 @@ func (s *Session) reReadContext(ctx context.Context, page pageDriver, videoID st
 		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
 		if evalErr != nil {
 			evalErrs++
-			if evalErrs >= 3 || time.Now().After(deadline) {
+			if evalErrs >= 3 || errors.Is(evalErr, cdp.ErrConnClosed) || time.Now().After(deadline) {
 				return playerContextRaw{}, fmt.Errorf("waxseal: player-context re-read: %w", evalErr)
 			}
 			// A transient CDP error is retried; surface it at debug so a slow re-read is
@@ -2692,19 +2693,12 @@ func (s *Session) Close() {
 	})
 }
 
-// DetectChrome resolves a Chromium binary from WAXSEAL_CHROME_BIN or this
-// platform's well-known install locations (internal/chromepath, shared with the
-// cdp package's live tests so the two cannot drift). WAXSEAL_CHROME_BIN remains
-// the escape hatch for any browser, including the ones chromepath deliberately
-// leaves out.
+// DetectChrome resolves a Chromium binary through internal/chromepath, which the
+// cdp package's live tests share so the two cannot drift: WAXSEAL_CHROME_BIN when
+// set, otherwise the first well-known install location that exists.
 func DetectChrome() (string, error) {
-	if b := os.Getenv("WAXSEAL_CHROME_BIN"); b != "" {
+	if b, ok := chromepath.Detect(); ok {
 		return b, nil
-	}
-	for _, p := range chromepath.Candidates() {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p, nil
-		}
 	}
 	return "", fmt.Errorf("waxseal: no Chromium found; set WAXSEAL_CHROME_BIN")
 }

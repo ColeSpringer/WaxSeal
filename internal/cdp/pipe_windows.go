@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -42,7 +43,24 @@ const (
 	// pipeBufferBytes sizes each direction's kernel buffer. CDP frames are small;
 	// this is generous so a burst of events cannot stall Chromium's writer.
 	pipeBufferBytes = 64 << 10
+
+	// overlappedDrainTimeout bounds the wait for a cancelled ConnectNamedPipe to
+	// report completion, after which its Overlapped is pinned rather than freed.
+	overlappedDrainTimeout = 5 * time.Second
 )
+
+// pinnedOverlapped holds every Overlapped whose operation never reported
+// completion. The kernel may still write to that memory, so it is never freed.
+var (
+	pinnedMu         sync.Mutex
+	pinnedOverlapped []*syscall.Overlapped
+)
+
+func pinOverlapped(ov *syscall.Overlapped) {
+	pinnedMu.Lock()
+	pinnedOverlapped = append(pinnedOverlapped, ov)
+	pinnedMu.Unlock()
+}
 
 // newPlatformPipePair creates a one-instance named pipe and connects a client to
 // it, returning the overlapped server end as parent and the inheritable client
@@ -146,7 +164,7 @@ func newPlatformPipePair(dir pipeDir, childPollable bool) (_ *pipePair, err erro
 // overlapped end needs a real event or the kernel has nowhere to signal
 // completion. ERROR_IO_PENDING is still an error here, but it cannot just return:
 // the kernel owns ov, which is Go heap the collector may reuse, so the operation
-// is cancelled and drained first.
+// is cancelled and drained first, and pinned if the drain does not complete.
 func connectServerEnd(server syscall.Handle) error {
 	event, _, eerr := procCreateEventW.Call(0, 1, 0, 0) // manual reset, initially unsignaled
 	if event == 0 {
@@ -160,12 +178,18 @@ func connectServerEnd(server syscall.Handle) error {
 		return nil
 	}
 	if cerr == syscall.ERROR_IO_PENDING {
-		// The wait is unbounded on purpose: there is no safe way to return while
-		// the kernel may still write to ov. A cancelled ConnectNamedPipe completes
-		// at once, and CancelIoEx failing with ERROR_NOT_FOUND means the operation
-		// already finished and the event is already signaled.
+		// A cancelled ConnectNamedPipe completes at once, and CancelIoEx failing
+		// with ERROR_NOT_FOUND means the operation already finished and the event
+		// is already signaled. The wait is bounded all the same: should the
+		// completion never arrive, or the wait itself fail, ov is pinned for the
+		// life of the process rather than returned to a collector that would hand
+		// the kernel's target to something else.
 		_ = syscall.CancelIoEx(server, ov)
-		_, _ = syscall.WaitForSingleObject(syscall.Handle(event), syscall.INFINITE)
+		ev, werr := syscall.WaitForSingleObject(syscall.Handle(event), uint32(overlappedDrainTimeout/time.Millisecond))
+		if ev != syscall.WAIT_OBJECT_0 {
+			pinOverlapped(ov)
+			return fmt.Errorf("cdp: ConnectNamedPipe: no client was attached, and the cancel did not complete (wait %#x, %v): %w", ev, werr, cerr)
+		}
 		runtime.KeepAlive(ov)
 		return fmt.Errorf("cdp: ConnectNamedPipe: no client was attached: %w", cerr)
 	}
@@ -176,7 +200,7 @@ func connectServerEnd(server syscall.Handle) error {
 // use it to prove the child end is inheritable and the parent end is not.
 func handleIsInheritable(h syscall.Handle) (bool, error) {
 	var flags uint32
-	ret, _, err := procGetHandleInformation.Call(uintptr(h), uintptr(unsafe.Pointer(&flags)))
+	ret, _, err := syscall.SyscallN(procGetHandleInformation.Addr(), uintptr(h), uintptr(unsafe.Pointer(&flags)))
 	if ret == 0 {
 		return false, fmt.Errorf("cdp: GetHandleInformation: %w", err)
 	}

@@ -6,7 +6,11 @@
 # bundle is committed, so `go build` and `go test` do not need Node. The CLI and
 # daemon still require Chromium at runtime.
 
+# VERSION stamps binaries and tags images. A leading v is dropped so a git tag
+# can be passed as is: v1.2.3 stamps and tags 1.2.3. override reaches a value
+# given on the command line, which a plain assignment would leave alone.
 VERSION           ?= dev
+override VERSION  := $(VERSION:v%=%)
 DIST              := dist
 RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
@@ -36,9 +40,19 @@ ARCHES ?= amd64 arm64
 # :latest.
 PUSH_LATEST ?= 0
 
-.PHONY: all help fmt-check vet test live jsbundle-browser verify-assets release deps clean \
-        docker-build docker-login docker-push docker-manifest docker-manifest-authed \
-        release-guard
+# GOVULNCHECK_VERSION pins the scanner vulncheck runs, so a run reads the same
+# way as the last one. Bump it by hand.
+GOVULNCHECK_VERSION ?= v1.8.0
+
+.PHONY: all help fmt-check tidy-check vulncheck vet test live jsbundle-browser verify-assets \
+        release deps clean docker-build docker-smoke docker-login docker-push \
+        docker-push-authed docker-manifest docker-manifest-authed release-guard \
+        image-name docker-digest docker-manifest-digest
+
+# The docker targets order their steps through prerequisite lists (build, then
+# smoke, then push), which make -j would run side by side. Nothing here gains
+# from parallelism, so it is off.
+.NOTPARALLEL:
 
 all: jsbundle-browser
 
@@ -46,6 +60,8 @@ all: jsbundle-browser
 help:
 	@echo "WaxSeal make targets:"
 	@echo "  fmt-check         fail if any file needs gofmt (covers provider/ too)"
+	@echo "  tidy-check        fail if go mod tidy would change either module"
+	@echo "  vulncheck         govulncheck over both modules"
 	@echo "  vet               go vet the root and provider/ modules, plus a windows cross-vet"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  live              real-Chromium CDP transport tests (needs a browser)"
@@ -53,6 +69,7 @@ help:
 	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
 	@echo "  release           build Linux/macOS/Windows amd64+arm64 binaries into $(DIST)/"
 	@echo "  docker-build      build the runtime image for this host's arch (VERSION=x.y.z to tag a release)"
+	@echo "  docker-smoke      start the image docker-build produced, on an isolated network"
 	@echo "  docker-push       publish this host's per-arch tag to $(REGISTRY)"
 	@echo "  docker-manifest   assemble $(IMAGE):VERSION from the per-arch tags (PUSH_LATEST=1 also moves :latest)"
 	@echo "  deps              install the Node toolchain for the bundle"
@@ -63,6 +80,18 @@ help:
 fmt-check:
 	@out=$$(gofmt -l . 2>&1); \
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+# tidy-check fails when `go mod tidy` would change go.mod or go.sum in either
+# module. -diff prints the change instead of writing it.
+tidy-check:
+	go mod tidy -diff
+	cd provider && go mod tidy -diff
+
+# vulncheck runs govulncheck over both modules. It reports only vulnerabilities
+# in functions the code actually calls, which keeps a finding actionable.
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	cd provider && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 # vet runs what CI vets, in one target: the root module, the nested provider/
 # module including its e2e-tagged files, and a windows cross-vet. The Windows job
@@ -161,6 +190,17 @@ docker-build:
 	DOCKER_BUILDKIT=1 docker build --build-arg VERSION=$(VERSION) \
 	  -t $(IMAGE):$(VERSION)-$(ARCH) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
+# docker-smoke builds the image (docker-build) and proves it can start Chromium,
+# fetch a page over HTTP, render it, and run JavaScript in it: `doctor
+# --stop-after-load` navigates to a page the command serves itself on loopback,
+# since a data: page never goes through the network service. --network none
+# keeps how YouTube answers a datacenter IP out of the verdict, so a red run
+# means the image is broken. --pull=never keeps the probe on the local build even
+# when this host is logged in to the registry.
+docker-smoke: docker-build
+	docker run --rm --network none --shm-size=1gb --pull=never \
+	  --entrypoint waxseal $(IMAGE):$(VERSION)-$(ARCH) doctor --stop-after-load
+
 # release-guard refuses to publish the default/empty VERSION, which would tag an
 # unreleased build and (with PUSH_LATEST=1) repoint the public :latest at it. It
 # guards both the per-arch push and the manifest that assembles them.
@@ -181,10 +221,15 @@ docker-login:
 	  exit 1; }
 	@gh auth token | docker login $(REGISTRY) -u $(IMAGE_OWNER) --password-stdin
 
-# docker-push validates VERSION and authentication before building. It pushes
-# this host's per-arch tag alone. The plain VERSION and latest tags belong to the
-# manifest, so nothing here can repoint them at a single architecture.
-docker-push: release-guard docker-login docker-build
+# docker-push validates VERSION and authentication, then builds, smoke-tests, and
+# pushes this host's per-arch tag alone. The plain VERSION and latest tags belong
+# to the manifest, so nothing here can repoint them at a single architecture.
+docker-push: release-guard docker-login docker-push-authed
+
+# docker-push-authed is docker-push for a caller already logged in to the
+# registry, the way docker-manifest-authed is for docker-manifest. The smoke test
+# runs before the push, so a broken image never reaches the registry.
+docker-push-authed: release-guard docker-smoke
 	docker push $(IMAGE):$(VERSION)-$(ARCH)
 	@echo "pushed $(IMAGE):$(VERSION)-$(ARCH); run docker-manifest once every arch is pushed"
 
@@ -218,6 +263,20 @@ docker-manifest-authed: release-guard
 	      echo "ERROR: $(IMAGE):$(VERSION) has no linux/$$a entry"; exit 1; }; \
 	  done; \
 	  echo "OK: $(IMAGE):$(VERSION) covers $(ARCHES)"
+
+# image-name prints the image reference, so the release workflow attests the
+# name this file tags rather than a copy of it.
+image-name:
+	@echo $(IMAGE)
+
+# docker-digest prints what this host's per-arch tag resolves to in the
+# registry, and docker-manifest-digest what the multi-arch VERSION tag resolves
+# to. The release workflow attests both.
+docker-digest:
+	@docker buildx imagetools inspect $(IMAGE):$(VERSION)-$(ARCH) --format '{{.Manifest.Digest}}'
+
+docker-manifest-digest:
+	@docker buildx imagetools inspect $(IMAGE):$(VERSION) --format '{{.Manifest.Digest}}'
 
 # deps installs the Node toolchain used to rebuild the browser bundle
 # (deterministically, from the committed lockfile).

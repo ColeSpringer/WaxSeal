@@ -30,6 +30,13 @@ The image is published for linux/amd64 and linux/arm64. The plain tag
 one; the per-architecture tags it is assembled from (`:1.0.0-amd64`,
 `:1.0.0-arm64`) stay pullable for pinning one platform.
 
+Each release's binaries and image tags, the multi-arch tag and the
+per-architecture ones alike, carry a GitHub build provenance attestation naming
+the commit and workflow run that built them. `gh attestation verify
+oci://ghcr.io/colespringer/waxseal:1.0.0 --repo ColeSpringer/WaxSeal` checks a
+pulled image against it, and `gh attestation verify <binary> --repo
+ColeSpringer/WaxSeal` a downloaded binary.
+
 The container is ready when its healthcheck passes. The daemon binds its socket
 before browser startup but serves only once `/ping` returns `{"ok":true,...}`;
 startup attests the first tenant, caches a GVS token, and runs a full-length
@@ -91,10 +98,11 @@ the load event of a page the command serves to itself on loopback, so it verifie
 that Chromium renders and navigates with no external network at all;
 `--landing-url` aims that check at some other page. Neither combines with
 `--full`, which needs an attested session. The container image is smoke-tested
-with `waxseal doctor --stop-after-load` on an isolated network.
+with `waxseal doctor --stop-after-load` on an isolated network, and `make
+docker-build docker-smoke` runs the same check locally.
 
-On Windows, Chrome is auto-detected under Program Files and the per-user install
-directory (`WAXSEAL_CHROME_BIN` overrides it, and Edge is never picked up on its
+On Windows, Chrome or a Chromium build is auto-detected under Program Files and
+the per-user install directory (`WAXSEAL_CHROME_BIN` overrides it, and Edge is never picked up on its
 own because it reports a different browser identity), browser profiles live under
 `%TEMP%`, and Ctrl-C stops the daemon the same way it does elsewhere. The
 container remains the recommended deployment on every host.
@@ -539,6 +547,8 @@ go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport te
 make vet                                   # what CI vets: both modules, plus a windows cross-vet
 make test                                  # both modules' offline tests, race-enabled
 make live                                  # the live CDP tests above
+make tidy-check                            # fail if go mod tidy would change either module
+make vulncheck                             # govulncheck over both modules
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js
 ```

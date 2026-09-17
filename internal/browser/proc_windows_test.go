@@ -73,3 +73,38 @@ func TestWindowsCleanupProfileRemovesLockedDirectory(t *testing.T) {
 		t.Errorf("cleanupProfile left the directory behind: %v", err)
 	}
 }
+
+// cleanupProfile can outlive its retry budget when a Chromium handle lingers on
+// a profile file. RemoveAll has deleted creator.pid by then, and the reaper
+// retains a markerless directory, so the marker has to be put back for it.
+func TestWindowsCleanupProfileLeavesMarkerWhenFilesAreHeld(t *testing.T) {
+	setProfileBase(t, t.TempDir())
+	dir, err := os.MkdirTemp(profileBase(), profilePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := markProfileDir(dir)
+	if lock == nil {
+		t.Fatal("markProfileDir returned a nil lock")
+	}
+	// Hold a profile file open with no sharing rights, the way a helper that has
+	// not exited yet does, so RemoveAll cannot delete it.
+	held := filepath.Join(dir, "Local State")
+	if err := os.WriteFile(held, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := openMarkerExclusive(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupProfile(profileHandle{dir: dir, lock: lock})
+	if _, err := os.Stat(filepath.Join(dir, creatorMarkerFile)); err != nil {
+		t.Fatalf("creator.pid is gone after a cleanup that could not finish (%v); the reaper would never collect this directory", err)
+	}
+	// Once the handle is released, the startup sweep collects the directory.
+	_ = h.Close()
+	ReapStaleProfiles(nil)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("ReapStaleProfiles left the directory behind: %v", err)
+	}
+}

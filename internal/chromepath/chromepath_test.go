@@ -1,6 +1,7 @@
 package chromepath
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -25,6 +26,16 @@ func TestCandidatesNotEmpty(t *testing.T) {
 		if strings.Contains(strings.ToLower(p), "edge") {
 			t.Errorf("candidate %d = %q: Edge must not be auto-detected, it reports a different browser identity", i, p)
 		}
+	}
+}
+
+// Detect trusts WAXSEAL_CHROME_BIN as given: it is the escape hatch for a browser
+// outside the candidate list, so it is not checked against the filesystem.
+func TestDetectPrefersTheOverride(t *testing.T) {
+	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "nowhere", "chrome"))
+	got, ok := Detect()
+	if !ok || got != os.Getenv("WAXSEAL_CHROME_BIN") {
+		t.Fatalf("Detect() = %q, %v; want the override", got, ok)
 	}
 }
 

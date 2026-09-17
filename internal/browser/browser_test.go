@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -354,14 +355,28 @@ func TestPlayerContextTagDrift(t *testing.T) {
 }
 
 // TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
-// every documented key. The JS runs only in Chromium, so a key dropped from the
-// JSON.stringify literal would otherwise surface as an empty field in a live run.
+// every documented key in the object literal it returns on success. The JS runs
+// only in Chromium, so a key dropped from that literal would otherwise surface as
+// an empty field in a live run. Only that literal is searched, and only for a
+// whole property name, so a key that survives elsewhere in the snippet, or as the
+// tail of another key, cannot satisfy the check.
 func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
+	const open = "return JSON.stringify({\n"
+	start := strings.Index(playerContextExtractJS, open)
+	if start < 0 {
+		t.Fatal("playerContextExtractJS has no multi-line success literal")
+	}
+	literal := playerContextExtractJS[start+len(open):]
+	end := strings.Index(literal, "});")
+	if end < 0 {
+		t.Fatal("playerContextExtractJS success literal is unterminated")
+	}
+	literal = literal[:end]
 	typ := reflect.TypeOf(PlayerContext{})
 	for i := range typ.NumField() {
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
-		if !strings.Contains(playerContextExtractJS, name+":") {
-			t.Errorf("playerContextExtractJS never emits %q", name)
+		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(name) + `:`).MatchString(literal) {
+			t.Errorf("playerContextExtractJS success literal never emits %q", name)
 		}
 	}
 }

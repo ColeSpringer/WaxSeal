@@ -4,28 +4,43 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run still in progress. Pushes
+# to main always run to completion, so any commit that could later be tagged
+# has a verdict from the jobs a tag push never reruns.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # Build, gofmt-check, vet, and run the offline race tests, plus the
+  # Build, gofmt-check, tidy-check, vet, and run the offline race tests, plus the
   # real-Chromium CDP pipe-transport tests (-tags live) against a pinned
   # browser. The committed browser bundle removes the Node dependency. Only
   # the network YouTube and BotGuard e2e (-tags e2e) still run manually,
   # needing network access.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+          # tidy-check below loads the provider/ module graph as well.
+          cache-dependency-path: |
+            go.sum
+            provider/go.sum
       - run: go build ./...
-      # gofmt covers this whole checkout by path, including the nested
+      # gofmt and tidy-check cover this whole checkout, including the nested
       # provider/ module, which the job below builds, vets, and tests on its own.
-      - run: make fmt-check
+      - run: make fmt-check tidy-check
       - run: go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
@@ -46,13 +61,34 @@ jobs:
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
 
+  # govulncheck over both modules. It reports only vulnerabilities in functions
+  # the code actually calls, so a red run here is something to act on.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            provider/go.sum
+      - run: make vulncheck
+
   # Build, vet, and test the nested consumer-adapter module separately. Its
   # untagged tests are pure httptest: no browser, no network, so they belong in
   # every run. The -tags e2e files need both, so they are only type-checked here.
   provider:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -82,8 +118,11 @@ jobs:
             live: false
             race: ""
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -112,72 +151,49 @@ jobs:
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
 
-  # Cross-compile the pure Go CLI and daemon for the supported targets. Each
-  # binary drives an external Chromium or Chrome at runtime. The windows job
-  # above builds, vets, and tests those binaries natively; this matrix is the
-  # cross-compilation check.
+  # Cross-compile every RELEASE_PLATFORMS target through the same `make release`
+  # the release workflow runs, so a target the Makefile cannot build fails on a
+  # push to main rather than on a tag. The windows job above builds, vets, and
+  # tests those binaries natively; this is the cross-compilation check.
   cross:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
-      - name: build ${{ matrix.goos }}/${{ matrix.goarch }} (no CGo)
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: go build ./cmd/waxseal
+      - run: make release VERSION=ci
 
   # Rebuild the committed browser bundle and require a byte-for-byte match.
   reproduce-bundle:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
       - name: rebuild and diff against the committed bundle
         run: make verify-assets
 
-  # Build the container image and smoke-test it. The probe covers the startup path
-  # an image has to get right: Chromium launching, fetching a page over HTTP,
-  # rendering it, and running JavaScript in it. It navigates a served URL rather
-  # than a data: page because a data: page never goes through the network service,
-  # so only a served URL proves the whole browser can load a page. It stops before
-  # identity capture, which reads ytcfg from a real watch page, because that would
-  # tie this gate to how YouTube answers a datacenter IP. `--network none` is what
-  # makes that hold: the page comes from a loopback server the command runs itself,
-  # so nothing outside the container is reachable and a red build here means the
-  # image is broken.
-  #
-  # Both architectures build on their own native runner. Going through `make
-  # docker-build` exercises the release's own path, and `--pull=never` keeps the
-  # probe on the image that build just produced.
+  # Build the image on each architecture's native runner and run the offline
+  # smoke test, through the same `make docker-smoke` that gates a release push.
+  # The Makefile says what the probe proves and why it needs no network.
   docker:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: make docker-build VERSION=ci
-      - name: the built image can start a renderer and complete a navigation
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          docker run --rm --network none --shm-size=1gb --pull=never \
-            --entrypoint waxseal "ghcr.io/colespringer/waxseal:ci-$ARCH" \
-            doctor --stop-after-load
+        with:
+          persist-credentials: false
+      - run: make docker-smoke VERSION=ci
