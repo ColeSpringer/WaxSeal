@@ -415,7 +415,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		logger.Error("startup: bind listen address failed", "err", err)
 		return err
 	}
-	logger.Info("listening socket bound; launching browser", "addr", ln.Addr().String())
+	logger.Info("listening socket bound; launching browser", "addr", ln.Addr().String(), "version", version)
 	// Close the listener on startup failures. Serve owns it after startup succeeds.
 	served := false
 	defer func() {

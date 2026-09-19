@@ -63,10 +63,14 @@ COPY --from=build /out/waxseal /usr/local/bin/waxseal
 # The image redistributes this code, and MIT requires the notice to travel with it.
 COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/waxseal/
 
-# Link the GHCR package to the source repository.
+# Link the GHCR package to the source repository, and stamp the version so
+# `docker inspect` says which release a pulled image is. The ARG is redeclared
+# because the build stage's declaration does not reach this one.
+ARG VERSION=docker
 LABEL org.opencontainers.image.source="https://github.com/ColeSpringer/WaxSeal" \
       org.opencontainers.image.description="YouTube PO-token service running BotGuard in a real headless Chromium" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 
 ENV WAXSEAL_CHROME_BIN=/usr/bin/chromium \
     HOME=/home/waxseal

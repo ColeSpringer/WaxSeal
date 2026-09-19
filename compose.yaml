@@ -1,13 +1,23 @@
-# Standalone WaxSeal PO-token service. Run with `docker compose up`.
-#
-# Extends the shared service in compose.base.yaml and publishes the daemon's
-# port. The image, security settings, and the read-only, resource-limit, and
-# multi-tenant options live in that base file. To run the daemon next to a
-# consumer on a shared egress IP, use compose.full.yaml.
+# WaxSeal, a YouTube PO-token service
 services:
   waxseal:
-    extends:
-      file: compose.base.yaml
-      service: waxseal
+    image: ghcr.io/colespringer/waxseal:${WAXSEAL_VERSION:-latest}
+    container_name: waxseal
+    restart: unless-stopped # the image runs tini as PID 1, so no init: is needed
     ports:
-      - "127.0.0.1:4416:4416" # loopback only; use "0.0.0.0:4416:4416" or a LAN IP to expose
+      # Loopback only. The daemon is keyless by default, so set API keys (see
+      # the guide above) before publishing on 0.0.0.0 or a LAN address.
+      - "127.0.0.1:4416:4416"
+    shm_size: 1gb # headless Chromium's working space
+    stop_grace_period: 70s # covers the daemon's 60s request drain; compose's default is 10s
+    # Chromium runs with --no-sandbox, so the container is the sandbox: the
+    # image's non-root user, no capabilities, no privilege escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: # cap log growth for a long-running daemon
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

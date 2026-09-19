@@ -14,35 +14,53 @@ tokens with the **integrity** grade.
 
 ## Quick start
 
-WaxSeal usually runs as a container (example compose file found in repo), and
-the published image bundles Chromium, so the host needs only Docker:
+WaxSeal runs as a container, and the published image bundles Chromium, so the
+host needs only Docker. The repository's `compose.yaml` is the whole deployment;
+copy it as it is:
 
-```sh
-docker compose up -d  # pulls ghcr.io/colespringer/waxseal and starts on 127.0.0.1:4416
+```yaml
+# WaxSeal, a YouTube PO-token service
+services:
+  waxseal:
+    image: ghcr.io/colespringer/waxseal:${WAXSEAL_VERSION:-latest}
+    container_name: waxseal
+    restart: unless-stopped # the image runs tini as PID 1, so no init: is needed
+    ports:
+      # Loopback only. The daemon is keyless by default, so set API keys (see
+      # the guide above) before publishing on 0.0.0.0 or a LAN address.
+      - "127.0.0.1:4416:4416"
+    shm_size: 1gb # headless Chromium's working space
+    stop_grace_period: 70s # covers the daemon's 60s request drain; compose's default is 10s
+    # Chromium runs with --no-sandbox, so the container is the sandbox: the
+    # image's non-root user, no capabilities, no privilege escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: # cap log growth for a long-running daemon
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 ```
 
-That pulls the `:latest` tag; pin a release with `WAXSEAL_VERSION`, for example
-`WAXSEAL_VERSION=1.0.0 docker compose up -d`. To build the image from source instead
-of pulling, run `make docker-build` first; it tags the same name locally.
+```sh
+docker compose up -d --wait   # pulls ghcr.io/colespringer/waxseal; returns once the daemon is healthy
+```
 
-The image is published for linux/amd64 and linux/arm64. The plain tag
-(`:latest`, `:1.0.0`) is a manifest covering both, so Docker resolves the right
-one; the per-architecture tags it is assembled from (`:1.0.0-amd64`,
-`:1.0.0-arm64`) stay pullable for pinning one platform.
+That pulls `:latest`, and `WAXSEAL_VERSION=1.3.0 docker compose up -d --wait`
+pins a release. [docs/deployment.md](docs/deployment.md) lists everything the
+file leaves out, each as a snippet to paste in: pinning and verifying a release,
+API keys and secrets, memory limits, a read-only rootfs, a consumer sharing the
+daemon's egress IP, `docker run` without compose, and building the image from
+source.
 
-Each release's binaries and image tags, the multi-arch tag and the
-per-architecture ones alike, carry a GitHub build provenance attestation naming
-the commit and workflow run that built them. `gh attestation verify
-oci://ghcr.io/colespringer/waxseal:1.0.0 --repo ColeSpringer/WaxSeal` checks a
-pulled image against it, and `gh attestation verify <binary> --repo
-ColeSpringer/WaxSeal` a downloaded binary.
-
-The container is ready when its healthcheck passes. The daemon binds its socket
-before browser startup but serves only once `/ping` returns `{"ok":true,...}`;
-startup attests the first tenant, caches a GVS token, and runs a full-length
-streaming proof, usually 10-30 seconds. A mint failure stops startup; a failed
-streaming proof is logged and retried by `/player-context` or `/session`. Once
-ready, call the API:
+The container is ready when its healthcheck passes, which is what `--wait`
+returns on. The daemon binds its socket before browser startup but serves only
+once `/ping` returns `{"ok":true,...}`; startup attests the first tenant, caches
+a GVS token, and runs a full-length streaming proof, usually 10-30 seconds. A
+mint failure stops startup; a failed streaming proof is logged and retried by
+`/player-context` or `/session`. Once ready, call the API:
 
 ```sh
 curl -s localhost:4416/get_pot -d '{"content_binding":"<video_id>"}'
@@ -55,18 +73,15 @@ curl -s localhost:4416/metrics
 ### Running with a consumer
 
 A PO token is bound to the minting host's egress IP, so a consumer that fetches
-media must egress the same IP as WaxSeal. `compose.full.yaml` runs the daemon and
-a consumer in one network namespace to guarantee that; point `CONSUMER_IMAGE` at
-your application, and the daemon stays unpublished:
-
-```sh
-CONSUMER_IMAGE=your/image:tag docker compose -f compose.full.yaml up
-```
-
-Both `compose.yaml` (standalone) and `compose.full.yaml` extend the shared,
-hardened `compose.base.yaml`; see those files for the read-only, resource-limit,
-and multi-tenant options. Publishing beyond loopback requires API keys, described
-under [Authentication and tenants](#authentication-and-tenants).
+media must egress the same IP as WaxSeal. A consumer on the host itself already
+does, and reaches the daemon through the published port. One that runs as its
+own container shares the daemon's network namespace instead, so both leave
+through one address and it reaches the daemon on loopback; the file's `ports:`
+block still publishes the daemon to the host, so drop it if nothing there should
+reach it. The snippet is in
+[docs/deployment.md](docs/deployment.md#run-a-consumer-on-the-same-egress-ip).
+Publishing beyond loopback requires API keys, described under
+[Authentication and tenants](#authentication-and-tenants).
 
 ### From source
 
@@ -610,6 +625,7 @@ make live                                  # the live CDP tests above
 make tidy-check                            # fail if go mod tidy would change either module
 make vulncheck                             # govulncheck over both modules
 make consumer-check                        # build provider/ as an external go get sees it
+make compose-check                         # validate compose.yaml and check it pulls the published image
 make verify-assets                         # rebuild the browser bundle and diff it against the committed one
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js

@@ -40,7 +40,9 @@ jobs:
       - run: go build ./...
       # gofmt and tidy-check cover this whole checkout, including the nested
       # provider/ module, which the job below builds, vets, and tests on its own.
-      - run: make fmt-check tidy-check
+      # compose-check is a static read of compose.yaml, so it runs here once
+      # rather than on both legs of the docker matrix.
+      - run: make fmt-check tidy-check compose-check
       - run: go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is

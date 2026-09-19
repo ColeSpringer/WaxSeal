@@ -14,3 +14,9 @@ build/js/node_modules/
 # Built CLI binary at the repo root. Anchored so it does not also match the
 # cmd/waxseal source directory.
 /waxseal
+
+# Local compose inputs: the .env compose reads for WAXSEAL_VERSION, and the
+# tenant-keys file docs/deployment.md mounts as a secret. Neither is anchored:
+# a copy of the compose file can live in any directory of a checkout.
+.env
+tenant-keys
