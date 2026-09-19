@@ -5,8 +5,8 @@ services:
     container_name: waxseal
     restart: unless-stopped # the image runs tini as PID 1, so no init: is needed
     ports:
-      # Loopback only. The daemon is keyless by default, so set API keys (see
-      # the guide above) before publishing on 0.0.0.0 or a LAN address.
+      # Loopback only. The daemon is keyless by default, so set API keys
+      # before publishing on 0.0.0.0 or a LAN address.
       - "127.0.0.1:4416:4416"
     shm_size: 1gb # headless Chromium's working space
     stop_grace_period: 70s # covers the daemon's 60s request drain; compose's default is 10s
