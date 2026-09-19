@@ -8,6 +8,9 @@ provider
 build/js/node_modules
 **/*_test.go
 *.md
+# The image is a distribution, so the notices travel with it (LICENSE has no
+# extension and was never excluded).
+!THIRD-PARTY-NOTICES.md
 compose*.yaml
 Dockerfile
 .dockerignore

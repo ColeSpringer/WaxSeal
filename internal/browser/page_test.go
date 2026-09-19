@@ -560,6 +560,37 @@ func TestEstablishDeadlineWithNoReasonNamesIt(t *testing.T) {
 	}
 }
 
+// A wall WaxSeal does not recognise reads as pending, so the establish timeout is
+// the only place it surfaces. The deadline error names the status and the phrase
+// the page sat on, which is what makes a rephrased or translated wall
+// diagnosable from one log line, and it stays a plain timeout: neither a graded
+// bot check nor a per-video verdict.
+func TestEstablishDeadlineNamesTheLastPlayabilityStatus(t *testing.T) {
+	payload := map[string]any{
+		"error":              "pending: player response not yet for vid",
+		"playability_status": "LOGIN_REQUIRED",
+		"reason":             "Melde dich an, um zu best\u00e4tigen, dass du kein Bot bist",
+		"video_id_match":     false,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{
+		playerContextExtractJS: {jsStringified(t, payload)},
+	})
+	s := newFakeSession(page)
+
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(30*time.Millisecond))
+	if err == nil {
+		t.Fatal("establish returned no error at the deadline")
+	}
+	for _, want := range []string{"pending: player response not yet for vid", "LOGIN_REQUIRED", "kein Bot"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to carry %q", err, want)
+		}
+	}
+	if errors.Is(err, ErrBotCheck) || errors.Is(err, ErrUnplayable) {
+		t.Errorf("error = %v, want a plain deadline: an unrecognised wall is graded as neither", err)
+	}
+}
+
 // An extraction that fails for a real reason must say so even when the deadline
 // has also passed. The deadline is checked before each poll, so the only way to
 // reach this is for the deadline to expire inside an Eval; the page's last

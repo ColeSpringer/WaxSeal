@@ -24,14 +24,14 @@ func TestBrowserProcessSelfHealHTTP(t *testing.T) {
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
 		t.Skip("browser recovery test requires an in-process daemon")
 	}
-	srv, addr := newInProcessDaemon(t, server.Config{})
+	srv, addr, ln := newInProcessDaemon(t, server.Config{})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	if err := srv.Warm(warmCtx, ""); err != nil {
 		cancel()
 		t.Fatalf("warm: %v", err)
 	}
 	cancel()
-	go func() { _ = srv.ListenAndServe() }()
+	go func() { _ = srv.Serve(ln) }()
 	base := "http://" + addr
 	waitDaemonReady(t, base)
 

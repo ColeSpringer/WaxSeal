@@ -23,9 +23,15 @@ import (
 // daemon returned per-tenant detail. detailed records which shape came back:
 // per-tenant detail carries state such as generation, the redacted aggregate
 // carries lifetime counters only.
+//
+// generation is read separately from the counters and only when the scrape
+// described exactly one tenant. Summing it is meaningless (a two-tenant sum
+// moves when either tenant relaunches), and it is not a lifetime counter.
 type metricsSnapshot struct {
-	counters map[string]int64
-	detailed bool
+	counters        map[string]int64
+	detailed        bool
+	generation      int64
+	generationKnown bool
 }
 
 // readMetrics scrapes /metrics once and reads whichever shape the daemon
@@ -101,6 +107,13 @@ func fetchMetrics(base, key string) (metricsSnapshot, error) {
 			}
 		}
 	}
+	// One tenant is the cold daemon this suite starts, and the only shape in
+	// which a generation names a session rather than an arithmetic accident.
+	if len(body.PerTenant) == 1 {
+		for _, per := range body.PerTenant {
+			out.generation, out.generationKnown = metricInt(per["generation"])
+		}
+	}
 	return out, nil
 }
 
@@ -152,11 +165,18 @@ func playerContexts(t *testing.T, base string) int64 {
 }
 
 // escalationMetrics contains the counters used together to detect an unnecessary
-// relaunch. Values are summed so the test does not depend on the cold daemon's
-// tenant label. GenerationKnown is false when the daemon served the redacted
-// aggregate: generation is per-tenant state, so redaction drops it. Attestations
-// survives redaction and rises on the same relaunch, so the check does not go
-// blind.
+// relaunch. The counters are summed across tenants, so the test does not depend
+// on the cold daemon's tenant label; the generation is not, because a sum of
+// generations describes no session. GenerationKnown is false when the scrape
+// could not name one tenant's generation: a redacted aggregate drops per-tenant
+// state, and several tenants leave no single generation to read. Attestations
+// rises on the same relaunch and survives both, so the check does not go blind.
+//
+// Everything here comes from one /metrics scrape. /ping would name the probed
+// tenant directly, but it is not an observer: it can retire a session and
+// relaunch the browser, which is the very thing these numbers are watching for,
+// and it answers 401 to the operator metrics key that readMetrics documents as
+// a supported way to reach the detail.
 //
 // Attestations and Generation are the relaunch detectors. Escalations is
 // narrower: it counts a request abandoning a generation it was still using, and
@@ -173,21 +193,15 @@ type escalationMetrics struct {
 
 func readEscalationMetrics(t *testing.T, base string) escalationMetrics {
 	t.Helper()
-	// One scrape, so the four values describe the same moment.
+	// One scrape, so every value describes the same moment.
 	m := readMetrics(t, base)
-	out := escalationMetrics{
-		GenerationKnown:       m.detailed,
+	return escalationMetrics{
+		Generation:            m.generation,
+		GenerationKnown:       m.generationKnown,
 		Attestations:          m.counter(t, "attestations"),
 		Escalations:           m.counter(t, "escalations"),
 		PlayerContextFailures: m.counter(t, "player_context_failures"),
 	}
-	// Per-tenant detail always carries generation, so read it through the same
-	// fatal helper: a silent zero here would reduce the generation check to the
-	// 0 == 0 no-op this helper exists to remove.
-	if m.detailed {
-		out.Generation = m.counter(t, "generation")
-	}
-	return out
 }
 
 // TestMetricsHelperReadsBothShapes pins the helper against both /metrics bodies
@@ -205,6 +219,16 @@ func TestMetricsHelperReadsBothShapes(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("WAXSEAL_KEY", "KEYA")
 
+	// One tenant, the cold daemon this suite starts: the generation is that
+	// tenant's own.
+	body = `{"tenants":1,"per_tenant":{
+		"alice":{"generation":3,"session_live":true,"attest_kind":"integrity","last_browser_proof_age_secs":null,"player_contexts":2,"attestations":1,"escalations":0,"player_context_failures":4}}}`
+	em := readEscalationMetrics(t, srv.URL)
+	want := escalationMetrics{Generation: 3, GenerationKnown: true, Attestations: 1, Escalations: 0, PlayerContextFailures: 4}
+	if em != want {
+		t.Errorf("single-tenant escalation metrics = %+v, want %+v", em, want)
+	}
+
 	// Per-tenant detail: counters sum across tenants and generation is readable.
 	body = `{"tenants":2,"per_tenant":{
 		"alice":{"generation":3,"session_live":true,"attest_kind":"integrity","last_browser_proof_age_secs":null,"player_contexts":2,"attestations":1,"escalations":0,"player_context_failures":4},
@@ -215,10 +239,12 @@ func TestMetricsHelperReadsBothShapes(t *testing.T) {
 	if gotKey != "KEYA" {
 		t.Errorf("X-API-Key = %q, want %q", gotKey, "KEYA")
 	}
-	em := readEscalationMetrics(t, srv.URL)
-	want := escalationMetrics{Generation: 4, GenerationKnown: true, Attestations: 3, Escalations: 1, PlayerContextFailures: 4}
+	// Several tenants leave no single generation to report: 4 is the sum of 3 and
+	// 1 and describes neither session.
+	em = readEscalationMetrics(t, srv.URL)
+	want = escalationMetrics{Generation: 0, GenerationKnown: false, Attestations: 3, Escalations: 1, PlayerContextFailures: 4}
 	if em != want {
-		t.Errorf("per-tenant escalation metrics = %+v, want %+v", em, want)
+		t.Errorf("multi-tenant escalation metrics = %+v, want %+v", em, want)
 	}
 
 	// The redacted aggregate: lifetime counters survive, per-tenant state does not.

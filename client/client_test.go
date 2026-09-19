@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/colespringer/waxseal/client"
+	"github.com/colespringer/waxseal/internal/readmedoc"
 )
 
 func TestPOToken(t *testing.T) {
@@ -398,6 +399,28 @@ func TestReport(t *testing.T) {
 	}
 }
 
+// A deferred retirement is the other accepted outcome: the daemon took the
+// report but a browser operation held the page, so the session goes at the next
+// streaming handoff. It is the only case that sets retirement_pending, so
+// without it that tag is never decoded from anything but false, which is also
+// the zero value.
+func TestReportRetirementPending(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accepted": true, "retired": false, "retirement_pending": true, "generation": 3,
+		})
+	}))
+	defer srv.Close()
+
+	res, err := client.New(srv.URL).Report(context.Background(), 3, "", "")
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if !res.Accepted || res.Retired || !res.RetirementPending || res.Generation != 3 {
+		t.Errorf("res = %+v, want accepted with retirement pending at gen 3", res)
+	}
+}
+
 func TestReportRateLimitedResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -422,5 +445,126 @@ func TestReportHTTPError(t *testing.T) {
 	defer srv.Close()
 	if _, err := client.New(srv.URL).Report(context.Background(), 1, "VID", "x"); err == nil {
 		t.Error("a non-200 from /report should error")
+	}
+}
+
+// TestClientDecodesREADMEExamples serves each documented response example to the
+// client and reads the values back. The shape contracts in server/ pin the
+// README's keys against the structs that produce them; a key can match there and
+// still decode into nothing here, which is the gap this closes.
+//
+// cookie_header is deliberately not checked: the client does not decode it,
+// because it is derivable from the cookies it does.
+func TestClientDecodesREADMEExamples(t *testing.T) {
+	serve := func(t *testing.T, heading string) (*client.Client, map[string]any) {
+		t.Helper()
+		raw, err := readmedoc.Response("../README.md", heading)
+		if err != nil {
+			t.Fatalf("locate the README %s response block: %v", heading, err)
+		}
+		var documented map[string]any
+		if err := json.Unmarshal(raw, &documented); err != nil {
+			t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(raw)
+		}))
+		t.Cleanup(srv.Close)
+		return client.New(srv.URL), documented
+	}
+	// equal compares one decoded field against the value the README documents for
+	// it. The documented side is an any, so a string, a bool, and a JSON number
+	// all go through one helper.
+	equal := func(t *testing.T, key string, got, want any) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s = %v, want the documented %v", key, got, want)
+		}
+	}
+	rfc3339 := func(t *testing.T, key string, v any) time.Time {
+		t.Helper()
+		ts, err := time.Parse(time.RFC3339, v.(string))
+		if err != nil {
+			t.Fatalf("the documented %s is not RFC3339: %v", key, err)
+		}
+		return ts
+	}
+
+	t.Run("get_pot", func(t *testing.T) {
+		c, want := serve(t, "/get_pot")
+		tok, err := c.POToken(context.Background(), "VID", "player")
+		if err != nil {
+			t.Fatalf("POToken: %v", err)
+		}
+		equal(t, "poToken", tok.Value, want["poToken"])
+		equal(t, "warning", tok.Warning, want["warning"])
+		if ts := rfc3339(t, "expiresAt", want["expiresAt"]); !tok.ExpiresAt.Equal(ts) {
+			t.Errorf("expiresAt = %v, want the documented %v", tok.ExpiresAt, ts)
+		}
+	})
+
+	t.Run("report", func(t *testing.T) {
+		// The documented example is the rate-limited one, so its three booleans are
+		// all false and only the generation and the wait carry a value here.
+		// TestReport is what pins an accepted report's true ones.
+		c, want := serve(t, "/report")
+		res, err := c.Report(context.Background(), 1, "", "truncated")
+		if err != nil {
+			t.Fatalf("Report: %v", err)
+		}
+		equal(t, "accepted", res.Accepted, want["accepted"])
+		equal(t, "retired", res.Retired, want["retired"])
+		equal(t, "retirement_pending", res.RetirementPending, want["retirement_pending"])
+		equal(t, "generation", float64(res.Generation), want["generation"])
+		equal(t, "retry_after_seconds", float64(res.RetryAfterSeconds), want["retry_after_seconds"])
+	})
+
+	t.Run("session", func(t *testing.T) {
+		c, want := serve(t, "/session")
+		sess, err := c.Session(context.Background())
+		if err != nil {
+			t.Fatalf("Session: %v", err)
+		}
+		equal(t, "visitor_data", sess.VisitorData, want["visitor_data"])
+		equal(t, "user_agent", sess.UserAgent, want["user_agent"])
+		equal(t, "client_version", sess.ClientVersion, want["client_version"])
+		equal(t, "session_generation", float64(sess.SessionGeneration), want["session_generation"])
+
+		documented, _ := want["cookies"].([]any)
+		if len(documented) == 0 || len(sess.Cookies) != len(documented) {
+			t.Fatalf("cookies = %d, want the %d the README documents", len(sess.Cookies), len(documented))
+		}
+		for i, raw := range documented {
+			doc := raw.(map[string]any)
+			got := sess.Cookies[i]
+			equal(t, "cookies.name", got.Name, doc["name"])
+			equal(t, "cookies.value", got.Value, doc["value"])
+			equal(t, "cookies.domain", got.Domain, doc["domain"])
+			equal(t, "cookies.path", got.Path, doc["path"])
+			equal(t, "cookies.secure", got.Secure, doc["secure"])
+			equal(t, "cookies.http_only", got.HttpOnly, doc["http_only"])
+			equal(t, "cookies.same_site", got.SameSite, wireSameSite(doc["same_site"]))
+			if ts := rfc3339(t, "cookies.expires", doc["expires"]); !got.Expires.Equal(ts) {
+				t.Errorf("cookies.expires = %v, want the documented %v", got.Expires, ts)
+			}
+		}
+	})
+}
+
+// wireSameSite is the mapping the README documents for a cookie's same_site,
+// spelled out here rather than reached for: the client's own mapper is
+// unexported, and a test that called it could not tell a wrong mapping from a
+// consistent one.
+func wireSameSite(v any) http.SameSite {
+	switch v {
+	case "Strict":
+		return http.SameSiteStrictMode
+	case "Lax":
+		return http.SameSiteLaxMode
+	case "None":
+		return http.SameSiteNoneMode
+	default:
+		return 0
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -239,12 +240,39 @@ func TestWarnKeylessExposure(t *testing.T) {
 	}
 }
 
+// clearServerEnv removes every environment variable the server command reads, so
+// a test sees only what it passes and configuration parsing reaches the step it
+// is about regardless of the caller's environment. The variables are removed
+// rather than emptied, because an empty value is a meaningful one for the three
+// duration settings.
+func clearServerEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"WAXSEAL_STREAMING_MAX_AGE", "WAXSEAL_REPORT_DEBOUNCE", "WAXSEAL_SHUTDOWN_TIMEOUT",
+		"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE",
+		"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE",
+	} {
+		// t.Setenv has no unset form, but it is what records the restore and marks
+		// the test as unsafe for t.Parallel, so it runs first and the unset follows.
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+}
+
+// keyFile writes content to a scratch file and returns its path.
+func keyFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	return path
+}
+
 func TestServerInvalidPortUsageError(t *testing.T) {
-	// Ensure configuration parsing reaches bindListener regardless of the caller's
-	// environment.
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	code, _, stderr := runCLI("server", "--port", "99999999")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
@@ -257,9 +285,7 @@ func TestServerInvalidPortUsageError(t *testing.T) {
 // Invalid tenant-key configurations are usage errors. Error messages must not
 // reveal API keys.
 func TestServerInvalidTenantKeysUsageError(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	for _, tc := range []struct {
 		name, keys, wantMsg string
 	}{
@@ -300,9 +326,7 @@ func TestServerMetricsFlagsParse(t *testing.T) {
 // A --metrics-key equal to a tenant key is a usage error (exit 2). The message
 // names the colliding tenant label and never leaks key material.
 func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	code, _, stderr := runCLI("server", "--tenant-keys", "alice=KEYA,bob=KEYB", "--metrics-key", "KEYA")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
@@ -315,6 +339,213 @@ func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
 	}
 	if strings.Contains(stderr, "KEYA") || strings.Contains(stderr, "KEYB") {
 		t.Errorf("stderr leaks key material: %q", stderr)
+	}
+}
+
+// Tenant keys reach the daemon from a flag, a file flag, or either environment
+// variable, flags outranking envs, and a tier that sets both its value and its
+// file is refused rather than picking one. Every arm carries key material a
+// duplicate label makes unusable, so the daemon names the source it read and
+// exits 2 before it binds or launches anything.
+func TestServerTenantKeySources(t *testing.T) {
+	clearServerEnv(t)
+	const (
+		fromA = "dupA=K1,dupA=K2" // parses to: duplicate tenant label "dupA"
+		fromB = "dupB=K1,dupB=K2"
+	)
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		file    string // written to a scratch file the args or env may name
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "the flag is read",
+			args: []string{"--tenant-keys", fromA},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the file flag is read",
+			file: fromA,
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the value env is read",
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": fromA},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the file env is read",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name:    "a flag outranks an env",
+			args:    []string{"--tenant-keys", fromA},
+			env:     map[string]string{"WAXSEAL_TENANT_KEYS": fromB},
+			want:    []string{"dupA"},
+			notWant: []string{"dupB"},
+		},
+		{
+			// A compose file that leaves a variable blank has said nothing, so the
+			// file beside it wins instead of colliding with it.
+			name: "a blank value env leaves the file env alone",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "a trailing newline is not part of the value",
+			file: fromA + "\n",
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the flag and its file are mutually exclusive",
+			file: fromB,
+			args: []string{"--tenant-keys", fromA, "--tenant-keys-file", "$FILE"},
+			want: []string{"--tenant-keys", "--tenant-keys-file", "mutually exclusive"},
+		},
+		{
+			name: "the two envs are mutually exclusive",
+			file: fromB,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": fromA, "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE", "mutually exclusive"},
+		},
+		{
+			name: "an empty file is refused",
+			file: "\n",
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{"--tenant-keys-file", "is empty", "$FILE"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runKeySourceCase(t, "K1", "K2", tc.file, tc.args, tc.env, tc.want, tc.notWant)
+		})
+	}
+}
+
+// The metrics key reaches the daemon from the same four sources. Each arm names
+// a key that collides with a tenant key, so the refusal names the tenant label
+// the resolved value matched, which is what says which source was read: no other
+// path reports the value without serving traffic.
+func TestServerMetricsKeySources(t *testing.T) {
+	clearServerEnv(t)
+	const tenants = "alice=KEYA,bob=KEYB"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		file    string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "the flag is read",
+			args: []string{"--metrics-key", "KEYA"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the file flag is read",
+			file: "KEYB",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"metrics key collides", "bob"},
+		},
+		{
+			name: "the value env is read",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY": "KEYA"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the file env is read",
+			file: "KEYB",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY_FILE": "$FILE"},
+			want: []string{"metrics key collides", "bob"},
+		},
+		{
+			name:    "a flag outranks an env",
+			args:    []string{"--metrics-key", "KEYA"},
+			env:     map[string]string{"WAXSEAL_METRICS_KEY": "KEYB"},
+			want:    []string{"alice"},
+			notWant: []string{"bob"},
+		},
+		{
+			// The collision is an exact match, so a file that an editor wrapped in a
+			// newline or a byte-order mark only reaches it once both are gone. Left
+			// in, they give a key that matches nothing and explains nothing.
+			name: "surrounding whitespace and a BOM are not part of the value",
+			file: "\ufeff  KEYA\n",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the flag and its file are mutually exclusive",
+			file: "KEYB",
+			args: []string{"--metrics-key", "KEYA", "--metrics-key-file", "$FILE"},
+			want: []string{"--metrics-key", "--metrics-key-file", "mutually exclusive"},
+		},
+		{
+			name: "the two envs are mutually exclusive",
+			file: "KEYB",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY": "KEYA", "WAXSEAL_METRICS_KEY_FILE": "$FILE"},
+			want: []string{"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE", "mutually exclusive"},
+		},
+		{
+			name: "an empty file is refused",
+			file: "  \n",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"--metrics-key-file", "is empty", "$FILE"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--tenant-keys", tenants}, tc.args...)
+			runKeySourceCase(t, "KEYA", "KEYB", tc.file, args, tc.env, tc.want, tc.notWant)
+		})
+	}
+}
+
+// runKeySourceCase runs one key-source arm. A "$FILE" placeholder in args or env
+// is replaced with the scratch file's path, and the path is also substituted into
+// the wanted strings so an arm can require it by name. Every arm is expected to
+// exit 2 before the daemon binds or launches, and none of them may put key
+// material on stderr.
+func runKeySourceCase(t *testing.T, secretA, secretB, file string, args []string, env map[string]string, want, notWant []string) {
+	t.Helper()
+	path := ""
+	if file != "" {
+		path = keyFile(t, file)
+	}
+	fill := func(s string) string { return strings.ReplaceAll(s, "$FILE", path) }
+	for name, value := range env {
+		t.Setenv(name, fill(value))
+	}
+	cmdArgs := []string{"server"}
+	for _, a := range args {
+		cmdArgs = append(cmdArgs, fill(a))
+	}
+
+	code, _, stderr := runCLI(cmdArgs...)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	for _, w := range want {
+		if !strings.Contains(stderr, fill(w)) {
+			t.Errorf("stderr = %q, want it to contain %q", stderr, fill(w))
+		}
+	}
+	for _, w := range notWant {
+		if strings.Contains(stderr, w) {
+			t.Errorf("stderr = %q, want it not to name %q: the other source won", stderr, w)
+		}
+	}
+	for _, secret := range []string{secretA, secretB} {
+		if strings.Contains(stderr, secret) {
+			t.Errorf("stderr leaks key material: %q", stderr)
+		}
 	}
 }
 
@@ -337,9 +568,7 @@ func TestValidateLandingVideo(t *testing.T) {
 
 // Every command validates its landing video before launching Chromium.
 func TestCommandsRejectInvalidLandingVideo(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -461,14 +690,16 @@ func TestPingAddrSchemeGuard(t *testing.T) {
 
 // runPingGuard runs runPing with an already-cancelled context so a request that
 // clears the address guards fails immediately at the network call instead of
-// dialing. That isolates the guard behavior without a live server.
+// dialing. That isolates the guard behavior without a live server. It carries
+// the flag's own default, since nothing here binds the flags that would supply
+// one and a zero budget is its own usage error.
 func runPingGuard(t *testing.T, addr string) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cmd := &cobra.Command{}
 	cmd.SetContext(ctx)
-	return runPing(cmd, &pingOpts{addr: addr})
+	return runPing(cmd, &pingOpts{addr: addr, timeout: pingTimeout})
 }
 
 // resolveSMA binds the flag before resolving it so Changed reflects command-line

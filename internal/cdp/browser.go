@@ -58,16 +58,31 @@ func (b *Browser) Page(target TargetCreateTarget) (*Page, error) {
 	}
 	var att attachToTargetResult
 	if err := b.conn.call(b.ctx, "", "Target.attachToTarget", attachToTargetParams{TargetID: ct.TargetID, Flatten: true}, &att); err != nil {
+		b.closeTarget(ct.TargetID)
 		return nil, fmt.Errorf("cdp: attach target: %w", err)
 	}
 	if att.SessionID == "" {
+		b.closeTarget(ct.TargetID)
 		return nil, fmt.Errorf("cdp: attach target returned no session id")
 	}
 	p := &Page{conn: b.conn, ctx: b.ctx, sessionID: att.SessionID, jsCtx: &jsCtxCache{}}
 	if err := b.conn.call(b.ctx, att.SessionID, "Page.enable", nil, nil); err != nil {
+		b.closeTarget(ct.TargetID)
 		return nil, fmt.Errorf("cdp: enable page: %w", err)
 	}
 	return p, nil
+}
+
+// closeTarget discards a target Page created but could not hand back, so a
+// failed attach or enable does not leave a renderer running for as long as the
+// browser does. It runs on its own short budget rather than b.ctx, because the
+// usual way to get here is b.ctx expiring, and cleaning up after that is the
+// whole point. It is best effort: the failure that brought us here is the one
+// worth reporting.
+func (b *Browser) closeTarget(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulCloseTimeout)
+	defer cancel()
+	_ = b.conn.call(ctx, "", "Target.closeTarget", closeTargetParams{TargetID: id}, nil)
 }
 
 // GetCookies returns the browser-level cookies for this context (Storage.getCookies

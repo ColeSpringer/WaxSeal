@@ -26,11 +26,13 @@ type serverOpts struct {
 	video           string
 	headful         bool
 	tenantKeys      string
+	tenantKeysFile  string
 	streamingMaxAge string
 	reportDebounce  string
 	shutdownTimeout string
 	metricsPublic   bool
 	metricsKey      string
+	metricsKeyFile  string
 	verbose         bool
 }
 
@@ -77,7 +79,12 @@ func newServerCmd() *cobra.Command {
 	f.IntVar(&o.port, "port", 4416, "listen port")
 	f.StringVar(&o.video, "video", browser.DefaultVideo, "landing video for each tenant session")
 	f.BoolVar(&o.headful, "headful", false, "run headful (needs a display/Xvfb)")
-	f.StringVar(&o.tenantKeys, "tenant-keys", "", `multi-tenant API keys in "label1=key1,label2=key2" form`)
+	f.StringVar(&o.tenantKeys, "tenant-keys", "",
+		`multi-tenant API keys in "label1=key1,label2=key2" form (or --tenant-keys-file,`+"\n"+
+			`WAXSEAL_TENANT_KEYS, or WAXSEAL_TENANT_KEYS_FILE; flags outrank envs)`)
+	f.StringVar(&o.tenantKeysFile, "tenant-keys-file", "",
+		"path to a file holding what --tenant-keys would carry, so the keys stay out of\n"+
+			"the process arguments. Setting both is a usage error.")
 	f.StringVar(&o.streamingMaxAge, "streaming-max-age", "",
 		"recycle a session on its next streaming handoff once older than this Go duration\n"+
 			"(flag > WAXSEAL_STREAMING_MAX_AGE env > 45m default; \"0\" disables). The\n"+
@@ -103,7 +110,12 @@ func newServerCmd() *cobra.Command {
 		"operator key that unlocks full per-tenant /metrics detail on a keyed daemon.\n"+
 			"Without it (or --metrics-public), a keyed daemon serves unauthenticated\n"+
 			"scrapes a redacted, label-free aggregate. Must differ from every tenant\n"+
-			"key. Ignored without --tenant-keys.")
+			"key. Ignored without --tenant-keys, though a source that cannot be read is\n"+
+			"still a usage error. Also reachable through --metrics-key-file,\n"+
+			"WAXSEAL_METRICS_KEY, and WAXSEAL_METRICS_KEY_FILE; flags outrank envs.")
+	f.StringVar(&o.metricsKeyFile, "metrics-key-file", "",
+		"path to a file holding what --metrics-key would carry. Setting both is a\n"+
+			"usage error.")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging")
 	return c
 }
@@ -204,6 +216,75 @@ func resolveShutdownTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logg
 	return d, nil
 }
 
+// keySource names the four places one piece of key material can come from: a
+// value flag and a file flag, then a value env and a file env. The _FILE envs
+// follow the Docker convention, so a compose file reaches a secret from an
+// environment block without overriding the image's CMD.
+type keySource struct {
+	valueFlag, fileFlag string
+	valueEnv, fileEnv   string
+	value, file         string
+}
+
+// resolveKeyMaterial applies flag, environment, and default precedence the way
+// the duration options do, with one addition: within a tier, a value and a file
+// both carrying something is a usage error rather than a silent winner, since
+// the two say different things and the daemon would end up keyed by something
+// the operator did not choose. Nothing it returns as an error carries key
+// material.
+func resolveKeyMaterial(cmd *cobra.Command, src keySource) (string, error) {
+	valueSet, fileSet := cmd.Flags().Changed(src.valueFlag), cmd.Flags().Changed(src.fileFlag)
+	switch {
+	case valueSet && fileSet:
+		return "", &usageError{msg: fmt.Sprintf("--%s and --%s are mutually exclusive; pass one", src.valueFlag, src.fileFlag)}
+	case valueSet:
+		return src.value, nil
+	case fileSet:
+		return readKeyFile("--"+src.fileFlag, src.file)
+	}
+	envValue, hasValue := lookupNonEmpty(src.valueEnv)
+	envFile, hasFile := lookupNonEmpty(src.fileEnv)
+	switch {
+	case hasValue && hasFile:
+		return "", &usageError{msg: fmt.Sprintf("%s and %s are mutually exclusive; set one", src.valueEnv, src.fileEnv)}
+	case hasValue:
+		return envValue, nil
+	case hasFile:
+		return readKeyFile(src.fileEnv, envFile)
+	}
+	return "", nil
+}
+
+// lookupNonEmpty reads an environment variable, reporting false when it is unset
+// or empty. A blank variable is how a compose file says nothing, and counting it
+// as a value would put it in conflict with the file variable beside it and
+// refuse to start over a setting the operator never made.
+func lookupNonEmpty(name string) (string, bool) {
+	if v, ok := os.LookupEnv(name); ok && v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+// readKeyFile reads one secret from path. source names the flag or environment
+// variable that pointed here, so a failure says which one to fix. The file is
+// taken whole with surrounding whitespace and a leading byte-order mark removed,
+// since a secrets file usually ends in a newline and an editor may have put a
+// BOM at the front; either one left in place yields a key that matches nothing
+// and says nothing about why. An empty file is a usage error rather than a
+// keyless daemon the operator did not ask for.
+func readKeyFile(source, path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", &usageError{msg: fmt.Sprintf("%s: %v", source, err)}
+	}
+	v := strings.TrimSpace(strings.TrimPrefix(string(b), "\ufeff"))
+	if v == "" {
+		return "", &usageError{msg: fmt.Sprintf("%s %q is empty", source, path)}
+	}
+	return v, nil
+}
+
 // unbracketHost removes one pair of surrounding brackets. This allows --host to
 // accept IPv6 literals in bare or bracketed form before passing them to
 // net.JoinHostPort or net.ParseIP.
@@ -299,14 +380,30 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, err)
 	}
-	keys, err := server.ParseTenantKeys(o.tenantKeys)
+	tenantKeys, err := resolveKeyMaterial(cmd, keySource{
+		valueFlag: "tenant-keys", fileFlag: "tenant-keys-file",
+		valueEnv: "WAXSEAL_TENANT_KEYS", fileEnv: "WAXSEAL_TENANT_KEYS_FILE",
+		value: o.tenantKeys, file: o.tenantKeysFile,
+	})
+	if err != nil {
+		return failStartup(logger, err)
+	}
+	metricsKey, err := resolveKeyMaterial(cmd, keySource{
+		valueFlag: "metrics-key", fileFlag: "metrics-key-file",
+		valueEnv: "WAXSEAL_METRICS_KEY", fileEnv: "WAXSEAL_METRICS_KEY_FILE",
+		value: o.metricsKey, file: o.metricsKeyFile,
+	})
+	if err != nil {
+		return failStartup(logger, err)
+	}
+	keys, err := server.ParseTenantKeys(tenantKeys)
 	if err != nil {
 		return failStartup(logger, &usageError{msg: err.Error()})
 	}
 	// Reject a metrics key that is also a tenant key before launching the browser.
 	// Name the tenant label, never the key material. server.New enforces the same
 	// rule for programmatic callers.
-	if label, collides := server.MetricsKeyCollision(keys, o.metricsKey); collides {
+	if label, collides := server.MetricsKeyCollision(keys, metricsKey); collides {
 		return failStartup(logger, &usageError{
 			msg: fmt.Sprintf("metrics key collides with API key for tenant %q", label)})
 	}
@@ -332,7 +429,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	// Warn before browser startup when unauthenticated callers can access the guest
 	// identity.
 	warnKeylessExposure(logger, len(keys) > 0, o.host)
-	logMetricsAccess(logger, len(keys) > 0, o.metricsPublic, o.metricsKey != "")
+	logMetricsAccess(logger, len(keys) > 0, o.metricsPublic, metricsKey != "")
 
 	srv, err := server.New(server.Config{
 		Addr:            ln.Addr().String(),
@@ -343,7 +440,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		StreamingMaxAge: streamingMaxAge,
 		ReportDebounce:  reportDebounce,
 		MetricsPublic:   o.metricsPublic,
-		MetricsKey:      o.metricsKey,
+		MetricsKey:      metricsKey,
 	})
 	if err != nil {
 		logger.Error("startup: launch browser failed", "err", err)

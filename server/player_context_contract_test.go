@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/colespringer/waxseal/internal/readmedoc"
 	"github.com/colespringer/waxseal/server"
 )
 
@@ -47,6 +47,21 @@ func TestPlayerContextShapeContract(t *testing.T) {
 func TestSessionShapeContract(t *testing.T) {
 	if diff := shapeDiff(structShape(reflect.TypeOf(server.SessionResponse{})), readmeResponseShape(t, "/session")); diff != "" {
 		t.Errorf("the README /session block drifted from server.SessionResponse (the README shape is the contract):\n%s", diff)
+	}
+}
+
+// TestGetPotShapeContract and TestReportShapeContract do for the two remaining
+// documented responses what the tests above do for /player-context and /session.
+// Both handlers used to write map literals, which no shape could be read from.
+func TestGetPotShapeContract(t *testing.T) {
+	if diff := shapeDiff(structShape(reflect.TypeOf(server.TokenResponse{})), readmeResponseShape(t, "/get_pot")); diff != "" {
+		t.Errorf("the README /get_pot block drifted from server.TokenResponse (the README shape is the contract):\n%s", diff)
+	}
+}
+
+func TestReportShapeContract(t *testing.T) {
+	if diff := shapeDiff(structShape(reflect.TypeOf(server.ReportResponse{})), readmeResponseShape(t, "/report")); diff != "" {
+		t.Errorf("the README /report block drifted from server.ReportResponse (the README shape is the contract):\n%s", diff)
 	}
 }
 
@@ -170,82 +185,21 @@ func shapeDiff(want, got shape) string {
 	return b.String()
 }
 
-// readmeResponseShape returns the shape of the README response example under the
-// first "###" heading containing heading. It locates the block by that heading
-// and by the "// response" line that opens it, so the section's request example
-// and a neighbouring endpoint's block cannot leak keys in, then decodes the
-// example with its comments stripped.
+// readmeResponseShape reduces the README response example for heading to a
+// shape. internal/readmedoc locates the block; only the reduction belongs here.
 func readmeResponseShape(t *testing.T, heading string) shape {
 	t.Helper()
-	raw, err := os.ReadFile("../README.md")
+	raw, err := readmedoc.Response("../README.md", heading)
 	if err != nil {
-		t.Fatalf("read README: %v", err)
+		t.Fatalf("locate the README %s response block: %v", heading, err)
 	}
-	lines := strings.Split(string(raw), "\n")
-	i := 0
-	for ; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "###") && strings.Contains(lines[i], heading) {
-			break
-		}
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
 	}
-	if i == len(lines) {
-		t.Fatalf("README has no %s heading", heading)
+	out := make(shape)
+	for k, v := range top {
+		addValueShape(out, k, v)
 	}
-	// The first fenced block after the heading whose first line is "// response"
-	// is the documented response shape.
-	for ; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "##") && !strings.Contains(lines[i], heading) {
-			t.Fatalf("README %s section ends before a // response block", heading)
-		}
-		if !strings.HasPrefix(lines[i], "```") {
-			continue
-		}
-		end := i + 1
-		for ; end < len(lines) && !strings.HasPrefix(lines[end], "```"); end++ {
-		}
-		if end == len(lines) {
-			t.Fatalf("README has an unterminated fenced block after %s", heading)
-		}
-		body := lines[i+1 : end]
-		if len(body) > 0 && strings.TrimSpace(body[0]) == "// response" {
-			var top map[string]any
-			if err := json.Unmarshal([]byte(stripLineComments(strings.Join(body, "\n"))), &top); err != nil {
-				t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
-			}
-			out := make(shape)
-			for k, v := range top {
-				addValueShape(out, k, v)
-			}
-			return out
-		}
-		i = end
-	}
-	t.Fatalf("README %s section has no // response block", heading)
-	return nil
-}
-
-// stripLineComments removes // comments from a JSON-with-comments document. It
-// tracks string literals, so a "//" inside a URL survives.
-func stripLineComments(src string) string {
-	var b strings.Builder
-	inString := false
-	for i := 0; i < len(src); i++ {
-		c := src[i]
-		switch {
-		case inString && c == '\\' && i+1 < len(src):
-			b.WriteByte(c)
-			i++
-			c = src[i]
-		case c == '"':
-			inString = !inString
-		case !inString && c == '/' && i+1 < len(src) && src[i+1] == '/':
-			for i < len(src) && src[i] != '\n' {
-				i++
-			}
-			i-- // leave the newline for the loop to copy
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
+	return out
 }

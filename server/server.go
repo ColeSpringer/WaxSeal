@@ -320,15 +320,12 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-POT-Cache", "miss")
 	}
 	s.log.Info("minted", "tenant", label, "binding_len", len(req.ContentBinding), "scope", scope, "kind", res.Kind, "token_len", res.TokenLen, "cached", cached)
-	resp := map[string]any{
-		"poToken":        res.Token,
-		"contentBinding": req.ContentBinding,
-		"expiresAt":      expires.UTC().Format(time.RFC3339),
-	}
-	if warning != "" {
-		resp["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, TokenResponse{
+		POToken:        res.Token,
+		ContentBinding: req.ContentBinding,
+		ExpiresAt:      expires.UTC().Format(time.RFC3339),
+		Warning:        warning,
+	})
 }
 
 // handlePlayerContext returns the attested browser's streaming context for a
@@ -648,6 +645,27 @@ func writePing(w http.ResponseWriter, strict bool, reason string, err error, bod
 	writeJSON(w, status, body)
 }
 
+// TokenResponse is the /get_pot response. Warning is omitted unless the daemon
+// has something to say about the binding, which is the conditional key the map
+// literal this replaced produced.
+type TokenResponse struct {
+	POToken        string `json:"poToken"`
+	ContentBinding string `json:"contentBinding"`
+	ExpiresAt      string `json:"expiresAt"`
+	Warning        string `json:"warning,omitempty"`
+}
+
+// ReportResponse is the /report response. RetryAfterSeconds is omitted unless
+// the report was rate-limited: any value there tells a consumer to back off, so
+// an accepted report must not carry a zero.
+type ReportResponse struct {
+	Accepted          bool   `json:"accepted"`
+	Retired           bool   `json:"retired"`
+	RetirementPending bool   `json:"retirement_pending"`
+	Generation        uint64 `json:"generation"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+}
+
 // SessionResponse is the /session response. It is exported, with SessionCookie,
 // so the README block stays a checkable contract (TestSessionShapeContract) and
 // so a reader of the wire format has one place to look.
@@ -770,17 +788,16 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	res := m.ReportDegraded(req.SessionGeneration, req.VideoID, req.Reason)
 	s.log.Info("degradation reported", "tenant", label, "video_id_len", len(req.VideoID), "reason", req.Reason,
 		"generation", req.SessionGeneration, "accepted", res.Accepted, "retired", res.Retired, "retirement_pending", res.RetirementPending)
-	body := map[string]any{
-		"accepted":           res.Accepted,
-		"retired":            res.Retired,
-		"retirement_pending": res.RetirementPending,
-		"generation":         res.Generation,
-	}
 	if res.RetryAfterSeconds > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(res.RetryAfterSeconds))
-		body["retry_after_seconds"] = res.RetryAfterSeconds
 	}
-	writeJSON(w, http.StatusOK, body)
+	writeJSON(w, http.StatusOK, ReportResponse{
+		Accepted:          res.Accepted,
+		Retired:           res.Retired,
+		RetirementPending: res.RetirementPending,
+		Generation:        res.Generation,
+		RetryAfterSeconds: res.RetryAfterSeconds,
+	})
 }
 
 // metricsFull reports whether a request may see full per-tenant /metrics detail.

@@ -55,8 +55,9 @@ import (
 // (attestation), not since tokenMinted.
 
 const (
-	// agingEnableEnv selects which matrix to run, "1" or "2". Either runs fresh
-	// browsers for tens of minutes, so the normal e2e suite must not pick one up.
+	// agingEnableEnv selects which matrix to run, "1", "2", or "3". Each runs
+	// fresh browsers for tens of minutes, so the normal e2e suite must not pick
+	// one up.
 	agingEnableEnv = "WAXSEAL_E2E_AGING"
 	// agingIterationsEnv overrides the per-arm iteration count.
 	agingIterationsEnv = "WAXSEAL_E2E_AGING_N"
@@ -412,7 +413,7 @@ type agingHarness struct {
 func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation time.Duration) *agingHarness {
 	t.Helper()
 	sepLog := &separationLog{}
-	srv, addr := newInProcessDaemon(t, server.Config{
+	srv, addr, ln := newInProcessDaemon(t, server.Config{
 		MintSeparation: separation,
 		Logger:         slog.New(separationWatcher{inner: testDaemonLogger(t).Handler(), log: sepLog}),
 	})
@@ -431,7 +432,7 @@ func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation t
 		}
 		rec.selfTestDone = time.Now()
 	}
-	go func() { _ = srv.ListenAndServe() }()
+	go func() { _ = srv.Serve(ln) }()
 	base := "http://" + addr
 	waitDaemonReady(t, base)
 

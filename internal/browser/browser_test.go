@@ -131,7 +131,7 @@ func TestLaunchPoolValidatesOptions(t *testing.T) {
 // producer's bytes.
 func TestUAOverride(t *testing.T) {
 	const realUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
+	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","acceptLanguage":"en-US,en","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
 
 	got, err := json.Marshal(uaOverride(realUA))
 	if err != nil {
@@ -215,6 +215,11 @@ func TestUAOverrideFromMetadata(t *testing.T) {
 		}
 		if md.PlatformVersion != "6.18.0" {
 			t.Errorf("platformVersion = %q, want the reported 6.18.0", md.PlatformVersion)
+		}
+		// The capture reports no language, so the real-hint path has to carry the
+		// pin itself or an overridden page falls back to the host's locale.
+		if got.AcceptLanguage != acceptLanguage {
+			t.Errorf("acceptLanguage = %q, want %q", got.AcceptLanguage, acceptLanguage)
 		}
 	})
 
@@ -363,11 +368,13 @@ var sessionFilledContextKeys = map[string]string{
 
 // TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
 // every documented key in the object literal it returns on success, bar the ones
-// the session fills itself. The JS runs only in Chromium, so a key dropped from
-// that literal would otherwise surface as an empty field in a live run. Only that
-// literal is searched, and only for a whole property name, so a key that survives
-// elsewhere in the snippet, or as the tail of another key, cannot satisfy the
-// check.
+// the session fills itself, and every grading field in the evidence block it
+// attaches to a pending or unplayable payload. The JS runs only in Chromium, so a
+// key dropped from either literal would otherwise surface as an empty field in a
+// live run, and a missing evidence key reads as a zero value that confirmTerminal
+// grades on. Only those literals are searched, and only for a whole property
+// name, so a key that survives elsewhere in the snippet, or as the tail of
+// another key, cannot satisfy the check.
 func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	const open = "return JSON.stringify({\n"
 	start := strings.Index(playerContextExtractJS, open)
@@ -381,15 +388,47 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	}
 	literal = literal[:end]
 	typ := reflect.TypeOf(PlayerContext{})
+	names := func(t *testing.T, in, key string) {
+		t.Helper()
+		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(key) + `:`).MatchString(in) {
+			t.Errorf("playerContextExtractJS never emits %q", key)
+		}
+	}
 	for i := range typ.NumField() {
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
 		if _, ok := sessionFilledContextKeys[name]; ok {
 			continue
 		}
-		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(name) + `:`).MatchString(literal) {
-			t.Errorf("playerContextExtractJS success literal never emits %q", name)
-		}
+		names(t, literal, name)
 	}
+	// Not a PlayerContext key: the success payload sets it so video_id_match means
+	// one thing on every payload rather than reading false on the one that matched.
+	names(t, literal, "video_id_match")
+
+	const evidenceOpen = "const evidence = {\n"
+	start = strings.Index(playerContextExtractJS, evidenceOpen)
+	if start < 0 {
+		t.Fatal("playerContextExtractJS has no evidence literal")
+	}
+	evidence := playerContextExtractJS[start+len(evidenceOpen):]
+	if end = strings.Index(evidence, "};"); end < 0 {
+		t.Fatal("playerContextExtractJS evidence literal is unterminated")
+	}
+	evidence = evidence[:end]
+	raw := reflect.TypeOf(playerContextRaw{})
+	for i := range raw.NumField() {
+		f := raw.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		// The embedded context is the success literal's business, and every payload
+		// sets error itself rather than taking it from the evidence block.
+		if f.Anonymous || name == "" || name == "error" {
+			continue
+		}
+		names(t, evidence, name)
+	}
+	// On the embedded struct, so the loop above cannot reach it, and the one
+	// grading field both confirmTerminal and the establish deadline read.
+	names(t, evidence, "playability_status")
 }
 
 // TestConfirmTerminal covers stale evidence that must not mark the current video

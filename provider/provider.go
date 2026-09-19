@@ -3,9 +3,12 @@
 // depend on WaxTap.
 //
 // Failures are reported as WaxTap's own sidecar error types, and a transient one
-// is retried once after the daemon's stated wait, exactly as WaxTap's HTTP
-// sidecar does. A consumer therefore classifies refusals and waits the same way
-// whichever of the two adapters it wires.
+// is retried once after the daemon's stated wait, on the rule WaxTap's own HTTP
+// sidecar retries by. A consumer therefore classifies refusals and waits the
+// same way whichever of the two adapters it wires. The daemon's own error rides
+// in the sidecar error's Cause for a caller that knows this adapter; nothing
+// unwraps it, so classification is unchanged, and a body that was not the
+// daemon's envelope travels no further than this package.
 package provider
 
 import (
@@ -43,15 +46,6 @@ const (
 const (
 	reasonRunes = 200
 	codeRunes   = 64
-)
-
-const (
-	// retryAfterMax is the longest stated wait this adapter sleeps through, and
-	// transientWait is the poke a transient failure that stated none earns. Both
-	// are WaxTap's sidecar numbers: past the maximum a wait is a cool-down to
-	// report, not to sleep through.
-	retryAfterMax = 60 * time.Second
-	transientWait = 500 * time.Millisecond
 )
 
 // sleep waits d or until ctx ends. It is a variable so a test can record the
@@ -125,12 +119,15 @@ func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error
 	}
 	endpoint := p.c.BaseURL() + path
 	if apiErr, ok := errors.AsType[*client.APIError](err); ok {
-		// Only a recognized envelope's text is forwarded. Anything else in Message
-		// is raw bytes from whatever answered instead, and Reason prints into
-		// WaxTap's CLI hints, so an intermediary's page never travels.
+		// Only a recognized envelope's text is forwarded, and only its error rides
+		// in Cause. Anything else in Message is raw bytes from whatever answered
+		// instead, which the client's own documentation says to keep for local
+		// diagnosis and not forward; Cause happens not to be printed today, but
+		// that is WaxTap's promise rather than something this side can rely on.
 		reason := "unrecognized response body"
+		var cause error
 		if apiErr.Envelope {
-			reason = capRunes(apiErr.Message, reasonRunes)
+			reason, cause = capRunes(apiErr.Message, reasonRunes), apiErr
 		}
 		return &waxtap.SidecarResponseError{
 			Label:      label,
@@ -140,6 +137,7 @@ func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error
 			Details:    capRunes(apiErr.Details, reasonRunes),
 			Reason:     reason,
 			RetryAfter: apiErr.RetryAfter,
+			Cause:      cause,
 		}
 	}
 	// net.Error covers the *url.Error http.Client.Do wraps a transport failure in,
@@ -150,7 +148,12 @@ func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error
 	// The daemon answered, but not with something usable: a decode failure, or one
 	// of the shape checks below. A zero status marks a contract mismatch, which is
 	// never retried.
-	return &waxtap.SidecarResponseError{Label: label, Endpoint: endpoint, Reason: capRunes(err.Error(), reasonRunes)}
+	return &waxtap.SidecarResponseError{
+		Label:    label,
+		Endpoint: endpoint,
+		Reason:   capRunes(err.Error(), reasonRunes),
+		Cause:    err,
+	}
 }
 
 // capRunes truncates s to at most n runes, appending an ellipsis when truncated,
@@ -164,28 +167,29 @@ func capRunes(s string, n int) string {
 	return string(r[:n]) + "\u2026"
 }
 
-// call runs fn and retries it once when the translated failure earns it, on
-// WaxTap's sidecar rule: a stated wait up to retryAfterMax on a 408, 429, or
-// 5xx, or transientWait on a transport failure or a 408/5xx that stated none.
+// call runs fn and retries it once when WaxTap's own sidecar rule says the
+// translated failure earns it.
 //
-// Sleeping into a deadline is the waste a stated wait exists to avoid, so a
-// cancellation returns the cancellation, and a budget that cannot fit the wait
-// plus a second of headroom returns the refusal now. A deadline that expires
-// during the sleep returns the refusal too: it is the error that explains the
-// run.
+// The pause policy mirrors WaxTap's httpx.PauseBlocked, which is internal to
+// WaxTap and so is kept here rather than called: sleeping into a deadline is the
+// waste a stated wait exists to avoid, so a cancellation returns the
+// cancellation, and a budget that cannot fit the wait plus a second of headroom
+// returns the refusal now, refusing at equality as WaxTap's does. A deadline
+// that expires during the sleep returns the refusal too: it is the error that
+// explains the run.
 func (p *Provider) call(ctx context.Context, label string, fn func() error) error {
 	err := fn()
 	if err == nil {
 		return nil
 	}
-	wait, retry := retryWait(err)
+	wait, retry := waxtap.SidecarRetryWait(err)
 	if !retry {
 		return err
 	}
 	if cerr := ctx.Err(); cerr != nil && !errors.Is(cerr, context.DeadlineExceeded) {
 		return cerr
 	}
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= wait+time.Second {
 		return err
 	}
 	p.log.Info("waxseal/provider: retrying after the daemon's stated wait",
@@ -197,46 +201,6 @@ func (p *Provider) call(ctx context.Context, label string, fn func() error) erro
 		return err
 	}
 	return fn()
-}
-
-// retryWait reports how long to wait before retrying err and whether a retry is
-// warranted at all. A bare 429 says back off, so it earns one only with a stated
-// wait; a wait past retryAfterMax is a cool-down to report rather than serve.
-func retryWait(err error) (time.Duration, bool) {
-	if _, ok := errors.AsType[*waxtap.SidecarError](err); ok {
-		return transientWait, true
-	}
-	sre, ok := errors.AsType[*waxtap.SidecarResponseError](err)
-	if !ok {
-		return 0, false
-	}
-	if sre.RetryAfter > 0 {
-		if sre.RetryAfter > retryAfterMax {
-			return 0, false
-		}
-		return sre.RetryAfter, sre.StatusCode == http.StatusTooManyRequests || retryableStatus(sre.StatusCode)
-	}
-	if retryableStatus(sre.StatusCode) {
-		return transientWait, true
-	}
-	return 0, false
-}
-
-// retryableStatus reports whether a status is the kind a second attempt can
-// clear on its own: the daemon may be launching a browser, mid-relaunch, or
-// briefly wedged. It is WaxTap's set, so one status does not mean transient on
-// one adapter and final on the other.
-func retryableStatus(status int) bool {
-	switch status {
-	case http.StatusRequestTimeout, // 408
-		http.StatusInternalServerError, // 500
-		http.StatusBadGateway,          // 502
-		http.StatusServiceUnavailable,  // 503
-		http.StatusGatewayTimeout:      // 504
-		return true
-	default:
-		return false
-	}
 }
 
 // sidecarCode is the refusal's code for a log line, empty for anything else.
@@ -459,14 +423,12 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 		}
 		thumbs = append(thumbs, potoken.PlayerContextThumbnail{URL: t.URL, Width: t.Width, Height: t.Height})
 	}
-	// pc.UserAgent has nowhere to go: potoken.PlayerContext carries ClientVersion
-	// only, so the context arm streams under WaxTap's own user agent. See the open
-	// entry in docs/upstream-requests.md.
 	return potoken.PlayerContext{
 		ServerAbrURL:    pc.ServerAbrStreamingURL,
 		PlayerURL:       pc.PlayerURL,
 		UstreamerConfig: pc.VideoPlaybackUstreamerConfig,
 		VisitorData:     pc.VisitorData,
+		UserAgent:       pc.UserAgent,
 		ClientVersion:   pc.ClientVersion,
 		Title:           pc.Title,
 		Author:          pc.Author,

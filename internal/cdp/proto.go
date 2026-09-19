@@ -36,6 +36,10 @@ type attachToTargetResult struct {
 	SessionID string `json:"sessionId"`
 }
 
+type closeTargetParams struct {
+	TargetID string `json:"targetId"`
+}
+
 type createBrowserContextResult struct {
 	BrowserContextID string `json:"browserContextId"`
 }

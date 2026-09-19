@@ -55,13 +55,13 @@ func startColdDaemon(t *testing.T) string {
 		t.Logf("using external daemon at %s (WAXSEAL_URL)", ext)
 		return ext
 	}
-	srv, addr := newInProcessDaemon(t, server.Config{})
+	srv, addr, ln := newInProcessDaemon(t, server.Config{})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := srv.Warm(warmCtx, ""); err != nil {
 		t.Fatalf("warm cold daemon (browser attest): %v", err)
 	}
-	go func() { _ = srv.ListenAndServe() }()
+	go func() { _ = srv.Serve(ln) }()
 	base := "http://" + addr
 	waitDaemonReady(t, base)
 	return base
@@ -124,17 +124,23 @@ func (w *testLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// newInProcessDaemon selects a loopback address and registers server cleanup. The
-// address is not reserved after selection, so waitDaemonReady reports any bind
-// failure. The caller is responsible for warming and serving the daemon.
-func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string) {
+// newInProcessDaemon binds a loopback listener and registers server cleanup. The
+// listener comes back open, for the caller to hand to srv.Serve: the caller
+// warms the daemon first, and a warm-up that fails does so before Serve has
+// taken ownership, which is why the close is a cleanup here. Holding the port
+// from the start also means nothing else can take it between selection and
+// serving.
+func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string, net.Listener) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("grab free port: %v", err)
 	}
+	// Registered before the server's own cleanup, so it runs after it: Shutdown
+	// drains first, and this is the no-op close that follows unless Serve never
+	// ran.
+	t.Cleanup(func() { _ = ln.Close() })
 	addr := ln.Addr().String()
-	_ = ln.Close()
 
 	cfg.Addr = addr
 	if cfg.Logger == nil {
@@ -149,15 +155,21 @@ func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string
 		defer c()
 		_ = srv.Shutdown(shutCtx)
 	})
-	return srv, addr
+	return srv, addr, ln
 }
 
-// waitDaemonReady waits for the server goroutine to bind its listener.
+// waitDaemonReady waits for the server goroutine to start serving.
+//
+// Each attempt carries its own timeout because the listener is already bound
+// when this runs: a request that arrives before Serve does is accepted into the
+// backlog and waits there rather than being refused, so without one the deadline
+// below could never be reached.
 func waitDaemonReady(t *testing.T, base string) {
 	t.Helper()
+	hc := &http.Client{Timeout: time.Second}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		resp, err := http.Get(base + "/metrics")
+		resp, err := hc.Get(base + "/metrics")
 		if err == nil {
 			_ = resp.Body.Close()
 			return
@@ -398,14 +410,14 @@ func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
 	const warmKey, lazyKey = "KEYWARM", "KEYLAZY"
 	// TenantKeys maps API key to tenant label (see server.Config), so key the map by
 	// the API key, not the label.
-	srv, addr := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{warmKey: "warm", lazyKey: "lazy"}})
+	srv, addr, ln := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{warmKey: "warm", lazyKey: "lazy"}})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	if err := srv.Warm(warmCtx, warmKey); err != nil { // warm only the "warm" tenant
 		cancel()
 		t.Fatalf("warm warm-tenant: %v", err)
 	}
 	cancel()
-	go func() { _ = srv.ListenAndServe() }()
+	go func() { _ = srv.Serve(ln) }()
 	base := "http://" + addr
 	waitDaemonReady(t, base)
 
@@ -429,14 +441,14 @@ func TestShortLandingVideoEstablishesHTTP(t *testing.T) {
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
 		t.Skip("short-landing-video test requires an in-process daemon")
 	}
-	srv, addr := newInProcessDaemon(t, server.Config{Video: shortVideoID})
+	srv, addr, ln := newInProcessDaemon(t, server.Config{Video: shortVideoID})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	if err := srv.Warm(warmCtx, ""); err != nil {
 		cancel()
 		t.Fatalf("warm with a short landing video: %v", err)
 	}
 	cancel()
-	go func() { _ = srv.ListenAndServe() }()
+	go func() { _ = srv.Serve(ln) }()
 	base := "http://" + addr
 	waitDaemonReady(t, base)
 
@@ -510,7 +522,7 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 			t.Errorf("generation changed from %d to %d (a relaunch happened)", before.Generation, after.Generation)
 		}
 	default:
-		t.Logf("generation not compared: this daemon redacts /metrics, which drops per-tenant state; the attestations check below covers the same relaunch")
+		t.Logf("generation not compared: this daemon's /metrics named no single tenant's generation, either redacted or serving several; the attestations check below covers the same relaunch")
 	}
 	if after.Attestations != before.Attestations {
 		t.Errorf("attestations changed from %d to %d (a re-attest happened)", before.Attestations, after.Attestations)

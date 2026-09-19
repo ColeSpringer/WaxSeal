@@ -146,18 +146,27 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 		// registered Minter and will not run again, so registering this one would
 		// leak it, log a tenant created after the daemon stopped, and inflate the
 		// tenant count /metrics reports for the run.
-		m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
+		m := t.newMinter()
 		m.Close() // Close owns the terminal flag; there is no session to tear down.
 		return m, label, nil
 	}
-	m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
-	m.launch = func(ctx context.Context) (minterSession, error) {
-		return t.newSession(ctx, t.video)
-	}
+	m := t.newMinter()
 	t.minters[label] = m
 	t.mu.Unlock()
 	t.log.Info("tenants: tenant minter created", "tenant", label)
 	return m, label, nil
+}
+
+// newMinter builds a tenant Minter that launches through this registry. Every
+// tenant Minter is built here, including the one a post-Close request is handed,
+// so none is ever left with the browser-wide launcher NewMinter defaults to,
+// which would start a second Chromium outside the pool.
+func (t *Tenants) newMinter() *Minter {
+	m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
+	m.launch = func(ctx context.Context) (minterSession, error) {
+		return t.newSession(ctx, t.video)
+	}
+	return m
 }
 
 // WarmOne attests the tenant selected by apiKey. Other tenants remain lazy.

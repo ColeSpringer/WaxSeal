@@ -2004,7 +2004,6 @@ type HealthSnapshot struct {
 	Generation              uint64
 	BrowserProofEstablished bool
 	LastBrowserProofOutcome string
-	LastBrowserProofAt      time.Time
 	StreamingSuspect        bool // a consumer reported this generation degraded
 }
 
@@ -2177,7 +2176,6 @@ func (m *Minter) healthSnapshot(sess minterSession, gen uint64) HealthSnapshot {
 		AttestKind:              sess.AttestKind(),
 		Generation:              gen,
 		BrowserProofEstablished: sess.Established(),
-		LastBrowserProofAt:      proofAt,
 	}
 	if !proofAt.IsZero() {
 		snap.LastBrowserProofOutcome = proof.Outcome

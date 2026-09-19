@@ -8,8 +8,9 @@ import (
 
 func TestClassifyStaleProfiles(t *testing.T) {
 	free := map[string]bool{
-		filepath.Join("/dead", creatorMarkerFile): true,
-		filepath.Join("/live", creatorMarkerFile): false,
+		filepath.Join("/dead", creatorMarkerFile):     true,
+		filepath.Join("/live", creatorMarkerFile):     false,
+		filepath.Join("/starting", creatorMarkerFile): true,
 	}
 	lockable := func(marker string) bool { return free[marker] }
 
@@ -17,6 +18,9 @@ func TestClassifyStaleProfiles(t *testing.T) {
 		{path: "/dead", hasMarker: true},
 		{path: "/live", hasMarker: true},
 		{path: "/markerless", hasMarker: false},
+		// A browser between writing its marker and taking the lock: marked, lock
+		// free, and not to be touched.
+		{path: "/starting", hasMarker: true, fresh: true},
 	}
 
 	got := classifyStaleProfiles(states, lockable)
@@ -25,7 +29,7 @@ func TestClassifyStaleProfiles(t *testing.T) {
 		removed[st.path] = true
 	}
 
-	want := map[string]bool{"/dead": true, "/live": false, "/markerless": false}
+	want := map[string]bool{"/dead": true, "/live": false, "/markerless": false, "/starting": false}
 	for path, w := range want {
 		if removed[path] != w {
 			t.Errorf("classify %s: removed = %v, want %v", path, removed[path], w)

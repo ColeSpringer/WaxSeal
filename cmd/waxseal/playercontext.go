@@ -74,6 +74,8 @@ func runPlayerContext(cmd *cobra.Command, o *playerContextOpts, args []string) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Remove profiles left by a run that could not clean up after itself.
+	browser.ReapStaleProfiles(logger)
 	// Establish the session on the stable default video before querying the target.
 	// This lets an unavailable target return ErrUnplayable instead of timing out
 	// during the streaming proof.

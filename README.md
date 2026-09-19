@@ -235,7 +235,11 @@ video is never negative-cached. The wall keys on the visitor identity, and the
 only thing that lifts it is a fresh one: the daemon relaunches once per 10
 minutes on a bot check and serves the request from the replacement, which is the
 common case. A check on the replacement, or one inside that window, is refused as
-`player-context-failed` (502) with a 2 minute `Retry-After`.
+`player-context-failed` (502) with a 2 minute `Retry-After`. The browser
+presents an `en-US,en` language list, so the wall arrives in English and is
+recognised whatever the host's locale. That list rides on the user-agent
+override, which a `--headful` run does not install, so a headful session keeps
+the host's own language and a non-English wall reads there as a timeout.
 
 ### `GET /session`
 
@@ -297,12 +301,15 @@ future generations are ignored.
 ```
 
 `/metrics` counts each report by disposition: `degradation_reports_accepted`
-(applied to the live session), `degradation_reports_rate_limited` (past the
-report budget), `degradation_reports_rejected_stale` (an old or replaced
-generation), `degradation_reports_already_retired` (the current generation,
-already retired by a crash or a prior report; a benign no-op), and
+(retired the live session, or queued its retirement for the next streaming
+handoff), `degradation_reports_rate_limited` (past the report budget),
+`degradation_reports_rejected_stale` (an old or replaced generation),
+`degradation_reports_already_retired` (the current generation, already retired by
+a crash or a prior report; a benign no-op), and
 `degradation_reports_duplicate_pending` (a repeat report for a generation whose
-retirement is already queued for the next streaming handoff).
+retirement is already queued; it answers `accepted: true`, because the session it
+named is on its way out either way, and counts here rather than under
+`accepted`).
 
 ### Authentication and tenants
 
@@ -341,6 +348,19 @@ generated labels); labels and keys must be non-empty and unique, and an invalid
 set stops startup before Chromium launches. A keyless daemon on a non-loopback
 host exposes its guest identity through `/session` and `/player-context`, so use
 `--tenant-keys` when exposing the service.
+
+Both keys reach the daemon from four places: `--tenant-keys` and `--metrics-key`,
+the `--tenant-keys-file` and `--metrics-key-file` paths, and the four environment
+variables `WAXSEAL_TENANT_KEYS`, `WAXSEAL_TENANT_KEYS_FILE`, `WAXSEAL_METRICS_KEY`,
+and `WAXSEAL_METRICS_KEY_FILE`. Flags outrank the environment, and setting a value
+and a file in the same tier is a usage error rather than a silent winner. A file
+is read whole with trailing whitespace removed, and an empty one is a usage error
+rather than a keyless daemon nobody asked for. Prefer a file in a container: a key
+on the command line shows in `ps` and in `docker inspect`, a key in the
+environment shows in `docker inspect`, and a `/run/secrets` path shows only the
+path. Outside swarm, compose bind-mounts a secret's host file as it is and
+ignores the secret's `uid`, `gid`, and `mode`, so that file has to be readable
+by the image's non-root user (uid 10001).
 
 ### Metrics
 
@@ -529,10 +549,13 @@ probes do not fail during the benign re-establishment window. A bare `?strict`
 also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`, `banana`)
 returns **400** rather than quietly running non-strict, so a typo in a probe is
 visible. Size a probe's timeout for the worst case: up to four session round
-trips and a session teardown, two browser round trips and a browser teardown,
-each bounded at 5 seconds, plus a relaunch, which normally takes a second or two
-and is bounded by the 60 second launch handshake; the image's `HEALTHCHECK`
-allows 110. The image runs `waxseal ping --strict` with no key, which checks
+trips and a session teardown, and two browser round trips, each bounded at 5
+seconds; a browser teardown of 7, which is a 2 second graceful close plus the
+launcher's 5 second wait; and a relaunch, which normally takes a second or two
+and is bounded by the 60 second launch handshake. That is 102 seconds, or 105 on
+Windows, which also removes the profile. `waxseal ping` allows itself 108, that
+worst case plus its own connect, transfer, and decode, and takes `--timeout` to
+change it; the image's `HEALTHCHECK` allows 110. The image runs `waxseal ping --strict` with no key, which checks
 the browser on a keyed daemon and the one tenant's session plus the browser on
 a keyless one, and it keeps working once the daemon is keyed. Add `--key <key>`
 to also probe that tenant's session; the CLI sends the key as a header and keeps
@@ -552,6 +575,22 @@ warning. Note that a Debian `chromium` build, which the image runs, reports no
 `Google Chrome` brand at all while its user agent still says `Chrome/<version>`.
 That is what real Debian Chromium looks like, not a bug.
 
+Most daemon settings have both a flag and an environment variable, and where both
+exist the flag outranks the variable. A container reaches for the variable, since
+a flag there means overriding the image's `CMD`. The rows naming no flag have
+only the variable.
+
+| Variable | Sets |
+|---|---|
+| `WAXSEAL_TENANT_KEYS`, `WAXSEAL_TENANT_KEYS_FILE` | `--tenant-keys`, `--tenant-keys-file` |
+| `WAXSEAL_METRICS_KEY`, `WAXSEAL_METRICS_KEY_FILE` | `--metrics-key`, `--metrics-key-file` |
+| `WAXSEAL_STREAMING_MAX_AGE` | `--streaming-max-age` |
+| `WAXSEAL_REPORT_DEBOUNCE` | `--report-debounce` |
+| `WAXSEAL_SHUTDOWN_TIMEOUT` | `--shutdown-timeout` |
+| `WAXSEAL_MINT_SEPARATION` | the mint-to-establishment gate, which has no flag |
+| `WAXSEAL_CHROME_BIN` | the browser binary, for every command |
+| `WAXSEAL_UA_HINTS` | the client-hint source, `real` or `synthetic` |
+
 WaxSeal is meant for loopback or a trusted network and does not implement CORS;
 because it mints tokens, browser-origin access is out of scope. Run
 `go run ./cmd/waxseal server --help` for the rest: session recycling, report
@@ -564,11 +603,14 @@ go test ./...                              # offline unit tests; no browser or n
 (cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs WAXSEAL_URL/WAXSEAL_KEY
-make vet                                   # what CI vets: both modules, plus a windows cross-vet
+make vet                                   # both modules, plus a windows cross-vet (CI vets Windows natively)
+make fmt-check                             # fail if any file needs gofmt
 make test                                  # both modules' offline tests, race-enabled
 make live                                  # the live CDP tests above
 make tidy-check                            # fail if go mod tidy would change either module
 make vulncheck                             # govulncheck over both modules
+make consumer-check                        # build provider/ as an external go get sees it
+make verify-assets                         # rebuild the browser bundle and diff it against the committed one
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js
 ```
@@ -610,6 +652,16 @@ proof and not on a mint.
 The `client` package is a reusable, consumer-agnostic HTTP client; the
 `provider/` module adapts it to the token-provider interface a streaming
 consumer expects.
+
+`provider/` builds against this checkout through a `replace`, while its `require`
+names the root version a consumer resolves, the `replace` being ignored there. So
+a change that adds a root member `provider/` uses is pushed first and pinned
+second: `go list -m github.com/colespringer/waxseal@<sha>` prints the
+pseudo-version of the pushed commit, then `go mod edit
+-require=github.com/colespringer/waxseal@<pseudo-version>` and `go mod tidy` from
+`provider/`; after each root tag the pin moves to the tag. `make consumer-check`
+builds the module with the `replace` dropped, and the release gate runs it, so a
+stale pin stops a release rather than a consumer.
 
 CLI exit codes: `0` success, `1` runtime failure, `2` usage error, `3` unavailable
 video, `130` interruption. A bot check is a runtime failure (`1`), not an

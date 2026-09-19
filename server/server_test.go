@@ -935,7 +935,7 @@ func TestSessionEchoesGeneration(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["visitor_data"] != "vd-x" {
 		t.Errorf("visitor_data = %v", resp["visitor_data"])
 	}
@@ -954,7 +954,7 @@ func TestPingHealthFields(t *testing.T) {
 		t.Fatalf("status = %d", w.Code)
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["ok"] != true {
 		t.Errorf("ok = %v, want true", resp["ok"])
 	}
@@ -1163,7 +1163,7 @@ func TestMetricsRedaction(t *testing.T) {
 		PerTenant map[string]any `json:"per_tenant"`
 		Redacted  bool           `json:"redacted"`
 	}
-	json.Unmarshal(pubW.Body.Bytes(), &pubResp)
+	mustUnmarshal(t, pubW.Body.Bytes(), &pubResp)
 	if pubResp.Redacted || len(pubResp.PerTenant) != 2 {
 		t.Errorf("--metrics-public view = redacted=%v per_tenant=%d, want full with 2 tenants", pubResp.Redacted, len(pubResp.PerTenant))
 	}
@@ -1176,7 +1176,7 @@ func TestMetricsRedaction(t *testing.T) {
 		PerTenant map[string]any `json:"per_tenant"`
 		Redacted  bool           `json:"redacted"`
 	}
-	json.Unmarshal(klW.Body.Bytes(), &klResp)
+	mustUnmarshal(t, klW.Body.Bytes(), &klResp)
 	if klResp.Redacted || len(klResp.PerTenant) != 1 {
 		t.Errorf("keyless view = redacted=%v per_tenant=%d, want full with 1 tenant", klResp.Redacted, len(klResp.PerTenant))
 	}
@@ -1227,7 +1227,7 @@ func TestPingReason(t *testing.T) {
 					t.Fatalf("status = %d, want 200", w.Code)
 				}
 				var resp map[string]any
-				json.Unmarshal(w.Body.Bytes(), &resp)
+				mustUnmarshal(t, w.Body.Bytes(), &resp)
 				return resp
 			}
 
@@ -1610,6 +1610,16 @@ func TestGetPotInvalidScopeMessage(t *testing.T) {
 	}
 }
 
+// mustUnmarshal decodes a response body or fails the test. A discarded decode
+// error leaves a zero value behind, and an assertion against that reads as a
+// missing field rather than as the body never having parsed.
+func mustUnmarshal(t *testing.T, body []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(body, v); err != nil {
+		t.Fatalf("decode response %s: %v", body, err)
+	}
+}
+
 func TestHandleReportLive(t *testing.T) {
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"}
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
@@ -1621,7 +1631,7 @@ func TestHandleReportLive(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["accepted"] != true {
 		t.Errorf("accepted = %v, want true", resp["accepted"])
 	}
@@ -1630,6 +1640,11 @@ func TestHandleReportLive(t *testing.T) {
 	}
 	if resp["generation"] != float64(1) {
 		t.Errorf("generation = %v, want 1", resp["generation"])
+	}
+	// An accepted report carries no wait, so the key is absent rather than zero:
+	// a consumer reads any value there as the daemon asking it to back off.
+	if _, ok := resp["retry_after_seconds"]; ok {
+		t.Errorf("retry_after_seconds = %v, want it absent on an accepted report", resp["retry_after_seconds"])
 	}
 	if !sess.closed.Load() {
 		t.Error("an idle reported session should be retired")
@@ -1676,7 +1691,7 @@ func TestHandleReportValidation(t *testing.T) {
 				t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body)
 			}
 			var env struct{ Error, Code string }
-			json.Unmarshal(w.Body.Bytes(), &env)
+			mustUnmarshal(t, w.Body.Bytes(), &env)
 			if env.Code != CodeInvalidRequest {
 				t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
 			}
@@ -1698,7 +1713,7 @@ func TestHandleReportNoSessionReflectsResult(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["accepted"] != false {
 		t.Errorf("accepted = %v, want false (no live session)", resp["accepted"])
 	}
@@ -1724,7 +1739,7 @@ func TestHandleReportRateLimited(t *testing.T) {
 		}
 		pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
 		var pc map[string]any
-		json.Unmarshal(pcW.Body.Bytes(), &pc)
+		mustUnmarshal(t, pcW.Body.Bytes(), &pc)
 		if got, _ := pc["session_generation"].(float64); int(got) != gen+1 {
 			t.Fatalf("relaunch %d generation = %v, want %d", gen, pc["session_generation"], gen+1)
 		}
@@ -1737,7 +1752,7 @@ func TestHandleReportRateLimited(t *testing.T) {
 		t.Error("a rate-limited report must carry a Retry-After header")
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["accepted"] != false {
 		t.Errorf("accepted = %v, want false", resp["accepted"])
 	}
@@ -1772,7 +1787,7 @@ func TestHandleReportAlreadyRetiredMetric(t *testing.T) {
 		t.Fatalf("second report status = %d, body = %s", w.Code, w.Body)
 	}
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
 	if resp["accepted"] != false || resp["generation"] != float64(1) {
 		t.Errorf("second report = %v, want accepted=false generation=1", resp)
 	}
@@ -1811,7 +1826,7 @@ func TestHandleReportCrossTenant(t *testing.T) {
 	pw := httptest.NewRecorder()
 	s.routes().ServeHTTP(pw, pr)
 	var resp map[string]any
-	json.Unmarshal(pw.Body.Bytes(), &resp)
+	mustUnmarshal(t, pw.Body.Bytes(), &resp)
 	if resp["ok"] != true {
 		t.Errorf("bob /ping ok = %v, want true (bob unaffected)", resp["ok"])
 	}
@@ -1832,7 +1847,7 @@ func TestGetPotDecodeMessages(t *testing.T) {
 				t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body)
 			}
 			var env struct{ Error, Code string }
-			json.Unmarshal(w.Body.Bytes(), &env)
+			mustUnmarshal(t, w.Body.Bytes(), &env)
 			if env.Error != c.want {
 				t.Errorf("message = %q, want %q", env.Error, c.want)
 			}
@@ -1850,7 +1865,7 @@ func TestPlayerContextEmptyBodyReportsMissingVideoID(t *testing.T) {
 		t.Fatalf("status = %d, want 400", w.Code)
 	}
 	var env struct{ Error, Code string }
-	json.Unmarshal(w.Body.Bytes(), &env)
+	mustUnmarshal(t, w.Body.Bytes(), &env)
 	if env.Error != "video_id is required" {
 		t.Errorf("message = %q, want 'video_id is required'", env.Error)
 	}

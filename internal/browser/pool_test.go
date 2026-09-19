@@ -37,7 +37,7 @@ func TestPoolRelaunchSingleFlight(t *testing.T) {
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func(i int) { defer wg.Done(); results[i], errs[i] = p.relaunch(stale) }(i)
+		go func(i int) { defer wg.Done(); results[i], errs[i] = p.relaunch(context.Background(), stale) }(i)
 	}
 	<-started
 	time.Sleep(25 * time.Millisecond) // Allow the remaining callers to begin waiting.
@@ -65,7 +65,7 @@ func TestPoolRelaunchShortCircuitsWhenAlreadySwapped(t *testing.T) {
 	p := &Pool{opts: withDefaults(Options{}), cur: fresh}
 	p.newInstance = func() (*browserInstance, error) { atomic.AddInt64(&created, 1); return &browserInstance{}, nil }
 
-	got, err := p.relaunch(stale)
+	got, err := p.relaunch(context.Background(), stale)
 	if err != nil {
 		t.Fatalf("relaunch: %v", err)
 	}
@@ -87,13 +87,13 @@ func TestPoolRelaunchBackoffAfterFailure(t *testing.T) {
 		return nil, errors.New("launch failed")
 	}
 
-	if _, err := p.relaunch(stale); err == nil {
+	if _, err := p.relaunch(context.Background(), stale); err == nil {
 		t.Fatal("first relaunch should return the launch error")
 	}
 	if got := atomic.LoadInt64(&created); got != 1 {
 		t.Fatalf("newInstance calls = %d, want 1", got)
 	}
-	_, err := p.relaunch(stale)
+	_, err := p.relaunch(context.Background(), stale)
 	if err == nil {
 		t.Fatal("second relaunch within the backoff window should fail fast")
 	}
@@ -141,7 +141,7 @@ func TestPoolRelaunchResetsStreakAfterStableGap(t *testing.T) {
 	var created int64
 	p := &Pool{opts: withDefaults(Options{}), cur: stale, relaunchStreak: 5, lastRelaunchAt: time.Now().Add(-time.Hour)}
 	p.newInstance = func() (*browserInstance, error) { atomic.AddInt64(&created, 1); return &browserInstance{}, nil }
-	if _, err := p.relaunch(stale); err != nil {
+	if _, err := p.relaunch(context.Background(), stale); err != nil {
 		t.Fatalf("a relaunch after a long stable gap must not back off: %v", err)
 	}
 	if got := atomic.LoadInt64(&created); got != 1 {
@@ -159,7 +159,7 @@ func TestPoolRelaunchHoldsCeilingDuringCrashLoop(t *testing.T) {
 	// stability window.
 	p := &Pool{opts: withDefaults(Options{}), cur: stale, relaunchStreak: 5, lastRelaunchAt: time.Now().Add(-(relaunchBackoffMax + time.Second))}
 	p.newInstance = func() (*browserInstance, error) { return &browserInstance{}, nil }
-	if _, err := p.relaunch(stale); err != nil {
+	if _, err := p.relaunch(context.Background(), stale); err != nil {
 		t.Fatalf("relaunch: %v", err)
 	}
 	if p.relaunchStreak <= 1 {
@@ -176,11 +176,11 @@ func TestPoolRelaunchBackoffOnCrashLoop(t *testing.T) {
 		atomic.AddInt64(&created, 1)
 		return &browserInstance{}, nil
 	}
-	inst1, err := p.relaunch(stale)
+	inst1, err := p.relaunch(context.Background(), stale)
 	if err != nil {
 		t.Fatalf("first relaunch: %v", err)
 	}
-	if _, err := p.relaunch(inst1); err == nil {
+	if _, err := p.relaunch(context.Background(), inst1); err == nil {
 		t.Fatal("immediate relaunch after a post-launch crash should be rejected")
 	}
 	if got := atomic.LoadInt64(&created); got != 1 {
@@ -194,8 +194,8 @@ func TestPoolRelaunchClosedBlocks(t *testing.T) {
 	p := &Pool{opts: withDefaults(Options{}), cur: stale}
 	p.newInstance = func() (*browserInstance, error) { return &browserInstance{}, nil }
 	p.Close()
-	if _, err := p.relaunch(stale); !errors.Is(err, errPoolClosed) {
-		t.Errorf("relaunch after Close = %v, want errPoolClosed", err)
+	if _, err := p.relaunch(context.Background(), stale); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("relaunch after Close = %v, want ErrPoolClosed", err)
 	}
 }
 
@@ -210,12 +210,48 @@ func TestPoolRelaunchDisposesStaleOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); _, _ = p.relaunch(stale) }()
+		go func() { defer wg.Done(); _, _ = p.relaunch(context.Background(), stale) }()
 	}
 	wg.Wait()
 	if got := atomic.LoadInt64(&teardowns); got != 1 {
 		t.Errorf("stale teardown count = %d, want 1", got)
 	}
+}
+
+// A caller waiting on someone else's relaunch leaves when its own budget is
+// gone. Without that, a request whose deadline had already passed would sit
+// through a launch handshake before failing anyway, holding a page and a
+// connection it can no longer use.
+func TestPoolRelaunchWaitHonoursTheCallersContext(t *testing.T) {
+	stale := &browserInstance{}
+	enter := make(chan struct{})
+	release := make(chan struct{})
+	p := &Pool{opts: withDefaults(Options{}), cur: stale}
+	p.newInstance = func() (*browserInstance, error) {
+		close(enter)
+		<-release
+		return &browserInstance{}, nil
+	}
+
+	first := make(chan struct{})
+	go func() { _, _ = p.relaunch(context.Background(), stale); close(first) }()
+	<-enter // the relaunch is in flight, so the next caller has to wait on it
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	second := make(chan error, 1)
+	go func() { _, err := p.relaunch(ctx, stale); second <- err }()
+	select {
+	case err := <-second:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("relaunch with a cancelled context = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled caller waited on the in-flight relaunch")
+	}
+
+	close(release)
+	<-first
 }
 
 // Close discards and tears down a replacement that finishes concurrently.
@@ -233,15 +269,15 @@ func TestPoolCloseDuringRelaunch(t *testing.T) {
 
 	done := make(chan struct{})
 	var relErr error
-	go func() { _, relErr = p.relaunch(stale); close(done) }()
+	go func() { _, relErr = p.relaunch(context.Background(), stale); close(done) }()
 
 	<-enter
 	p.Close()
 	close(release)
 	<-done
 
-	if !errors.Is(relErr, errPoolClosed) {
-		t.Errorf("relaunch during Close = %v, want errPoolClosed", relErr)
+	if !errors.Is(relErr, ErrPoolClosed) {
+		t.Errorf("relaunch during Close = %v, want ErrPoolClosed", relErr)
 	}
 	if got := atomic.LoadInt64(&newTorn); got != 1 {
 		t.Errorf("replacement teardown count = %d, want 1", got)
@@ -420,16 +456,16 @@ func TestPoolHealthClosedPoolFails(t *testing.T) {
 		return nil
 	})
 	p.Close()
-	if _, err := p.Health(context.Background()); !errors.Is(err, errPoolClosed) {
-		t.Errorf("Health after Close = %v, want errPoolClosed", err)
+	if _, err := p.Health(context.Background()); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("Health after Close = %v, want ErrPoolClosed", err)
 	}
 }
 
 // A nil pool reads as closed, like Close on a nil pool is a no-op.
 func TestPoolHealthNilPoolFails(t *testing.T) {
 	var p *Pool
-	if _, err := p.Health(context.Background()); !errors.Is(err, errPoolClosed) {
-		t.Errorf("(*Pool)(nil).Health = %v, want errPoolClosed", err)
+	if _, err := p.Health(context.Background()); !errors.Is(err, ErrPoolClosed) {
+		t.Errorf("(*Pool)(nil).Health = %v, want ErrPoolClosed", err)
 	}
 	wantCounts(t, p, 0, 0)
 }

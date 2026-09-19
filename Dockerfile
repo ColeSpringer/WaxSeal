@@ -60,6 +60,8 @@ RUN apt-get update \
 # Non-root user with a writable HOME (the browser profile lives under $HOME).
 RUN useradd --create-home --uid 10001 waxseal
 COPY --from=build /out/waxseal /usr/local/bin/waxseal
+# The image redistributes this code, and MIT requires the notice to travel with it.
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/waxseal/
 
 # Link the GHCR package to the source repository.
 LABEL org.opencontainers.image.source="https://github.com/ColeSpringer/WaxSeal" \

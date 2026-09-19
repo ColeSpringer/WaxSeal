@@ -97,6 +97,8 @@ func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 		landingURL = pageURL
 	}
 
+	// Remove profiles left by a run that could not clean up after itself.
+	browser.ReapStaleProfiles(logger)
 	sess, err := browser.Launch(ctx, o.video, browser.Options{
 		Headful:       o.headful,
 		NormalizeUA:   !o.headful,

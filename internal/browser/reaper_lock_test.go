@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Profile ownership is a lock on the marker file: an advisory flock on Unix, an
@@ -73,6 +74,16 @@ func TestMarkerLockableMissingFile(t *testing.T) {
 	}
 }
 
+// age backdates a profile's marker past markerGrace and returns the directory.
+func age(t *testing.T, dir string) string {
+	t.Helper()
+	old := time.Now().Add(-markerGrace - time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, creatorMarkerFile), old, old); err != nil {
+		t.Fatalf("backdate %s: %v", dir, err)
+	}
+	return dir
+}
+
 func TestReapStaleProfiles(t *testing.T) {
 	base := t.TempDir()
 	setProfileBase(t, base)
@@ -93,9 +104,15 @@ func TestReapStaleProfiles(t *testing.T) {
 		return dir
 	}
 
-	dead := mk(".waxseal-11111111", true)
+	// Backdated past markerGrace: the sweep writes and reaps in the same instant,
+	// which every real abandoned profile is minutes or hours away from.
+	dead := age(t, mk(".waxseal-11111111", true))
 	live := mk(".waxseal-22222222", true)
 	markerless := mk(".waxseal-33333333", false)
+	// A marker written moments ago belongs to a browser still starting:
+	// markProfileDir writes it before it takes the lock, so a fresh marker with a
+	// free lock is that window, not an abandoned profile.
+	starting := mk(".waxseal-44444444", true)
 	backup := mk(".waxseal-backup", false)
 	sentinel := filepath.Join(backup, "important.txt")
 	if err := os.WriteFile(sentinel, []byte("user data"), 0o644); err != nil {
@@ -117,9 +134,10 @@ func TestReapStaleProfiles(t *testing.T) {
 		wantGone bool
 		why      string
 	}{
-		{dead, true, "marked + lock free"},
+		{dead, true, "marked + lock free + marker older than the grace"},
 		{live, false, "marked + lock held by a live owner"},
 		{markerless, false, "unmarked profile"},
+		{starting, false, "marker written within the grace: a browser still starting"},
 		{backup, false, "unrelated .waxseal-backup"},
 	} {
 		if gone(c.dir) != c.wantGone {

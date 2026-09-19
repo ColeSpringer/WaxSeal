@@ -25,10 +25,22 @@ func hasScheme(s string) bool { return strings.Contains(s, "://") }
 
 // pingOpts holds ping-subcommand flags.
 type pingOpts struct {
-	addr   string
-	key    string
-	strict bool
+	addr    string
+	key     string
+	strict  bool
+	timeout time.Duration
 }
+
+// pingTimeout is the whole probe's budget, which covers the probe's own connect,
+// transfer, and decode as well as the daemon's work, so it has to be more than
+// the daemon's worst case rather than equal to it.
+//
+// That worst case adds up to 102 seconds: four session round trips and a session
+// teardown at pingProbeTimeout and teardownTimeout, two browser round trips at
+// aliveProbeTimeout, a browser teardown of gracefulCloseTimeout plus the
+// launcher's waitDelay, and a relaunch bounded by launchTimeout. Windows adds
+// profileRemoveTimeout for 105. The rest is the probe's own.
+const pingTimeout = 108 * time.Second
 
 // newPingCmd checks a running server with GET /ping and exits nonzero on failure.
 // It is a curl-free probe for scripts, systemd, and container health checks.
@@ -46,6 +58,10 @@ func newPingCmd() *cobra.Command {
 		"tenant API key: probe that tenant's session. Without it a keyed daemon\n"+
 			"answers with the shared browser's liveness instead, which is what a\n"+
 			"container health check needs; a keyless daemon probes its one tenant.")
+	f.DurationVar(&p.timeout, "timeout", pingTimeout,
+		"budget for the whole probe, as a Go duration. The default covers the\n"+
+			"daemon's worst case: session and browser probes, a teardown, and one\n"+
+			"relaunch of the browser.")
 	f.BoolVar(&p.strict, "strict", false,
 		"treat the benign no-session and busy windows as healthy and fail only\n"+
 			"on probe failure (sends ?strict=true). Use this for container or\n"+
@@ -61,6 +77,9 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	// tenant it meant to watch is never checked.
 	if cmd.Flags().Changed("key") && p.key == "" {
 		return &usageError{msg: "--key is empty: pass the tenant key, or omit --key to probe the daemon's browser"}
+	}
+	if p.timeout <= 0 {
+		return &usageError{msg: fmt.Sprintf("invalid --timeout %v: must be positive", p.timeout)}
 	}
 	q := url.Values{}
 	if p.strict {
@@ -89,7 +108,7 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	// validated as host:port above. An empty RawQuery yields no "?", and
 	// NewRequestWithContext still rejects anything malformed that slips through.
 	u := (&url.URL{Scheme: "http", Host: p.addr, Path: "/ping", RawQuery: q.Encode()}).String()
-	ctx, cancel := context.WithTimeout(cmd.Context(), 100*time.Second)
+	ctx, cancel := context.WithTimeout(cmd.Context(), p.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

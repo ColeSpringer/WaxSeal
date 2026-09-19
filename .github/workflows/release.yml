@@ -23,6 +23,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # CI never sees a tag push, and nothing enforced that a tag sat on main, so a
+  # tag on a stray commit, or one whose provider pin has fallen behind the root,
+  # used to publish binaries and an image regardless. This job is the gate: the
+  # same Makefile targets the local gate runs, so the two cannot drift, plus the
+  # ancestry check. Nothing downstream starts until it is green.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The full history is what brings refs/remotes/origin/main with it.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Uncached, for the reason the binaries job is: this workflow publishes,
+          # so nothing restored from an earlier run gets to decide whether a
+          # release goes out. ci.yml caches because it publishes nothing.
+          cache: false
+      # HEAD, not the event SHA: an annotated tag points at the tag object, and
+      # the checkout has already resolved that to the commit.
+      - name: the tag is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main; nothing will be published"
+            exit 1
+          fi
+      - name: gates
+        run: make fmt-check tidy-check vet test consumer-check
+
   # Build the version-stamped Linux, macOS, and Windows binaries and attach them,
   # plus a SHA256SUMS manifest, to the release for the tag. Normally the release is
   # already there, published by hand with written notes, and it keeps its body
@@ -33,6 +67,7 @@ jobs:
   # Chromium or Chrome at runtime. RELEASE_PLATFORMS in the Makefile is the list;
   # the cross job in ci.yml runs the same `make release` on every push.
   binaries:
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -71,14 +106,16 @@ jobs:
           # draft beside the real v1.2.0. The pre-1.2.0 spelling of this step
           # was not --draft, so the create did fail and `|| true` was enough.
           #
-          # The count comes from `gh release list` rather than `gh release
-          # view`: list reports drafts as well as published releases, so a
-          # re-run of this job cannot pile a second draft onto one it created
-          # earlier. Nothing here swallows a failure any more, since a create
-          # that fails leaves the upload below nowhere to put the assets.
-          existing=$(gh release list --limit 100 --json tagName \
-            --jq '[.[] | select(.tagName == env.GITHUB_REF_NAME)] | length')
-          if [ "$existing" -eq 0 ]; then
+          # The lookup goes through the releases endpoint rather than `gh
+          # release view`: that endpoint reports drafts as well as published
+          # releases, so a re-run of this job cannot pile a second draft onto one
+          # it created earlier, and --paginate walks the whole list rather than
+          # trusting a page cap to reach far enough back. Nothing here swallows a
+          # failure any more, since a create that fails leaves the upload below
+          # nowhere to put the assets.
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.tag_name == env.GITHUB_REF_NAME) | .id')
+          if [ -z "$existing" ]; then
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
               --draft --notes "" --verify-tag
           fi
@@ -102,6 +139,7 @@ jobs:
   # this build resolves `apt-get install chromium` fresh, so without it a release
   # could publish an image no workflow ever started.
   image:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

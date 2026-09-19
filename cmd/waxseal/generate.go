@@ -79,6 +79,8 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Remove profiles left by a run that could not clean up after itself.
+	browser.ReapStaleProfiles(logger)
 	sess, err := browser.Launch(ctx, g.video, browser.Options{Headful: g.headful, NormalizeUA: !g.headful, Logger: logger})
 	if err != nil {
 		fmt.Fprintln(stdout, "{}")

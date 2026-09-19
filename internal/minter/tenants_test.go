@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/colespringer/waxseal/internal/browser"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,6 +248,37 @@ type fakeProber struct {
 func (f *fakeProber) Health(context.Context) (browser.Recovery, error) { return f.rec, f.err }
 func (f *fakeProber) ProbeFailures() int64                             { return f.probes }
 func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunchs }
+
+// A Minter handed out after the registry closed is born closed, but it must also
+// be unable to launch a browser of its own: NewMinter's default launcher calls
+// browser.Launch, which would start a second Chromium outside the pool and leave
+// it running. Both paths that build a tenant Minter go through newMinter, so the
+// launcher is always the registry's, and after Close the registry's is what a
+// shut-down pool answers with.
+func TestMinterAfterCloseLaunchesThroughTheRegistry(t *testing.T) {
+	// ChromeBin names nothing, so the regression this guards against fails at the
+	// exec instead of starting a real Chromium and leaking it out of a package
+	// that otherwise never launches one.
+	opts := browser.Options{ChromeBin: filepath.Join(t.TempDir(), "no-such-chrome")}
+	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, opts, 0, 0, 0)
+	var calls int
+	tn.newSession = func(context.Context, string) (minterSession, error) {
+		calls++
+		return nil, browser.ErrPoolClosed // what poolSession answers once the pool is gone
+	}
+	tn.Close()
+
+	m, _, err := tn.Minter("K")
+	if err != nil {
+		t.Fatalf("Minter after Close: %v", err)
+	}
+	if _, err := m.launch(context.Background()); !errors.Is(err, browser.ErrPoolClosed) {
+		t.Fatalf("launch after Close = %v, want browser.ErrPoolClosed", err)
+	}
+	if calls != 1 {
+		t.Errorf("registry launcher calls = %d, want 1: the Minter kept a browser launcher of its own", calls)
+	}
+}
 
 // A registry built without a pool has no browser to lose: the check answers
 // and the counters read zero, so handler tests need no pool to run a probe.

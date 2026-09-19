@@ -16,39 +16,16 @@ follow-up and remove both entries.
 
 ## WaxTap
 
-- **`potoken.PlayerContext` cannot carry the context's user agent.**
-  `/player-context` now sends `user_agent`, the session identity the
-  context was minted under and the same value `/session` exports,
-  answering WaxTap's own ask for it (its `docs/upstream-requests.md`,
-  2026-09-16). `potoken.PlayerContext` has `ClientVersion` only and the
-  sidecar's `playerContextResponse` reads no `user_agent`, so the context
-  arm streams under WaxTap's own user agent with the context's client
-  version, which is the same coherence gap the session arm had before
-  `potoken.Session` grew the pair. Wanted: `UserAgent` on
-  `potoken.PlayerContext`, read by the sidecar and applied through
-  `webContextProfile` the way the session's is. Shipped workaround: none
-  is needed. Delivery is full length under WaxTap's identity, as WaxTap's
-  own ask says, so this is coherence rather than an observed failure. The
-  test that will notice the field landing is the mapping pin in
-  `provider_test.go`. Opened 2026-09-17.
-
-- **`SidecarResponseError` cannot carry the cause, and the retry rule is
-  unexported.** `provider/` translates a `*client.APIError` into a
-  `*waxtap.SidecarResponseError` so WaxTap classifies and waits exactly
-  as it does for its own sidecar. Two things follow from the types.
-  `SidecarResponseError` has no field for an underlying error and its
-  `Unwrap` is reserved for the playability verdict, so the original
-  `*client.APIError` cannot travel with it: a consumer that reaches
-  through `provider/` for `errors.AsType[*client.APIError]` no longer
-  finds one, and has to use the WaxSeal `client` package directly for
-  that. And `sidecarCall`, `sidecarRetryWait`, and
-  `retryableSidecarStatus` are unexported, so the one-retry rule is
-  copied into `provider/call` rather than shared, and the two can drift
-  apart silently. Wanted: a `Cause error` on `SidecarResponseError`
-  (reported, not unwrapped, so the verdict `Unwrap` is unchanged), and
-  the retry rule exported in some form, for example a
-  `RetryAfterFor(err) (time.Duration, bool)`. Shipped workaround: the
-  copy mirrors WaxTap `9a53a55` line for line and
-  `TestProviderRetriesOnceAfterStatedWait` pins every arm of it, so a
-  drift is at least visible in this repo's own tests. Opened 2026-09-17,
-  from a review of the adapter change.
+- **The sidecar pause policy is unexported.** WaxTap took the retry rule as
+  `SidecarRetryWait` (2026-09-19), so `provider/call` now asks WaxTap whether a
+  refusal earns a retry and how long to wait. The other half of that decision,
+  what to do when the caller's own budget cannot fit the wait, is
+  `httpx.PauseBlocked` in `internal/httpx`, so `provider/call` still carries a
+  copy of it: a cancellation outranks the pending refusal, a deadline that
+  cannot fit the wait plus a second of headroom returns the refusal now, and the
+  comparison refuses at equality. Wanted: that policy exported beside
+  `SidecarRetryWait`, for example `PauseBlocked(ctx, wait, pending) error`, so
+  one rule governs both adapters. Shipped workaround: the copy is aligned to
+  WaxTap's, including the boundary, and two arms of
+  `TestProviderRetriesOnceAfterStatedWait` bracket it, so a drift shows up in
+  this repo's own tests. Opened 2026-09-19, when the retry half landed.

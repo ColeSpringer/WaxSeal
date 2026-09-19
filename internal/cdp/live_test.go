@@ -4,6 +4,9 @@ package cdp
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,8 +19,9 @@ import (
 
 // These live tests exercise the pipe transport against a real Chromium. They
 // verify remote-debugging-pipe through local launcher wrappers, eval context
-// recovery after navigation, connection teardown after process death, command-pipe
-// EOF shutdown, incognito isolation, WaitCrash, and handshake-timeout cleanup.
+// recovery after navigation, the Accept-Language override, connection teardown
+// after process death, command-pipe EOF shutdown, incognito isolation, WaitCrash,
+// and handshake-timeout cleanup.
 // They skip when Chromium is unavailable so the offline suite remains portable.
 
 func findChrome(t *testing.T) string {
@@ -199,6 +203,78 @@ func TestLiveNavigateWaitLoadEval(t *testing.T) {
 	}
 	if got.Int() != 7 {
 		t.Errorf("post-navigate eval = %d, want 7 (context not re-resolved?)", got.Int())
+	}
+}
+
+// The Accept-Language override is what makes the bot wall's phrase deterministic
+// whatever the host's locale, so the mechanism is proved against a real browser
+// rather than assumed. The override takes Chrome's pref-style list: Chrome
+// derives the header from it, appending its own q-values, and mirrors the raw
+// list into navigator.languages. A value carrying q-values of its own would ship
+// a malformed header and an anomalous language list, which is why the exact
+// bytes are asserted here.
+func TestLiveAcceptLanguageOverride(t *testing.T) {
+	b := spawnForTest(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ver, err := b.Context(ctx).Version()
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+
+	header := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			select {
+			case header <- r.Header.Get("Accept-Language"):
+			default:
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, "<!doctype html><title>waxseal language</title><p>ok\n")
+	}))
+	defer srv.Close()
+
+	page, err := b.Context(ctx).Page(TargetCreateTarget{URL: "about:blank"})
+	if err != nil {
+		t.Fatalf("page: %v", err)
+	}
+	p := page.Context(ctx)
+	// A list no runner defaults to, so a pass cannot come from the host's own
+	// locale, under the browser's real user agent: only the language is under test.
+	if err := p.SetUserAgentOverride(&NetworkSetUserAgentOverride{
+		UserAgent:      ver.UserAgent,
+		AcceptLanguage: "fr-CA,fr",
+	}); err != nil {
+		t.Fatalf("set user agent override: %v", err)
+	}
+	if err := p.Navigate(srv.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	if err := p.WaitLoad(); err != nil {
+		t.Fatalf("wait load: %v", err)
+	}
+
+	select {
+	case got := <-header:
+		if got != "fr-CA,fr;q=0.9" {
+			t.Errorf("Accept-Language = %q, want %q", got, "fr-CA,fr;q=0.9")
+		}
+	default:
+		t.Fatal("the page never reached the test server")
+	}
+	for _, tc := range []struct{ js, want string }{
+		{`() => navigator.language`, "fr-CA"},
+		{`() => JSON.stringify(navigator.languages)`, `["fr-CA","fr"]`},
+	} {
+		got, err := p.Eval(tc.js)
+		if err != nil {
+			t.Fatalf("eval %s: %v", tc.js, err)
+		}
+		if got.Str() != tc.want {
+			t.Errorf("%s = %q, want %q", tc.js, got.Str(), tc.want)
+		}
 	}
 }
 
