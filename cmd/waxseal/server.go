@@ -280,7 +280,9 @@ func readKeyFile(source, path string) (string, error) {
 	}
 	v := strings.TrimSpace(strings.TrimPrefix(string(b), "\ufeff"))
 	if v == "" {
-		return "", &usageError{msg: fmt.Sprintf("%s %q is empty", source, path)}
+		// Plain quotes rather than %q, which would double every separator in a
+		// Windows path and name a file the operator never passed.
+		return "", &usageError{msg: fmt.Sprintf(`%s "%s" is empty`, source, path)}
 	}
 	return v, nil
 }

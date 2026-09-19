@@ -70,14 +70,15 @@ func markerLockable(marker string) bool {
 //
 // The first pass runs with the lock held, so a concurrent reaper still reads a
 // live owner and leaves the tree alone. It cannot delete creator.pid or the
-// directory holding it, so the lock is released and the removal retried; what a
-// reaper can catch unlocked is one file, for two syscalls. The retry loop is for
-// Chromium's own handles, which close asynchronously after the job kill.
+// directory holding it, so the lock is released and the removal retried; from
+// there a concurrent reaper may join in, which only helps, since both are
+// removing the same abandoned tree. The retry loop is for Chromium's own
+// handles, which close asynchronously after the job kill.
 func cleanupProfile(h profileHandle) {
 	if h.dir != "" && h.lock != nil {
 		// Expected to fail on creator.pid and on the directory itself; what it
 		// removes is everything Chromium left behind.
-		_ = os.RemoveAll(h.dir)
+		_ = removeProfile(h.dir)
 	}
 	if h.lock != nil {
 		_ = h.lock.Close()
@@ -87,15 +88,13 @@ func cleanupProfile(h profileHandle) {
 	}
 	deadline := time.Now().Add(profileRemoveTimeout)
 	for {
-		if err := os.RemoveAll(h.dir); err == nil {
+		if err := removeProfile(h.dir); err == nil {
 			return
 		}
 		if time.Now().After(deadline) {
-			// RemoveAll keeps going past a file it cannot delete, so by now it has
-			// taken creator.pid and left the directory markerless, which the reaper
-			// retains rather than collects. Put the marker back so the next startup
-			// sweep finds an unlocked, marked directory and removes it.
-			_ = writeMarker(h.dir)
+			// The handles outlived the budget. The marker is still there and still
+			// dated from the launch, so date it abandoned for the next startup sweep.
+			_ = markProfileAbandoned(h.dir)
 			return
 		}
 		time.Sleep(profileRemoveInterval)

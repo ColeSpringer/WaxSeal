@@ -50,7 +50,11 @@ func markerLockable(marker string) bool {
 // A flock does not stop the unlink, so removing first is free here.
 func cleanupProfile(h profileHandle) {
 	if h.dir != "" {
-		_ = os.RemoveAll(h.dir)
+		if err := removeProfile(h.dir); err != nil {
+			// The removal did not finish, so the marker is still dated from the
+			// launch. Date it abandoned for the next startup sweep.
+			_ = markProfileAbandoned(h.dir)
+		}
 	}
 	if h.lock != nil {
 		_ = h.lock.Close()

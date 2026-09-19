@@ -39,6 +39,55 @@ func writeMarker(dir string) error {
 	return os.WriteFile(filepath.Join(dir, creatorMarkerFile), []byte(strconv.Itoa(os.Getpid())), 0o600)
 }
 
+// markProfileAbandoned marks a directory that is being left behind, so that a
+// sweep collects it. The marker is dated past markerGrace, which is there for a
+// launch that has not taken its lock yet: this directory has no owner left to
+// wait for, and a marker dated now would only hide it from the next sweep.
+func markProfileAbandoned(dir string) error {
+	if err := writeMarker(dir); err != nil {
+		return err
+	}
+	stale := time.Now().Add(-2 * markerGrace)
+	return os.Chtimes(filepath.Join(dir, creatorMarkerFile), stale, stale)
+}
+
+// removeProfile removes a profile directory, taking creator.pid last. RemoveAll
+// on the whole directory would keep going past a file it cannot delete and
+// unlink the marker on the way, and a markerless directory is one every later
+// sweep retains rather than collects. Whatever stops the removal, a pinned file
+// or a kill, has to leave a directory the next sweep can still find.
+func removeProfile(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var firstErr error
+	for _, e := range entries {
+		if e.Name() == creatorMarkerFile {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := os.Remove(filepath.Join(dir, creatorMarkerFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		// The directory outlived its marker: something landed in it after the scan,
+		// or the directory itself is held. Mark it again for a later sweep.
+		_ = markProfileAbandoned(dir)
+		return err
+	}
+	return nil
+}
+
 // markProfileDir writes the marker and takes its ownership lock, returning the
 // open file that holds the lock (nil if marking or locking failed). The caller
 // owns the returned file and closes it through profileHandle.cleanup, which knows
@@ -114,7 +163,7 @@ func ReapStaleProfiles(log *slog.Logger) {
 	}
 
 	for _, st := range classifyStaleProfiles(states, markerLockable) {
-		if err := os.RemoveAll(st.path); err != nil {
+		if err := removeProfile(st.path); err != nil {
 			log.Warn("waxseal: reap stale profile directory failed", "dir", st.path, "err", err)
 			continue
 		}
