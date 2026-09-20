@@ -878,10 +878,23 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 		}
 	})
 
-	// The two arms below bracket the pause policy's boundary, which is the one
-	// piece of WaxTap's behaviour this adapter still carries a copy of: a budget
-	// has to clear the wait plus a second of headroom, and a budget that does not
-	// gets the refusal instead of a sleep it cannot finish.
+	// The arms below run WaxTap's pause policy through this adapter on the
+	// caller's own budget, so a wrapper that dropped the context, or slept before
+	// asking, would pass the table above and fail here: a budget has to clear the
+	// wait plus a second of headroom, one that does not gets the refusal instead
+	// of a sleep it cannot finish, and a wait the context ends early returns the
+	// refusal for a deadline and the cancellation for a caller giving up.
+	//
+	// refuseAll answers every request with a 502 stating retryAfter and counts
+	// them, for the arms that never reach a second attempt.
+	refuseAll := func(calls *int, retryAfter string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			*calls++
+			w.Header().Set("Retry-After", retryAfter)
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "player-context-failed"})
+		}
+	}
 	t.Run("a budget that clears the wait plus the headroom retries", func(t *testing.T) {
 		slept = nil
 		var calls int
@@ -910,12 +923,7 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 	t.Run("a budget too short for the wait gets the refusal now", func(t *testing.T) {
 		slept = nil
 		var calls int
-		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
-			calls++
-			w.Header().Set("Retry-After", "30")
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "player-context-failed"})
-		})
+		p, done := newProvider(refuseAll(&calls, "30"))
 		defer done()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -926,6 +934,53 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 		}
 		if calls != 1 || len(slept) != 0 {
 			t.Errorf("requests = %d, waits = %v, want one request and no wait", calls, slept)
+		}
+	})
+
+	t.Run("a deadline that expires during the wait returns the refusal", func(t *testing.T) {
+		undo := provider.SetSleepForTest(func(context.Context, time.Duration) error { return context.DeadlineExceeded })
+		defer undo()
+		var calls int
+		p, done := newProvider(refuseAll(&calls, "1"))
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		if _, ok := errors.AsType[*waxtap.SidecarResponseError](err); !ok {
+			t.Fatalf("err = %v (%T), want the refusal the deadline cut short, not a bare timeout", err, err)
+		}
+		if calls != 1 {
+			t.Errorf("requests = %d, want one: a wait cut short by a deadline earns no retry", calls)
+		}
+	})
+
+	t.Run("a caller that leaves during the wait gets its cancellation, not the wait", func(t *testing.T) {
+		// The real wait, handed the caller's context, which the caller ends the
+		// moment the wait starts: after the refusal, so a retry is due, and before
+		// any of the wait has been served. A wait given a context of its own would
+		// hold the caller for the whole stated wait, which is long enough here to
+		// be unmistakable and is never served when the wiring is right.
+		const stated = 30 * time.Second
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		undo := provider.SetSleepForTest(func(ctx context.Context, d time.Duration) error {
+			cancel()
+			return provider.RealSleep(ctx, d)
+		})
+		defer undo()
+		var calls int
+		p, done := newProvider(refuseAll(&calls, "30"))
+		defer done()
+
+		start := time.Now()
+		_, err := p.ProvidePlayerContext(ctx, "VID")
+		if elapsed := time.Since(start); elapsed >= stated {
+			t.Errorf("the call took %v: the caller's cancellation did not end the %v wait", elapsed, stated)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v (%T), want the cancellation to outrank the refusal", err, err)
+		}
+		if calls != 1 {
+			t.Errorf("requests = %d, want one: the caller gave up", calls)
 		}
 	})
 

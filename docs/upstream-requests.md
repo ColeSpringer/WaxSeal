@@ -16,16 +16,4 @@ follow-up and remove both entries.
 
 ## WaxTap
 
-- **The sidecar pause policy is unexported.** WaxTap took the retry rule as
-  `SidecarRetryWait` (2026-09-19), so `provider/call` now asks WaxTap whether a
-  refusal earns a retry and how long to wait. The other half of that decision,
-  what to do when the caller's own budget cannot fit the wait, is
-  `httpx.PauseBlocked` in `internal/httpx`, so `provider/call` still carries a
-  copy of it: a cancellation outranks the pending refusal, a deadline that
-  cannot fit the wait plus a second of headroom returns the refusal now, and the
-  comparison refuses at equality. Wanted: that policy exported beside
-  `SidecarRetryWait`, for example `PauseBlocked(ctx, wait, pending) error`, so
-  one rule governs both adapters. Shipped workaround: the copy is aligned to
-  WaxTap's, including the boundary, and two arms of
-  `TestProviderRetriesOnceAfterStatedWait` bracket it, so a drift shows up in
-  this repo's own tests. Opened 2026-09-19, when the retry half landed.
+No open requests.

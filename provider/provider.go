@@ -3,9 +3,9 @@
 // depend on WaxTap.
 //
 // Failures are reported as WaxTap's own sidecar error types, and a transient one
-// is retried once after the daemon's stated wait, on the rule WaxTap's own HTTP
-// sidecar retries by. A consumer therefore classifies refusals and waits the
-// same way whichever of the two adapters it wires. The daemon's own error rides
+// is retried once after a wait, on the rule WaxTap's own HTTP sidecar retries
+// and pauses by. A consumer therefore classifies refusals and waits the same
+// way whichever of the two adapters it wires. The daemon's own error rides
 // in the sidecar error's Cause for a caller that knows this adapter; nothing
 // unwraps it, so classification is unchanged, and a body that was not the
 // daemon's envelope travels no further than this package.
@@ -168,15 +168,10 @@ func capRunes(s string, n int) string {
 }
 
 // call runs fn and retries it once when WaxTap's own sidecar rule says the
-// translated failure earns it.
-//
-// The pause policy mirrors WaxTap's httpx.PauseBlocked, which is internal to
-// WaxTap and so is kept here rather than called: sleeping into a deadline is the
-// waste a stated wait exists to avoid, so a cancellation returns the
-// cancellation, and a budget that cannot fit the wait plus a second of headroom
-// returns the refusal now, refusing at equality as WaxTap's does. A deadline
-// that expires during the sleep returns the refusal too: it is the error that
-// explains the run.
+// translated failure earns it, pausing under WaxTap's own policy too: a caller
+// that has gone away gets its cancellation, a budget that cannot fit the wait
+// gets the refusal now, and a deadline that expires mid-wait gets the refusal
+// rather than a bare timeout, since it is what explains the run.
 func (p *Provider) call(ctx context.Context, label string, fn func() error) error {
 	err := fn()
 	if err == nil {
@@ -186,19 +181,13 @@ func (p *Provider) call(ctx context.Context, label string, fn func() error) erro
 	if !retry {
 		return err
 	}
-	if cerr := ctx.Err(); cerr != nil && !errors.Is(cerr, context.DeadlineExceeded) {
-		return cerr
+	if berr := waxtap.PauseBlocked(ctx, wait, err); berr != nil {
+		return berr
 	}
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= wait+time.Second {
-		return err
-	}
-	p.log.Info("waxseal/provider: retrying after the daemon's stated wait",
+	p.log.Info("waxseal/provider: retrying once after a wait",
 		"endpoint", label, "wait", wait, "code", sidecarCode(err))
 	if serr := sleep(ctx, wait); serr != nil {
-		if !errors.Is(serr, context.DeadlineExceeded) {
-			return serr
-		}
-		return err
+		return waxtap.PauseInterrupted(serr, err)
 	}
 	return fn()
 }
