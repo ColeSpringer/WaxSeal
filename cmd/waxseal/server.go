@@ -53,7 +53,8 @@ const (
 	// defaultShutdownTimeout bounds the drain on SIGTERM or SIGINT. It is sized to
 	// the work a real request does, not to requestProcessTimeout: cold
 	// /player-context calls measure 6 to 10 seconds and first-session establishment
-	// is documented at 10 to 30, so this covers both with roughly twice the headroom.
+	// is documented as typically under ten seconds, so this covers both with real
+	// headroom.
 	// Matching the 3 minute request timeout instead would make `docker compose down`
 	// hang that long against a wedged daemon, since stop_grace_period has to match.
 	// A request still running after a minute is pathological: it is severed, logged,
@@ -70,7 +71,12 @@ func newServerCmd() *cobra.Command {
 			"at 127.0.0.1:4416. Set --host 0.0.0.0 to expose it. With --tenant-keys,\n" +
 			"each key receives an isolated browser context. Without it, the server is\n" +
 			"keyless. On SIGTERM or SIGINT it drains in-flight requests for up to\n" +
-			"--shutdown-timeout (default 60s) before tearing the browser down.",
+			"--shutdown-timeout (default 60s) before tearing the browser down.\n\n" +
+			"Three settings are read from the environment only:\n" +
+			"  WAXSEAL_MINT_SEPARATION  spacing kept between a token mint and a context\n" +
+			"                           establishment; a positive Go duration, default 12s\n" +
+			"  WAXSEAL_CHROME_BIN       the Chromium binary, for every command\n" +
+			"  WAXSEAL_UA_HINTS         client-hint source, real (default) or synthetic",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
 	}
@@ -89,7 +95,9 @@ func newServerCmd() *cobra.Command {
 		"recycle a session on its next streaming handoff once older than this Go duration\n"+
 			"(flag > WAXSEAL_STREAMING_MAX_AGE env > 45m default; \"0\" disables). The\n"+
 			"first streaming request after a recycle waits for re-attestation and\n"+
-			"establishment. Idle sessions are not recycled. Minimum 1m.")
+			"establishment. Idle sessions are not recycled. Minimum 1m. The deadline is\n"+
+			"jittered by up to ten percent so a fleet does not recycle in lockstep;\n"+
+			"streaming_seconds_until_recycle counts down to the jittered deadline.")
 	f.StringVar(&o.reportDebounce, "report-debounce", "",
 		fmt.Sprintf("sustained spacing between consumer-report-driven (POST /report) session\n"+
 			"recycles (flag > WAXSEAL_REPORT_DEBOUNCE env > 5m default). Bursts of up\n"+
@@ -216,6 +224,26 @@ func resolveShutdownTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logg
 	return d, nil
 }
 
+// resolveMintSeparation reads WAXSEAL_MINT_SEPARATION, which has no flag, the
+// way the duration flags are read: blank keeps the default, anything else is a
+// positive Go duration or a usage error, decided before the socket binds.
+func resolveMintSeparation(logger *slog.Logger) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(minter.MintSeparationEnv))
+	d, err := minter.ParseMintSeparation(raw)
+	if err != nil {
+		return 0, &usageError{msg: err.Error()}
+	}
+	switch {
+	case raw == "":
+		logger.Info("mint-separation set", "value", d, "source", "default")
+	case d > minter.MintSeparationWarn:
+		logger.Warn(minter.MintSeparationEnv+" is large; values near the request budget make first contexts time out", "value", d)
+	default:
+		logger.Info("mint-separation set", "value", d, "source", minter.MintSeparationEnv)
+	}
+	return d, nil
+}
+
 // keySource names the four places one piece of key material can come from: a
 // value flag and a file flag, then a value env and a file env. The _FILE envs
 // follow the Docker convention, so a compose file reaches a secret from an
@@ -238,7 +266,13 @@ func resolveKeyMaterial(cmd *cobra.Command, src keySource) (string, error) {
 	case valueSet && fileSet:
 		return "", &usageError{msg: fmt.Sprintf("--%s and --%s are mutually exclusive; pass one", src.valueFlag, src.fileFlag)}
 	case valueSet:
-		return src.value, nil
+		// A flag the operator typed is a choice, so a blank one is refused
+		// rather than falling through to the environment it was meant to override.
+		v := strings.TrimSpace(src.value)
+		if v == "" {
+			return "", &usageError{msg: fmt.Sprintf("--%s is empty: pass a value, or omit the flag", src.valueFlag)}
+		}
+		return v, nil
 	case fileSet:
 		return readKeyFile("--"+src.fileFlag, src.file)
 	}
@@ -255,13 +289,15 @@ func resolveKeyMaterial(cmd *cobra.Command, src keySource) (string, error) {
 	return "", nil
 }
 
-// lookupNonEmpty reads an environment variable, reporting false when it is unset
-// or empty. A blank variable is how a compose file says nothing, and counting it
-// as a value would put it in conflict with the file variable beside it and
-// refuse to start over a setting the operator never made.
+// lookupNonEmpty reads an environment variable, reporting false when it is
+// unset, empty, or only whitespace. A blank variable is how a compose file says
+// nothing, and counting it as a value would put it in conflict with the file
+// variable beside it and refuse to start over a setting the operator never made.
 func lookupNonEmpty(name string) (string, bool) {
-	if v, ok := os.LookupEnv(name); ok && v != "" {
-		return v, true
+	if v, ok := os.LookupEnv(name); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return v, true
+		}
 	}
 	return "", false
 }
@@ -297,30 +333,32 @@ func unbracketHost(host string) string {
 	return host
 }
 
+// validatePort rejects a port outside the range a listener can bind. It runs
+// with the rest of the configuration, before anything is announced, and again
+// inside bindListener for callers that reach it directly.
+func validatePort(port int) error {
+	if port < 0 || port > 65535 {
+		return &usageError{msg: fmt.Sprintf("invalid --port %d: must be 0-65535", port)}
+	}
+	return nil
+}
+
 // bindListener validates the port and binds the listen address. An invalid port
 // is a usage error. Other bind failures retain the error returned by net.Listen.
 // Port 0 asks the operating system to select an available port.
 func bindListener(host string, port int) (net.Listener, error) {
-	if port < 0 || port > 65535 {
-		return nil, &usageError{msg: fmt.Sprintf("invalid --port %d: must be 0-65535", port)}
+	if err := validatePort(port); err != nil {
+		return nil, err
 	}
 	return net.Listen("tcp", net.JoinHostPort(unbracketHost(host), strconv.Itoa(port)))
 }
 
-// isExposedHost reports whether host may accept connections from outside the
-// local machine. Only "localhost" and literal loopback addresses are considered
-// private. All other values, including wildcard addresses and hostnames, are
-// considered exposed.
-func isExposedHost(host string) bool {
-	host = unbracketHost(host)
-	if host == "localhost" {
-		return false
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return true
-	}
-	return !ip.IsLoopback()
+// isExposedAddr reports whether the bound address accepts connections from
+// off the machine. The listener's own address is what counts: "LOCALHOST" and
+// the host's own name resolve to loopback, and 0.0.0.0 binds dual-stack.
+func isExposedAddr(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	return !ok || !tcp.IP.IsLoopback()
 }
 
 // logMetricsAccess reports the effective /metrics access mode. Metrics flags
@@ -347,9 +385,9 @@ func logMetricsAccess(logger *slog.Logger, keyed, metricsPublic, metricsKeySet b
 
 // warnKeylessExposure reports a configuration that exposes guest identity data
 // from an unauthenticated daemon.
-func warnKeylessExposure(logger *slog.Logger, keyed bool, host string) {
-	if !keyed && isExposedHost(host) {
-		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "host", host)
+func warnKeylessExposure(logger *slog.Logger, keyed bool, addr net.Addr) {
+	if !keyed && isExposedAddr(addr) {
+		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "addr", addr.String())
 	}
 }
 
@@ -364,10 +402,13 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if o.verbose {
 		level = "debug"
 	}
-	logger := buildLogger(level, os.Stdout) // daemon logs to stdout
+	logger := buildLogger(level, cmd.OutOrStdout()) // daemon logs to stdout
 
 	// Validate configuration before binding a socket or launching Chromium.
 	if err := validateLandingVideo(o.video); err != nil {
+		return failStartup(logger, err)
+	}
+	if err := validatePort(o.port); err != nil {
 		return failStartup(logger, err)
 	}
 	streamingMaxAge, err := resolveStreamingMaxAge(cmd, o, logger)
@@ -379,6 +420,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		return failStartup(logger, err)
 	}
 	drainTimeout, err := resolveShutdownTimeout(cmd, o, logger)
+	if err != nil {
+		return failStartup(logger, err)
+	}
+	mintSeparation, err := resolveMintSeparation(logger)
 	if err != nil {
 		return failStartup(logger, err)
 	}
@@ -402,6 +447,11 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, &usageError{msg: err.Error()})
 	}
+	if metricsKey != "" {
+		if err := server.CheckKeyChars(metricsKey); err != nil {
+			return failStartup(logger, &usageError{msg: "metrics key: " + err.Error()})
+		}
+	}
 	// Reject a metrics key that is also a tenant key before launching the browser.
 	// Name the tenant label, never the key material. server.New enforces the same
 	// rule for programmatic callers.
@@ -414,6 +464,12 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	// without running browser startup and attestation.
 	ln, err := bindListener(o.host, o.port)
 	if err != nil {
+		// A backstop: validatePort above already refused a bad port, so this only
+		// fires if that check ever moves. Without it the exit code would quietly
+		// drop from 2 to 1.
+		if ue, ok := errors.AsType[*usageError](err); ok {
+			return failStartup(logger, ue)
+		}
 		logger.Error("startup: bind listen address failed", "err", err)
 		return err
 	}
@@ -430,10 +486,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	browser.ReapStaleProfiles(logger)
 	// Warn before browser startup when unauthenticated callers can access the guest
 	// identity.
-	warnKeylessExposure(logger, len(keys) > 0, o.host)
+	warnKeylessExposure(logger, len(keys) > 0, ln.Addr())
 	logMetricsAccess(logger, len(keys) > 0, o.metricsPublic, metricsKey != "")
 
-	srv, err := server.New(server.Config{
+	srv, err := server.NewWithContext(cmd.Context(), server.Config{
 		Addr:            ln.Addr().String(),
 		Video:           o.video,
 		Headful:         o.headful,
@@ -441,10 +497,15 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		Logger:          logger,
 		StreamingMaxAge: streamingMaxAge,
 		ReportDebounce:  reportDebounce,
+		MintSeparation:  mintSeparation,
 		MetricsPublic:   o.metricsPublic,
 		MetricsKey:      metricsKey,
 	})
 	if err != nil {
+		if cmd.Context().Err() != nil {
+			logger.Info("interrupted during browser launch; exiting")
+			return nil
+		}
 		logger.Error("startup: launch browser failed", "err", err)
 		return err
 	}
@@ -466,6 +527,14 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	}
 	cancel()
 	if err != nil {
+		if cmd.Context().Err() != nil {
+			// A stop requested during warm-up is a clean stop, as it is once
+			// serving: a supervisor that restarts on non-zero must not see the
+			// two differently.
+			logger.Info("interrupted during startup checks; shutting down")
+			_ = srv.Shutdown(context.Background())
+			return nil
+		}
 		logger.Error("startup checks failed", "err", err)
 		_ = srv.Shutdown(context.Background())
 		return err
@@ -473,7 +542,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if len(keys) == 0 {
 		logger.Info("mode: keyless single-tenant")
 	} else {
-		logger.Info("mode: multi-tenant", "tenants", len(keys))
+		logger.Info("mode: multi-tenant", "configured_tenants", len(keys))
 	}
 
 	errCh := make(chan error, 1)
@@ -485,33 +554,45 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	}()
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if err != nil {
+			stop()
 			logger.Error("listen failed", "err", err)
 			_ = srv.Shutdown(context.Background())
 			return err
 		}
 	}
-	logger.Info("shutting down", "drain_timeout", drainTimeout)
-	shutCtx, c := context.WithTimeout(context.Background(), drainTimeout)
+	// A second signal during the drain cuts it short: the drain context is
+	// cancelled, Shutdown returns, and the browser is torn down at once. This
+	// registers before the first handler is released, so a signal arriving
+	// between the two is caught by one of them rather than killing the process
+	// through the default disposition.
+	sigCtx, stopSecond := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSecond()
+	stop() // the first signal is consumed; the drain's own handler owns the rest
+	logger.Info("shutting down; a second signal cuts the drain short", "drain_timeout", drainTimeout)
+	shutCtx, c := context.WithTimeout(sigCtx, drainTimeout)
 	defer c()
-	if err := srv.Shutdown(shutCtx); err != nil {
-		// The browser and its profile are torn down by Shutdown regardless of the
-		// drain result, so a drain budget that simply ran out
-		// (context.DeadlineExceeded, wrapped or bare) is routine: it is a warning
-		// about severed connections, not a failed stop. Any other error means the
-		// stop itself failed, and is returned so the existing exit-code mapping
-		// reports a real failure instead of every busy shutdown logging as a
-		// routine warning.
-		if !shutdownOutcome(err) {
-			logger.Error("shutdown failed", "err", err, "drain_timeout", drainTimeout)
-			return err
-		}
+	err = srv.Shutdown(shutCtx)
+	switch {
+	case err == nil:
+	case sigCtx.Err() != nil && errors.Is(err, context.Canceled):
+		logger.Warn("second signal received; in-flight requests were severed")
+	// The browser and its profile are torn down by Shutdown regardless of the
+	// drain result, so a drain budget that simply ran out is routine: it is a
+	// warning about severed connections, not a failed stop. Any other error
+	// means the stop itself failed, and is returned so the existing exit-code
+	// mapping reports a real failure instead of every busy shutdown logging as
+	// a routine warning.
+	case shutdownOutcome(err):
 		logger.Warn("drain budget expired; in-flight requests were severed", "err", err, "drain_timeout", drainTimeout)
+	default:
+		logger.Error("shutdown failed", "err", err, "drain_timeout", drainTimeout)
+		return err
 	}
+	logger.Info("waxseal server stopped")
 	return nil
 }
 

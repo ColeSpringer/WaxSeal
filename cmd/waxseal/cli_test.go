@@ -50,6 +50,41 @@ func TestGenerateRequiresBinding(t *testing.T) {
 	}
 }
 
+// pflag reads the shorthand form "-c=" as the value "=", so the binding a
+// caller thought was empty becomes a one-character one and the daemon mints
+// against it.
+func TestGenerateShorthandEqualsIsUsageError(t *testing.T) {
+	code, stdout, stderr := runCLI("-c=")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if stdout != "{}\n" {
+		t.Errorf("stdout = %q, want %q (the bgutil contract holds for every failure)", stdout, "{}\n")
+	}
+	if !strings.Contains(stderr, "-c=") {
+		t.Errorf("stderr = %q, want it to name the shorthand form", stderr)
+	}
+}
+
+// A one-shot mint logs at warn, so the things a caller should act on reach
+// stderr: an ignored WAXSEAL_UA_HINTS, a fallback-only token, the profile
+// reaper. This is the only test in the package that may trigger the UA-hints
+// warning, which internal/browser guards with a process-wide sync.Once.
+func TestGenerateWarnsAtDefaultLevel(t *testing.T) {
+	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("WAXSEAL_UA_HINTS", "banana")
+	code, _, stderr := runCLI("-c", "aqz-KE-bpKQ")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "ignoring WAXSEAL_UA_HINTS") {
+		t.Errorf("stderr = %q, want the ignored-variable warning. "+
+			"internal/browser guards it with a process-wide sync.Once, so if another "+
+			"test in this package now sets an unrecognised WAXSEAL_UA_HINTS, it spent "+
+			"the warning before this ran", stderr)
+	}
+}
+
 func TestBuildLogger(t *testing.T) {
 	if buildLogger("debug", &bytes.Buffer{}) == nil {
 		t.Error("buildLogger returned nil")
@@ -202,40 +237,48 @@ func TestBindListenerBracketedIPv6(t *testing.T) {
 	}
 }
 
-func TestIsExposedHost(t *testing.T) {
-	for _, h := range []string{"localhost", "127.0.0.1", "::1", "[::1]"} {
-		if isExposedHost(h) {
-			t.Errorf("isExposedHost(%q) = true, want false (loopback)", h)
+// The listener's own address is what decides exposure: "LOCALHOST" and a host
+// name both resolve before the bind, and 0.0.0.0 binds dual-stack.
+func TestIsExposedAddr(t *testing.T) {
+	addr := func(ip string) *net.TCPAddr { return &net.TCPAddr{IP: net.ParseIP(ip), Port: 4416} }
+	for _, ip := range []string{"127.0.0.1", "127.0.1.1", "::1"} {
+		if isExposedAddr(addr(ip)) {
+			t.Errorf("isExposedAddr(%q) = true, want false (loopback)", ip)
 		}
 	}
-	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "[2001:db8::1]", "example.com", ""} {
-		if !isExposedHost(h) {
-			t.Errorf("isExposedHost(%q) = false, want true (exposed)", h)
+	for _, ip := range []string{"0.0.0.0", "::", "192.168.1.5", "2001:db8::1"} {
+		if !isExposedAddr(addr(ip)) {
+			t.Errorf("isExposedAddr(%q) = false, want true (exposed)", ip)
 		}
 	}
 }
 
 // TestWarnKeylessExposure checks that the guest-identity warning is emitted only
-// for keyless daemons bound to an exposed address.
+// for keyless daemons bound to an exposed address, and that it names the address
+// the daemon actually bound.
 func TestWarnKeylessExposure(t *testing.T) {
 	cases := []struct {
 		keyed    bool
-		host     string
+		ip       string
 		wantWarn bool
 	}{
 		{false, "0.0.0.0", true},    // keyless and exposed
 		{false, "::", true},         // keyless and exposed through IPv6 any
 		{false, "127.0.0.1", false}, // loopback stays local
-		{false, "localhost", false}, // loopback name stays local
+		{false, "::1", false},       // IPv6 loopback stays local
 		{true, "0.0.0.0", false},    // keys protect exposed hosts
 	}
 	for _, tt := range cases {
 		var buf bytes.Buffer
-		warnKeylessExposure(slog.New(slog.NewTextHandler(&buf, nil)), tt.keyed, tt.host)
+		a := &net.TCPAddr{IP: net.ParseIP(tt.ip), Port: 4416}
+		warnKeylessExposure(slog.New(slog.NewTextHandler(&buf, nil)), tt.keyed, a)
 		warned := strings.Contains(buf.String(), "keyless daemon exposes")
 		if warned != tt.wantWarn {
-			t.Errorf("warnKeylessExposure(keyed=%v, host=%q): warned=%v, want %v (log=%q)",
-				tt.keyed, tt.host, warned, tt.wantWarn, buf.String())
+			t.Errorf("warnKeylessExposure(keyed=%v, addr=%q): warned=%v, want %v (log=%q)",
+				tt.keyed, tt.ip, warned, tt.wantWarn, buf.String())
+		}
+		if warned && !strings.Contains(buf.String(), "addr="+a.String()) {
+			t.Errorf("log = %q, want it to name the bound address", buf.String())
 		}
 	}
 }
@@ -249,6 +292,7 @@ func clearServerEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"WAXSEAL_STREAMING_MAX_AGE", "WAXSEAL_REPORT_DEBOUNCE", "WAXSEAL_SHUTDOWN_TIMEOUT",
+		"WAXSEAL_MINT_SEPARATION",
 		"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE",
 		"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE",
 	} {
@@ -273,12 +317,21 @@ func keyFile(t *testing.T, content string) string {
 
 func TestServerInvalidPortUsageError(t *testing.T) {
 	clearServerEnv(t)
-	code, _, stderr := runCLI("server", "--port", "99999999")
+	code, stdout, stderr := runCLI("server", "--port", "99999999")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
 	}
 	if !strings.Contains(stderr, "invalid --port") {
 		t.Errorf("stderr = %q, want it to mention the invalid port", stderr)
+	}
+	// Configuration is decided before anything is announced, so the refusal is
+	// the first thing in the log rather than the end of a startup narration.
+	first, _, _ := strings.Cut(stdout, "\n")
+	if !strings.Contains(first, "startup: invalid configuration") {
+		t.Errorf("first log line = %q, want the configuration refusal", first)
+	}
+	if before, _, found := strings.Cut(stdout, "startup: invalid configuration"); found && strings.Contains(before, "streaming-max-age set") {
+		t.Errorf("log = %q, want no settings announced before the refusal", stdout)
 	}
 }
 
@@ -422,6 +475,28 @@ func TestServerTenantKeySources(t *testing.T) {
 			args: []string{"--tenant-keys-file", "$FILE"},
 			want: []string{"--tenant-keys-file", "is empty", "$FILE"},
 		},
+		{
+			// Whitespace is the same nothing a blank variable is, so the file
+			// beside it still wins.
+			name: "a whitespace-only value env counts as unset",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "  ", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			// A flag the operator typed is a choice, so a blank one is loud
+			// rather than a silent fall-through to the environment.
+			name: "a blank value flag is refused",
+			args: []string{"--tenant-keys", ""},
+			want: []string{"--tenant-keys is empty"},
+		},
+		{
+			name:    "a blank value flag does not silently win over the env",
+			args:    []string{"--tenant-keys", " "},
+			env:     map[string]string{"WAXSEAL_TENANT_KEYS": fromB},
+			want:    []string{"--tenant-keys is empty"},
+			notWant: []string{"dupB"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runKeySourceCase(t, "K1", "K2", tc.file, tc.args, tc.env, tc.want, tc.notWant)
@@ -499,6 +574,22 @@ func TestServerMetricsKeySources(t *testing.T) {
 			file: "  \n",
 			args: []string{"--metrics-key-file", "$FILE"},
 			want: []string{"--metrics-key-file", "is empty", "$FILE"},
+		},
+		{
+			// Trimming is applied to every source, not only to a file.
+			name: "the flag value is trimmed",
+			args: []string{"--metrics-key", " KEYA "},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "a metrics key with whitespace inside is refused",
+			args: []string{"--metrics-key", "KE YA"},
+			want: []string{"metrics key", "whitespace"},
+		},
+		{
+			name: "a blank metrics key flag is refused",
+			args: []string{"--metrics-key", ""},
+			want: []string{"--metrics-key is empty"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -660,6 +751,48 @@ func TestMaybeWarnURLBinding(t *testing.T) {
 		if b.Len() != 0 {
 			t.Errorf("maybeWarnURLBinding(%q) wrote %q, want silence", s, b.String())
 		}
+	}
+}
+
+// WAXSEAL_MINT_SEPARATION has no flag, but it is decided before startup like
+// the three duration flags: a value that does not parse stops the daemon rather
+// than warning past it after Chromium is already up.
+func TestResolveMintSeparation(t *testing.T) {
+	for _, tc := range []struct {
+		name, env string
+		want      time.Duration
+		wantErr   bool
+		wantLog   string
+	}{
+		{name: "unset", want: minter.DefaultMintSeparation, wantLog: "mint-separation set"},
+		{name: "explicit", env: "20s", want: 20 * time.Second, wantLog: "mint-separation set"},
+		{name: "unparseable", env: "banana", wantErr: true},
+		{name: "negative", env: "-1s", wantErr: true},
+		{name: "large", env: "5m", want: 5 * time.Minute, wantLog: "large"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("WAXSEAL_MINT_SEPARATION", tc.env)
+			var buf bytes.Buffer
+			got, err := resolveMintSeparation(slog.New(slog.NewTextHandler(&buf, nil)))
+			if tc.wantErr {
+				if _, ok := errors.AsType[*usageError](err); !ok {
+					t.Fatalf("err = %v (%T), want a *usageError", err, err)
+				}
+				if !strings.Contains(err.Error(), "WAXSEAL_MINT_SEPARATION") {
+					t.Errorf("err = %q, want it to name the variable", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("mint separation = %v, want %v", got, tc.want)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("log = %q, want it to contain %q", buf.String(), tc.wantLog)
+			}
+		})
 	}
 }
 
@@ -891,9 +1024,10 @@ func TestResolveShutdownTimeout(t *testing.T) {
 	}
 }
 
-// The 60 second default has to cover first-session establishment (documented at
-// 10 to 30 seconds) with real headroom, or a routine stop under load goes back
-// to severing connections the way the bare 5 second literal it replaced did.
+// The 60 second default has to cover first-session establishment (documented as
+// typically under ten seconds) with real headroom, or a routine stop under load
+// goes back to severing connections the way the bare 5 second literal it
+// replaced did.
 func TestDefaultShutdownTimeoutCoversEstablishment(t *testing.T) {
 	if defaultShutdownTimeout < 45*time.Second {
 		t.Errorf("defaultShutdownTimeout = %v, want at least 45s", defaultShutdownTimeout)
@@ -968,6 +1102,20 @@ func TestDoctorLandingURLRequiresStopAfterLoad(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "--landing-url needs --stop-after-load") {
 		t.Errorf("stderr = %q, want it to name the missing flag", stderr)
+	}
+	// A blank value is a typo or an unset variable, not a request for the
+	// default: with or without --stop-after-load, it is refused before launch.
+	for _, args := range [][]string{
+		{"doctor", "--landing-url", ""},
+		{"doctor", "--stop-after-load", "--landing-url", ""},
+	} {
+		code, _, stderr := runCLI(args...)
+		if code != 2 {
+			t.Errorf("%v: exit = %d, want 2 (stderr=%q)", args, code, stderr)
+		}
+		if !strings.Contains(stderr, "--landing-url is empty") {
+			t.Errorf("%v: stderr = %q, want it to name the empty flag", args, stderr)
+		}
 	}
 }
 

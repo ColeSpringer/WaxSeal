@@ -179,6 +179,14 @@ func (c *Conn) pid() int {
 	return c.cmd.Process.Pid
 }
 
+// exitStatus describes how the process ended, or "" while it runs.
+func (c *Conn) exitStatus() string {
+	if c == nil || c.cmd == nil || c.cmd.ProcessState == nil {
+		return ""
+	}
+	return c.cmd.ProcessState.String()
+}
+
 // readLoop reads NUL-delimited frames and dispatches them. A malformed frame is
 // logged and skipped. A normal EOF/IO error means Chromium is going away, so the
 // connection is torn down; an oversized frame means a live browser is

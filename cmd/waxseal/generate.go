@@ -51,6 +51,11 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		fmt.Fprintln(stdout, "{}")
 		return &usageError{msg: "content-binding (-c) is required"}
 	}
+	if g.contentBinding == "=" {
+		// pflag reads the shorthand form "-c=" (no value) as the value "=".
+		fmt.Fprintln(stdout, "{}")
+		return &usageError{msg: `content-binding "=" is not a binding; "-c=" with no value is read as "=", pass -c <binding>`}
+	}
 	if len(g.contentBinding) > browser.MaxContentBindingBytes {
 		// The bgutil script-provider contract requires {} on stdout for failures.
 		fmt.Fprintln(stdout, "{}")
@@ -69,7 +74,10 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	}
 	// content_binding is opaque, so a URL-shaped value is warned, not rejected.
 	maybeWarnURLBinding(stderr, g.contentBinding)
-	level := "error"
+	// warn, so a one-shot caller sees the things it should act on: an ignored
+	// WAXSEAL_UA_HINTS, a fallback-only token, the profile reaper. A clean run
+	// still writes nothing to stderr, and stdout stays the token or "{}".
+	level := "warn"
 	if g.verbose {
 		level = "info"
 	}

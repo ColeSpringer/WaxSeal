@@ -14,10 +14,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/colespringer/waxseal/internal/browser"
 	"github.com/colespringer/waxseal/internal/minter"
@@ -45,9 +48,9 @@ type Config struct {
 	// MintSeparation overrides, for every tenant, the spacing the minter keeps
 	// between an in-page mint and a context establishment, when positive. A
 	// non-positive value leaves each tenant's Minter to resolve its own
-	// env-derived default (WAXSEAL_MINT_SEPARATION, or 12s). The waxseal server
-	// command does not expose a flag for this; it exists for programmatic callers
-	// such as tests that need a daemon with a specific, known spacing.
+	// env-derived default (WAXSEAL_MINT_SEPARATION, or 12s). There is no flag
+	// for it: the server command resolves the variable itself, so an unparseable
+	// value stops startup, and passes the result here.
 	MintSeparation time.Duration
 
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
@@ -77,9 +80,19 @@ type Server struct {
 // to exercise the server-timeout path.
 var requestProcessTimeout = 3 * time.Minute
 
-// New launches the shared Chromium and builds the service. It does not attest
-// until Warm or the first request. Shutdown tears the browser down.
-func New(cfg Config) (*Server, error) {
+// New launches the shared Chromium and builds the service with a background
+// launch context, so the version handshake runs to its own timeout whatever the
+// caller is doing.
+//
+// Deprecated: use NewWithContext, which can be interrupted. New is kept because
+// it is an exported v1 signature.
+func New(cfg Config) (*Server, error) { return NewWithContext(context.Background(), cfg) }
+
+// NewWithContext launches the shared Chromium and builds the service. ctx bounds
+// that launch, so a signal during the version handshake stops startup instead of
+// waiting it out. It does not attest until Warm or the first request. Shutdown
+// tears the browser down.
+func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -100,7 +113,7 @@ func New(cfg Config) (*Server, error) {
 		NormalizeUA: !cfg.Headful, // remove the HeadlessChrome marker in headless mode
 		Logger:      log,
 	}
-	pool, err := browser.LaunchPool(opts)
+	pool, err := browser.LaunchPool(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +151,7 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 // that would run browser-backed work, so explicit HEAD patterns reject them with
 // 405. HEAD /ping and /metrics stay on the GET handlers: /metrics is cheap, and
 // /ping is a bounded probe with no navigation that some balancers issue as HEAD.
+// Their 405 fallbacks therefore name HEAD in Allow as well, since it is served.
 // Add the same HEAD gate for any future browser-backed GET endpoint. Because
 // authentication runs in endpoint handlers, unsupported methods are rejected before
 // tenant lookup.
@@ -150,14 +164,14 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("HEAD /player-context", methodNotAllowed(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("/player-context", methodNotAllowed(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("GET /ping", s.handlePing)
-	mux.HandleFunc("/ping", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/ping", methodNotAllowed(http.MethodGet, http.MethodHead))
 	mux.HandleFunc("GET /session", s.handleSession)
 	mux.HandleFunc("HEAD /session", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/session", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("POST /report", s.handleReport)
 	mux.HandleFunc("/report", methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet, http.MethodHead))
 	// ServeMux would otherwise answer unknown paths with plaintext 404s. The "/"
 	// fallback gives canonical unknown paths and trailing-slash mismatches the same
 	// JSON envelope as the rest of the API. More specific patterns, including method
@@ -517,6 +531,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writePing(w, strict, reason, err, map[string]any{
 		"ok":                         live,
 		"probe":                      PingProbeTenant,
+		"keyed":                      s.tenants.Keyed(),
 		"tenant":                     label,
 		"attest":                     snap.AttestKind,
 		"generation":                 snap.Generation,
@@ -530,7 +545,8 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 
 // handleDaemonPing answers a keyless probe on a keyed daemon with the shared
 // browser's health. The body carries only whether the daemon has a running
-// browser and, if not, why, which is less than the redacted /metrics already
+// browser and, if not, why, plus keyed, which says nothing a probe:"daemon"
+// answer does not already say. That is less than the redacted /metrics already
 // serves anyone. There is no loopback gate: an orchestrator's probe arrives
 // from the node, not loopback, and a port published through Docker's proxy
 // arrives from the bridge address, so the source address says nothing about
@@ -550,6 +566,7 @@ func (s *Server) handleDaemonPing(w http.ResponseWriter, r *http.Request) {
 	writePing(w, strict, reason, err, map[string]any{
 		"ok":                 err == nil,
 		"probe":              PingProbeDaemon,
+		"keyed":              s.tenants.Keyed(),
 		"browser_relaunched": relaunched,
 	})
 }
@@ -990,6 +1007,9 @@ func decodeErrMsg(err error) string {
 	if errors.As(err, &maxErr) {
 		return "request body too large (max 1 MiB)"
 	}
+	if isReadTimeout(err) {
+		return "request body was not received before the read timeout"
+	}
 	if errors.Is(err, io.EOF) {
 		return "request body is empty"
 	}
@@ -1013,15 +1033,6 @@ func decodeErrMsg(err error) string {
 			return "field \"" + typeErr.Field + "\" has the wrong type"
 		}
 	}
-	// DisallowUnknownFields reports an untyped error whose tail is the client's
-	// own key (`json: unknown field "videoId"`). Echo it so typos are actionable.
-	// The name is the caller's, not Go internals, so this leaks no type info. The
-	// prefix is encoding/json's wording. If a Go upgrade or a json/v2 migration
-	// reworded it, TestDecodeRejectsUnknownField drives the real decoder and would
-	// fail instead of letting this fall back to the generic message.
-	if strings.HasPrefix(err.Error(), "json: unknown field ") {
-		return "request body contains " + strings.TrimPrefix(err.Error(), "json: ")
-	}
 	return "request body contains invalid JSON"
 }
 
@@ -1031,6 +1042,23 @@ func decodeErrMsg(err error) string {
 // When strictFields is true, unknown fields are rejected (see below).
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty, strictFields bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	var raw json.RawMessage
+	err := dec.Decode(&raw)
+	if allowEmpty && errors.Is(err, io.EOF) {
+		return true
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, decodeErrMsg(err))
+		return false
+	}
+	// null would decode into dst as a no-op and read as a missing field; a
+	// number, array, or string as a type error. One message covers all four.
+	// Decode yields the value's own bytes, so there is no surrounding space to
+	// trim; the length check guards the index, not whitespace.
+	if len(raw) == 0 || raw[0] != '{' {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "request body must be a JSON object")
+		return false
+	}
 	// strictFields rejects unknown fields so a client typo fails with a 400 instead
 	// of being silently dropped. Only /report enables it, because its optional
 	// fields (video_id, reason) would otherwise swallow a typo'd key with no error.
@@ -1040,13 +1068,15 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 	// field is required, so a typo already shows up as "video_id is required", and
 	// leniency keeps the body-or-query fallback working.
 	if strictFields {
-		dec.DisallowUnknownFields()
+		// encoding/json matches field names case-insensitively, so
+		// DisallowUnknownFields lets REASON through. The keys are checked
+		// against the struct's tags exactly instead.
+		if msg, ok := unknownField(raw, dst); ok {
+			writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
+			return false
+		}
 	}
-	err := dec.Decode(dst)
-	if allowEmpty && errors.Is(err, io.EOF) {
-		return true
-	}
-	if err != nil {
+	if err := json.Unmarshal(raw, dst); err != nil {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, decodeErrMsg(err))
 		return false
 	}
@@ -1056,14 +1086,79 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 		return true
 	}
 	// MaxBytesReader may not report an oversized body until this second decode,
-	// such as when a valid object is followed by too much whitespace.
+	// such as when a valid object is followed by too much whitespace, and a client
+	// that stopped sending mid-body arrives here as the read timeout.
 	msg := "request body must be a single JSON object"
 	var maxErr *http.MaxBytesError
-	if errors.As(err, &maxErr) {
+	if errors.As(err, &maxErr) || isReadTimeout(err) {
 		msg = decodeErrMsg(err)
 	}
 	writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
 	return false
+}
+
+// unknownField reports the first key of the object in raw, in sorted order,
+// that is not a json tag of dst's struct. Duplicate keys stay lenient.
+func unknownField(raw json.RawMessage, dst any) (string, bool) {
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(raw, &keys) != nil {
+		return "", false // the typed decode below reports the syntax error
+	}
+	allowed := jsonFieldNames(reflect.TypeOf(dst))
+	// The lexicographically smallest unknown key, so a body carrying several
+	// typos names the same one on every request.
+	first, found := "", false
+	for k := range keys {
+		if allowed[k] {
+			continue
+		}
+		if !found || k < first {
+			first, found = k, true
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return fmt.Sprintf("request body contains unknown field %q", first), true
+}
+
+// jsonFieldNames returns the JSON names dst's struct accepts. An untagged
+// embedded struct contributes the fields encoding/json promotes out of it,
+// rather than its Go type name. A non-struct returns nothing, so a call site
+// that passes one rejects every key rather than panicking here or silently
+// dropping the strictness it asked for.
+func jsonFieldNames(t reflect.Type) map[string]bool {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	names := map[string]bool{}
+	if t.Kind() != reflect.Struct {
+		return names
+	}
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if f.Anonymous && name == "" {
+			for k := range jsonFieldNames(f.Type) {
+				names[k] = true
+			}
+			continue
+		}
+		switch name {
+		case "-":
+			continue
+		case "":
+			name = f.Name
+		}
+		names[name] = true
+	}
+	return names
+}
+
+// isReadTimeout reports whether err is the request body's read deadline firing.
+func isReadTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
@@ -1088,26 +1183,50 @@ func MetricsKeyCollision(tenantKeys map[string]string, metricsKey string) (label
 	return label, collides
 }
 
-// ParseTenantKeys parses comma-separated label=key entries and bare API keys into
-// a map from API key to tenant label. Bare keys receive generated labels. Empty
-// input selects keyless single-tenant mode.
+// CheckKeyChars rejects a key that carries whitespace or a character that does
+// not print. Such a key is always an accident of parsing (a newline from a
+// file, a pasted space, a zero-width space or byte-order mark carried out of a
+// web page) and would match nothing a client sends. IsPrint is what covers the
+// invisible ones: unicode.IsControl sees only C0 and C1, not the format
+// characters an editor or a copy-paste leaves behind. The message never
+// includes the key.
+func CheckKeyChars(key string) error {
+	if strings.ContainsFunc(key, func(r rune) bool { return unicode.IsSpace(r) || !unicode.IsPrint(r) }) {
+		return errors.New("key contains whitespace or a character that does not print")
+	}
+	return nil
+}
+
+// ParseTenantKeys parses label=key entries and bare API keys into a map from API
+// key to tenant label. Entries are separated by commas or newlines, so a key
+// file can hold one per line. Bare keys receive generated labels and must not
+// contain "="; a base64 key with padding needs a label. Empty input selects
+// keyless single-tenant mode.
 //
-// Empty or duplicate keys and labels are rejected. Generated labels do not
-// collide with explicit labels, and errors never include API keys.
+// Empty or duplicate keys and labels are rejected, as is a key carrying
+// whitespace. Generated labels do not collide with explicit labels, and errors
+// never include API keys.
 func ParseTenantKeys(s string) (map[string]string, error) {
 	s = strings.TrimSpace(s)
+	// An editor's UTF-8 BOM would otherwise become part of the first label.
+	s = strings.TrimSpace(strings.TrimPrefix(s, "\ufeff"))
 	if s == "" {
 		return nil, nil
 	}
 	out := map[string]string{} // API key -> tenant label
 	labels := map[string]bool{}
 	var bareKeys []string
-	for _, pair := range strings.Split(s, ",") {
+	entry := 0
+	for _, pair := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' }) {
 		if pair = strings.TrimSpace(pair); pair == "" {
-			continue // tolerate a stray or trailing comma
+			continue // tolerate a stray or trailing separator
 		}
+		entry++
 		before, after, found := strings.Cut(pair, "=")
 		if !found {
+			if err := CheckKeyChars(pair); err != nil {
+				return nil, fmt.Errorf("tenant entry %d: %w", entry, err)
+			}
 			if _, dup := out[pair]; dup {
 				return nil, errors.New("duplicate API key")
 			}
@@ -1115,12 +1234,19 @@ func ParseTenantKeys(s string) (map[string]string, error) {
 			bareKeys = append(bareKeys, pair)
 			continue
 		}
+		// "alice=" and "Zm9vYmE=" look the same here: a label with no key, or
+		// a bare key with base64 padding. Neither is guessed at, and the
+		// message names the entry by position because either reading may be a
+		// key.
+		if strings.Trim(after, "=") == "" {
+			return nil, fmt.Errorf("tenant entry %d is a label with an empty key, or a bare key ending in \"=\"; write it as label=key", entry)
+		}
 		label, key := strings.TrimSpace(before), strings.TrimSpace(after)
 		if label == "" {
 			return nil, errors.New(`tenant entry has an empty label (use "label=key")`)
 		}
-		if key == "" {
-			return nil, fmt.Errorf("tenant label %q has an empty key", label)
+		if err := CheckKeyChars(key); err != nil {
+			return nil, fmt.Errorf("tenant label %q: %w", label, err)
 		}
 		if _, dup := out[key]; dup {
 			return nil, errors.New("duplicate API key")

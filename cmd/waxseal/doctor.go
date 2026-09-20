@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/colespringer/waxseal/internal/browser"
@@ -55,15 +56,24 @@ func newDoctorCmd() *cobra.Command {
 }
 
 // validateDoctorStage rejects flag combinations that ask for a check the chosen
-// stage cannot deliver.
-func validateDoctorStage(o *doctorOpts) error {
+// stage cannot deliver. A flag the caller typed is judged on having been typed,
+// not on its value, so an unset variable behind it is loud rather than silently
+// the default.
+func validateDoctorStage(cmd *cobra.Command, o *doctorOpts) error {
 	if o.full && (o.skipAttest || o.stopAfterLoad) {
 		return &usageError{msg: "--full needs an attested session, so it cannot be combined with --skip-attest or --stop-after-load"}
 	}
 	if o.stopAfterLoad && o.skipAttest {
 		return &usageError{msg: "--stop-after-load already stops before attestation runs, so it cannot be combined with --skip-attest"}
 	}
-	if o.landingURL != "" && !o.stopAfterLoad {
+	landingSet := cmd.Flags().Changed("landing-url")
+	// Trimmed in place, so the value navigation gets is the one checked here: a
+	// padded URL would otherwise pass and fail deep in the load instead.
+	o.landingURL = strings.TrimSpace(o.landingURL)
+	if landingSet && o.landingURL == "" {
+		return &usageError{msg: "--landing-url is empty: pass a URL, or omit the flag"}
+	}
+	if landingSet && !o.stopAfterLoad {
 		return &usageError{msg: "--landing-url needs --stop-after-load, because the identity is only readable on a watch page"}
 	}
 	return nil
@@ -71,7 +81,7 @@ func validateDoctorStage(o *doctorOpts) error {
 
 func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
-	if err := validateDoctorStage(o); err != nil {
+	if err := validateDoctorStage(cmd, o); err != nil {
 		return err
 	}
 	if err := validateLandingVideo(o.video); err != nil {

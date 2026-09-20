@@ -557,13 +557,18 @@ func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
 // PlayerContext is not called again (no mintMu, no eval).
 func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	var calls int64
-	m, _, _, _ := newTestMinterFull(
-		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
-		func(string) (browser.PlayerContext, error) {
-			atomic.AddInt64(&calls, 1)
-			return browser.PlayerContext{}, fmt.Errorf("%w: LOGIN_REQUIRED", browser.ErrUnplayable)
-		},
-	)
+	var logs bytes.Buffer
+	m := newBareMinter(0, 0)
+	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{
+			mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+			playerCtx: func(string) (browser.PlayerContext, error) {
+				atomic.AddInt64(&calls, 1)
+				return browser.PlayerContext{}, &browser.UnplayableError{Status: "LOGIN_REQUIRED", Detail: "Private video"}
+			},
+		}, nil
+	}
 	ctx := context.Background()
 	if err := m.Warm(ctx); err != nil {
 		t.Fatalf("warm: %v", err)
@@ -585,6 +590,34 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	}
 	if got := m.metrics.PlayerContextNegativeCacheHits.Load(); got != 1 {
 		t.Errorf("player_context_negative_cache_hits = %d, want 1", got)
+	}
+	// A fresh verdict is worth one line; the cache hits behind it are not, or a
+	// caller looping on one unplayable video fills the log. The Info line never
+	// carries the id itself, only its length; the debug record beside it has its
+	// own message, so -v does not read one verdict as two.
+	if got := strings.Count(logs.String(), "video unavailable; verdict cached"); got != 1 {
+		t.Errorf("verdict-cached lines = %d, want exactly 1 (log=%q)", got, logs.String())
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if !strings.Contains(line, "video unavailable; verdict cached") {
+			continue
+		}
+		if !strings.Contains(line, "level=INFO") {
+			t.Errorf("line %q should be the Info record", line)
+		}
+		for _, want := range []string{"status=LOGIN_REQUIRED", "video_id_len=3"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("line %q is missing %q", line, want)
+			}
+		}
+		if strings.Contains(line, "video_id=vid") {
+			t.Errorf("INFO line %q carries the full video id", line)
+		}
+	}
+	for _, want := range []string{"negative cache entry written", "refused from the negative cache"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %q, want a debug record %q", logs.String(), want)
+		}
 	}
 }
 
@@ -1453,16 +1486,23 @@ func TestMinterHealthPersistentSupersedeReportsNoSession(t *testing.T) {
 	}
 }
 
-// SelfTest caches its GVS token under the regular mint key.
+// SelfTest caches its GVS token under the regular mint key, and says in the log
+// that its streaming proof passed: a failing one already logs, so without this
+// a reader cannot tell a passing proof from one that never ran.
 func TestMinterSelfTestCachesGVSMint(t *testing.T) {
 	var mints int64
+	var logs bytes.Buffer
 	m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
 		atomic.AddInt64(&mints, 1)
 		return browser.MintResult{Kind: "integrity", Token: "gvs-" + id, TokenLen: 5, Identifier: id, Lifetime: 3600}, nil
 	})
+	m.log = slog.New(slog.NewTextHandler(&logs, nil))
 	ctx := context.Background()
 	if err := m.SelfTest(ctx); err != nil {
 		t.Fatalf("SelfTest: %v", err)
+	}
+	if !strings.Contains(logs.String(), "streaming proof passed") {
+		t.Errorf("log = %q, want the passing proof named", logs.String())
 	}
 	if got := atomic.LoadInt64(&mints); got != 1 {
 		t.Errorf("mints during self-test = %d, want 1", got)
@@ -2965,7 +3005,7 @@ func resetMintSeparationWarnOnces() {
 }
 
 // WAXSEAL_MINT_SEPARATION overrides the default; anything but a positive
-// duration keeps it. A value past mintSeparationWarn is still accepted, but logs
+// duration keeps it. A value past MintSeparationWarn is still accepted, but logs
 // a warning, since a wait that long risks the per-request budget. Each subtest
 // resets the warning once-guards first so it observes its own first call, the
 // same way a process's very first tenant would.
@@ -2976,26 +3016,26 @@ func TestMintSeparationOverride(t *testing.T) {
 		want     time.Duration
 		wantWarn string // substring the warn log must contain; "" means don't check
 	}{
-		{"unset", "", defaultMintSeparation, ""},
+		{"unset", "", DefaultMintSeparation, ""},
 		{"valid", "3s", 3 * time.Second, ""},
 		{"valid sub-second", "250ms", 250 * time.Millisecond, ""},
-		{"unparseable", "soon", defaultMintSeparation, ""},
-		{"bare number", "12", defaultMintSeparation, ""},
-		{"zero", "0s", defaultMintSeparation, ""},
-		{"negative", "-5s", defaultMintSeparation, ""},
+		{"unparseable", "soon", DefaultMintSeparation, ""},
+		{"bare number", "12", DefaultMintSeparation, ""},
+		{"zero", "0s", DefaultMintSeparation, ""},
+		{"negative", "-5s", DefaultMintSeparation, ""},
 		{"large", "90s", 90 * time.Second, "make first contexts time out"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(mintSeparationEnv, tc.env)
+			t.Setenv(MintSeparationEnv, tc.env)
 			resetMintSeparationWarnOnces()
 			var logs bytes.Buffer
 			log := slog.New(slog.NewTextHandler(&logs, nil))
 			got := NewMinter("v", browser.Options{Logger: log}, 0, 0, 0).mintSeparation
 			if got != tc.want {
-				t.Errorf("%s=%q gave mintSeparation %v, want %v", mintSeparationEnv, tc.env, got, tc.want)
+				t.Errorf("%s=%q gave mintSeparation %v, want %v", MintSeparationEnv, tc.env, got, tc.want)
 			}
 			if tc.wantWarn != "" && !strings.Contains(logs.String(), tc.wantWarn) {
-				t.Errorf("%s=%q logged %q, want a warning containing %q", mintSeparationEnv, tc.env, logs.String(), tc.wantWarn)
+				t.Errorf("%s=%q logged %q, want a warning containing %q", MintSeparationEnv, tc.env, logs.String(), tc.wantWarn)
 			}
 		})
 	}
@@ -3005,7 +3045,7 @@ func TestMintSeparationOverride(t *testing.T) {
 // process: a fleet of tenants that share one bad WAXSEAL_MINT_SEPARATION must not
 // repeat the identical warning once per tenant constructor.
 func TestMintSeparationWarnOncePerProcess(t *testing.T) {
-	t.Setenv(mintSeparationEnv, "90s")
+	t.Setenv(MintSeparationEnv, "90s")
 	resetMintSeparationWarnOnces()
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, nil))
@@ -3025,7 +3065,7 @@ func TestMintSeparationWarnOncePerProcess(t *testing.T) {
 // value keeps the env-derived fallback, matching every existing caller that
 // passes 0.
 func TestMintSeparationConstructorOverride(t *testing.T) {
-	t.Setenv(mintSeparationEnv, "3s")
+	t.Setenv(MintSeparationEnv, "3s")
 	resetMintSeparationWarnOnces()
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, nil))
@@ -4524,6 +4564,11 @@ func TestDeferredReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
 		t.Fatalf("report while busy = %+v, want RetirementPending", res)
 	}
+	// The drop happens at report time, not at the handoff: a token request in
+	// between must miss.
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d while the report is pending, want 0", got)
+	}
 	release()
 	<-done
 	released = true
@@ -4539,6 +4584,105 @@ func TestDeferredReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 	}
 	if got := m.metrics.ReportDrivenRecycles.Load(); got != 1 {
 		t.Errorf("report_driven_recycles = %d, want 1", got)
+	}
+}
+
+// A deferred retirement is consumed by the next request that takes the page,
+// and a token request is one: minting on the reported identity would hand out
+// a fresh token for the session the consumer just called degraded.
+func TestDeferredReportIsConsumedByTheNextTokenRequest(t *testing.T) {
+	m, sessions, smu, release, done := startBlockingPlayerContext(t)
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	release()
+	<-done
+
+	if _, cached, err := m.Mint(context.Background(), "gvs", "b"); err != nil || cached {
+		t.Fatalf("mint after the deferred report: cached=%v err=%v, want a fresh token", cached, err)
+	}
+	if got := m.Generation(); got != 2 {
+		t.Errorf("generation = %d after the token request, want 2 (the pending retirement was consumed)", got)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != 1 {
+		t.Errorf("report_driven_recycles = %d, want 1", got)
+	}
+	smu.Lock()
+	closed := (*sessions)[0].closed.Load()
+	smu.Unlock()
+	if !closed {
+		t.Error("the reported session is still open after a token request took the page")
+	}
+}
+
+// startBlockingMint is startBlockingPlayerContext for a token request: the
+// first mint of binding "b" parks inside sess.Mint holding mintMu until release
+// is called. The pre-mint at warm-up names the visitor, not "b", so it is not
+// parked.
+func startBlockingMint(t *testing.T) (m *Minter, release func(), done <-chan struct{}) {
+	t.Helper()
+	entered := make(chan struct{})
+	rel := make(chan struct{})
+	var parked atomic.Bool
+	mint := func(id string) (browser.MintResult, error) {
+		if id == "b" && parked.CompareAndSwap(false, true) {
+			close(entered)
+			<-rel
+		}
+		return okMint(id)
+	}
+	m, _, _, _ = newTestMinter(mint)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	d := make(chan struct{})
+	go func() { defer close(d); _, _, _ = m.Mint(ctx, "gvs", "b") }()
+	<-entered
+	return m, func() { close(rel) }, d
+}
+
+// A mint that already holds the page when the report arrives must not cache
+// its token under the reported generation: the next request for that binding
+// would be served from the fast path and never take the page, so the
+// retirement would never be consumed.
+func TestMintInFlightDuringReportDoesNotCacheOnTheReportedGeneration(t *testing.T) {
+	m, release, done := startBlockingMint(t)
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while a mint holds the page = %+v, want RetirementPending", res)
+	}
+	release()
+	<-done
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after the in-flight mint finished, want 0 (its token must not be cached on the reported generation)", got)
+	}
+	if _, cached, err := m.Mint(context.Background(), "gvs", "b"); err != nil || cached {
+		t.Fatalf("next mint for the same binding: cached=%v err=%v, want a fresh token from the replacement", cached, err)
+	}
+	if got := m.Generation(); got != 2 {
+		t.Errorf("generation = %d, want 2 (the retirement was consumed by the next request)", got)
+	}
+}
+
+// A crash that lands while a report's retirement is pending takes the
+// retirement with it: the crash retire clears the mark and drops the cache, the
+// report is not charged a recycle, and the next request finds a plain crash.
+func TestPendingReportThenCrashIsNotChargedTwice(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	crashUnder(m)
+	release()
+	<-done
+	if _, gen, err := m.PlayerContext(context.Background(), "vid"); err != nil || gen != 2 {
+		t.Fatalf("recovery: gen=%d err=%v, want gen 2", gen, err)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != 0 {
+		t.Errorf("report_driven_recycles = %d, want 0 (the crash retired the generation, not the report)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 1 {
+		t.Errorf("crashes = %d, want 1", got)
 	}
 }
 
@@ -4962,6 +5106,42 @@ func TestProofBotCheckOnReplacementIsCountedAndNamed(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "could not prove full-length streaming") {
 		t.Errorf("log = %q, want the bot check not reported as an unprovable session", logs.String())
+	}
+}
+
+// A request already on its replacement launches nothing more. The QA round
+// showed one request retiring A, taking B, and buying C when B's proof met a
+// bot check: three Chromiums under one mintMu hold. B's bot check is refused
+// with the cool-down instead, the way a walled replacement is refused
+// elsewhere.
+func TestOneRequestTakesAtMostOneReplacement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+				return browser.PlayerContext{}, errors.New("extraction failed")
+			}}, nil
+		}
+		return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+	}
+
+	_, _, err := m.PlayerContext(context.Background(), "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok || !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("err = %v (%T), want a RetryAfterError wrapping ErrBotCheck", err, err)
+	}
+	if ra.After != botCheckCooldown {
+		t.Errorf("After = %v, want %v", ra.After, botCheckCooldown)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (A, then its one replacement B; no C)", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
+		t.Errorf("unproven_rejections = %d, want 1", got)
 	}
 }
 

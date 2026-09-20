@@ -444,6 +444,43 @@ func TestEstablishUnplayableIsTerminal(t *testing.T) {
 	}
 }
 
+// A private video refuses without videoDetails, so video_id_match stays false;
+// once the response is the new load's, the refusal is terminal on the first
+// poll instead of waiting for onError or the deadline.
+func TestEstablishPrivateWithoutVideoDetailsIsTerminal(t *testing.T) {
+	payload := map[string]any{
+		"error": "pending: player response not yet for vid", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Private video", "video_id_match": false, "response_changed": true,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
+	s := newFakeSession(page)
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
+	var ue *UnplayableError
+	if !errors.As(err, &ue) || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Private video" {
+		t.Fatalf("err = %v, want UnplayableError LOGIN_REQUIRED / Private video", err)
+	}
+	if got := page.evalCount(playerContextExtractJS); got != 1 {
+		t.Errorf("extract ran %d times, want 1", got)
+	}
+}
+
+// An on-air broadcast is refused as soon as its response arrives: no seek, no
+// confirm, and the verdict is negative-cacheable like any other.
+func TestEstablishLiveBroadcastIsTerminal(t *testing.T) {
+	payload := establishedPayload("vid", 0)
+	payload["is_live_now"] = true
+	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
+	s := newFakeSession(page)
+	_, err := s.establishStatus1(context.Background(), page, "vid", s.timing.establishTimeout, s.timing.confirmBudget)
+	var ue *UnplayableError
+	if !errors.As(err, &ue) || ue.Status != LiveBroadcastStatus {
+		t.Fatalf("err = %v, want UnplayableError %s", err, LiveBroadcastStatus)
+	}
+	if got := page.evalCount(playerSeekJS); got != 0 {
+		t.Errorf("seek ran %d times, want 0 (no confirmation for a live broadcast)", got)
+	}
+}
+
 // A bot check reaches establish the same way a per-video verdict does, but it
 // describes the browser session, so it must not unwrap to ErrUnplayable: the
 // minter relaunches on it instead of negative-caching the video.

@@ -1,5 +1,6 @@
 # Keep the build context small: only Go source + the committed bundle are needed.
 .git
+.gitnexus
 .github
 .toolchains
 dist

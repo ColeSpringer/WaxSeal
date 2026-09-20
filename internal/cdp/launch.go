@@ -2,6 +2,7 @@ package cdp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -157,6 +158,18 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 		if !c.waitExited() {
 			opts.Logger.Warn("cdp: chromium was not reaped after a failed handshake; the profile may not remove cleanly",
 				"budget", waitDelay, "pid", c.pid())
+		}
+		// The read loop (EOF), the reaper (process exited), and a write into a
+		// closed pipe (broken pipe) race to record the loss, so a Chromium that
+		// died is named by its exit rather than by whichever wording won. Only a
+		// lost connection qualifies: forceClose above kills the child, so
+		// procExited is true for every failure by the time we get here, and a live
+		// browser that failed the handshake some other way (a protocol error)
+		// would otherwise be reported as an exit. A timeout or a cancellation
+		// keeps its own wording for the same reason.
+		if c.procExited.Load() && errors.Is(err, ErrConnClosed) &&
+			!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			err = fmt.Errorf("chromium exited during the version handshake (%s): %w", c.exitStatus(), err)
 		}
 		return nil, fmt.Errorf("cdp: launch handshake: %w (stderr tail: %q)", err, tail(stderr.String(), 600))
 	}

@@ -100,6 +100,48 @@ func TestSpawnHandshakeTimeoutKillsChild(t *testing.T) {
 	}
 }
 
+// A Chromium that dies during the handshake is named by its exit, whichever of
+// the three losses got there first: the read loop's EOF, the reaper, or the
+// parent's write into a closed pipe. Without that, the same failure reported
+// three different wordings run to run.
+func TestSpawnChildExitDuringHandshakeIsNamedByItsExit(t *testing.T) {
+	for _, mode := range []string{"exit", "exit-late"} {
+		t.Run(mode, func(t *testing.T) {
+			// Repeated because the three losses race: one run can only show the
+			// wording that won that time.
+			for i := range 5 {
+				b, _, err := spawnHelper(t, mode, 30*time.Second)
+				if err == nil {
+					_ = b.Close()
+					t.Fatalf("run %d: Spawn succeeded against a child that exits", i)
+				}
+				for _, want := range []string{"chromium exited during the version handshake", "exit status 3"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("run %d: error = %v, want it to contain %q", i, err, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// A browser that is alive and simply refuses the handshake keeps its own error.
+// Spawn kills the child on the way out, so the exit-status rewrite above cannot
+// key on "the process has exited" alone: every failure looks like that by then.
+func TestSpawnLiveBrowserProtocolErrorIsNotReportedAsAnExit(t *testing.T) {
+	b, _, err := spawnHelper(t, "cdp-error", 30*time.Second)
+	if err == nil {
+		_ = b.Close()
+		t.Fatal("Spawn succeeded against a browser that refused the handshake")
+	}
+	if !strings.Contains(err.Error(), "helper refuses this method") {
+		t.Errorf("error = %v, want it to carry the protocol error", err)
+	}
+	if strings.Contains(err.Error(), "chromium exited during the version handshake") {
+		t.Errorf("error = %v, want it not to blame an exit: the browser answered, then Spawn killed it", err)
+	}
+}
+
 // Spawn must report a launch failure rather than returning a Browser when the
 // binary does not exist.
 func TestSpawnMissingBinary(t *testing.T) {

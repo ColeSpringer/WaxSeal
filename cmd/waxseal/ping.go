@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -75,8 +77,8 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	// header, and on a keyed daemon that turns the tenant probe the operator
 	// configured into the daemon-level one without a word: healthy, while the
 	// tenant it meant to watch is never checked.
-	if cmd.Flags().Changed("key") && p.key == "" {
-		return &usageError{msg: "--key is empty: pass the tenant key, or omit --key to probe the daemon's browser"}
+	if cmd.Flags().Changed("key") && strings.TrimSpace(p.key) == "" {
+		return &usageError{msg: "--key is empty or only whitespace: pass the tenant key, or omit --key to probe the daemon's browser"}
 	}
 	if p.timeout <= 0 {
 		return &usageError{msg: fmt.Sprintf("invalid --timeout %v: must be positive", p.timeout)}
@@ -134,8 +136,23 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		Attest     string `json:"attest"`
 		Reason     string `json:"reason"`
 		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
+		Keyed      *bool  `json:"keyed"`              // nil from a daemon older than the field
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&body)
+	// A body the probe cannot read is not health, whatever the status line says,
+	// and naming it apart from ok=false is what tells an operator they are
+	// probing something that is not this daemon.
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<10))
+	if err := dec.Decode(&body); err != nil {
+		return fmt.Errorf("unhealthy: status=%d unreadable body: %v", resp.StatusCode, err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("unhealthy: status=%d unreadable body: trailing data after the health object", resp.StatusCode)
+	}
+	// A keyless daemon ignores the key, so the tenant probe the operator
+	// configured silently becomes an unkeyed one.
+	if p.key != "" && body.Keyed != nil && !*body.Keyed {
+		return errors.New("unhealthy: the daemon is keyless and ignored --key; drop --key or key the daemon")
+	}
 	// Health semantics:
 	//   default: require a live session or browser (ok:true), so the benign
 	//   no-session window reads as not ready.
@@ -166,10 +183,14 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	switch {
 	case !body.OK: // strict mode, a benign window: healthy but nothing live to describe
 		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s%s)\n", body.Reason, detail)
-	case body.Probe == server.PingProbeDaemon: // a keyed daemon probed without a key: no session, so no attest
+	case body.Attest != "":
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s%s)\n", body.Attest, detail)
+	case body.Probe != "": // no attest to name, so say what was checked instead
 		fmt.Fprintf(cmd.OutOrStdout(), "ok (probe=%s%s)\n", body.Probe, detail)
 	default:
-		fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s%s)\n", body.Attest, detail)
+		// Every daemon that reports a relaunch also reports what it probed, so
+		// there is nothing left to put in parentheses here.
+		fmt.Fprintln(cmd.OutOrStdout(), "ok")
 	}
 	return nil
 }

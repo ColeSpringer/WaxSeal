@@ -41,6 +41,22 @@ func TestMain(m *testing.M) {
 	case "cdp-echo":
 		helperCDPEcho()
 		os.Exit(0)
+	case "cdp-error":
+		// A live browser that answers the handshake with a CDP protocol error.
+		// Spawn kills it on the way out, so this is what separates "the browser
+		// died" from "the browser said no".
+		helperCDPError()
+		os.Exit(0)
+	case "exit":
+		// A child that dies without ever reading its pipes. The parent's handshake
+		// write then races the reap, so the loss can be recorded as EOF, as a
+		// process exit, or as a broken pipe.
+		os.Exit(3)
+	case "exit-late":
+		// The same death, ordered the other way: the parent's write lands first
+		// and the pipe is only closed afterwards.
+		time.Sleep(250 * time.Millisecond)
+		os.Exit(3)
 	}
 	os.Exit(m.Run())
 }
@@ -52,6 +68,37 @@ func helperWritePID() {
 		return
 	}
 	_ = os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+// helperCDPError answers every request with a CDP protocol error, staying alive
+// until its parent goes away.
+func helperCDPError() {
+	in, out, err := helperTransport()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "helper:", err)
+		os.Exit(1)
+	}
+	r := bufio.NewReaderSize(in, 64<<10)
+	for {
+		frame, rerr := r.ReadBytes(0)
+		if len(frame) > 1 {
+			var req struct {
+				ID int64 `json:"id"`
+			}
+			if json.Unmarshal(frame[:len(frame)-1], &req) == nil {
+				resp, _ := json.Marshal(map[string]any{
+					"id":    req.ID,
+					"error": map[string]any{"code": -32601, "message": "helper refuses this method"},
+				})
+				if _, werr := out.Write(append(resp, 0)); werr != nil {
+					return
+				}
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // helperCDPEcho stands in for Chromium: it opens the inherited transport, reads

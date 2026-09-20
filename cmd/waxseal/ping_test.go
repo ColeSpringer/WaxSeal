@@ -310,26 +310,119 @@ func TestPingCLIDaemonProbe(t *testing.T) {
 	}
 }
 
-// TestPingCLIEmptyKeyIsUsageError pins that `--key ""` is refused. A compose
-// file that passes `--key ${SOME_VAR}` with the variable unset would otherwise
-// send no header, and on a keyed daemon that quietly turns the tenant probe the
-// operator configured into the daemon-level one, which stays healthy while the
-// tenant it meant to watch is never checked.
+// runPingAgainst runs one probe against fake and returns its stdout and error.
+func runPingAgainst(t *testing.T, addr string, args ...string) (string, error) {
+	t.Helper()
+	c := newPingCmd()
+	c.SetArgs(append([]string{"--addr", addr}, args...))
+	var out strings.Builder
+	c.SetOut(&out)
+	c.SetErr(io.Discard)
+	err := c.Execute()
+	return out.String(), err
+}
+
+// A 200 whose body the probe cannot read is not health. Saying so separately
+// from ok=false is what tells an operator they are probing the wrong port.
+func TestPingCLIUnreadableBodyIsNamed(t *testing.T) {
+	fake := &pingFake{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	for _, payload := range []string{`{"ok":`, `{"ok":true}{"x":1}`} {
+		fake.answer(http.StatusOK, payload)
+		_, err := runPingAgainst(t, addr)
+		if err == nil {
+			t.Fatalf("payload %q: want an error", payload)
+		}
+		for _, want := range []string{"unreadable body", "status=200"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("payload %q: err = %v, want it to contain %q", payload, err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "ok=false") {
+			t.Errorf("payload %q: err = %v, want it distinct from an unhealthy daemon", payload, err)
+		}
+	}
+}
+
+// A keyless daemon that answered a tenant probe has no attest to print, so the
+// output names what it did check rather than printing an empty field.
+func TestPingCLIOutputWithoutAttest(t *testing.T) {
+	fake := &pingFake{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer srv.Close()
+	fake.answer(http.StatusOK, `{"ok":true,"probe":"tenant","reason":"ok"}`)
+	out, err := runPingAgainst(t, strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if want := "ok (probe=tenant)\n"; out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+	if strings.Contains(out, "attest=") {
+		t.Errorf("output = %q, want no empty attest field", out)
+	}
+}
+
+// A keyless daemon ignores --key, so the probe the operator configured silently
+// becomes an unkeyed one. The daemon's keyed field is what lets the CLI say so.
+func TestPingCLIKeyIgnoredByKeylessDaemonFails(t *testing.T) {
+	fake := &pingFake{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	fake.answer(http.StatusOK, `{"ok":true,"probe":"tenant","reason":"ok","attest":"integrity","keyed":false}`)
+	_, err := runPingAgainst(t, addr, "--key", "K")
+	if err == nil {
+		t.Fatal("a keyless daemon ignored --key and the probe passed")
+	}
+	if _, isUsage := errors.AsType[*usageError](err); isUsage {
+		t.Errorf("err = %v, want a runtime failure rather than a usage error: the flags were fine", err)
+	}
+	for _, want := range []string{"keyless", "--key"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to contain %q", err, want)
+		}
+	}
+
+	// A daemon older than the field says nothing, and a keyed one agrees.
+	for _, payload := range []string{
+		`{"ok":true,"probe":"tenant","reason":"ok","attest":"integrity"}`,
+		`{"ok":true,"probe":"tenant","reason":"ok","attest":"integrity","keyed":true}`,
+	} {
+		fake.answer(http.StatusOK, payload)
+		if _, err := runPingAgainst(t, addr, "--key", "K"); err != nil {
+			t.Errorf("payload %q: %v, want success", payload, err)
+		}
+	}
+}
+
+// TestPingCLIEmptyKeyIsUsageError pins that `--key ""` is refused, and so is a
+// key that is only whitespace. A compose file that passes `--key ${SOME_VAR}`
+// with the variable unset would otherwise send no header, and on a keyed daemon
+// that quietly turns the tenant probe the operator configured into the
+// daemon-level one, which stays healthy while the tenant it meant to watch is
+// never checked.
 func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("the daemon was probed despite the empty --key")
 	}))
 	defer srv.Close()
-	c := newPingCmd()
-	c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", ""})
-	c.SetOut(io.Discard)
-	c.SetErr(io.Discard)
-	err := c.Execute()
-	var ue *usageError
-	if !errors.As(err, &ue) {
-		t.Fatalf("ping --key \"\" = %v, want a usage error", err)
-	}
-	if !strings.Contains(err.Error(), "--key") {
-		t.Errorf("usage error %q does not name --key", err)
+	for _, key := range []string{"", " ", "\t"} {
+		c := newPingCmd()
+		c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", key})
+		c.SetOut(io.Discard)
+		c.SetErr(io.Discard)
+		err := c.Execute()
+		var ue *usageError
+		if !errors.As(err, &ue) {
+			t.Fatalf("ping --key %q = %v, want a usage error", key, err)
+		}
+		if !strings.Contains(err.Error(), "--key") {
+			t.Errorf("usage error %q does not name --key", err)
+		}
 	}
 }

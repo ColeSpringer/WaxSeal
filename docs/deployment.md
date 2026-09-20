@@ -9,9 +9,11 @@ docker compose up -d --wait
 ```
 
 `--wait` returns once the image's healthcheck passes, which is when the daemon
-has attested a session and can serve tokens, usually 10 to 30 seconds after
-Chromium starts. `docker compose logs -f` follows startup, and `docker compose ps`
-shows the health state. A container that never turns healthy is either
+has attested a session and can serve tokens, typically under ten seconds after
+Chromium starts. The first token or context request may still wait up to 12
+seconds behind the daemon's mint-separation gate (README, `/player-context`).
+`docker compose logs -f` follows startup, and `docker compose ps` shows the
+health state. A container that never turns healthy is either
 restarting, because the daemon exited on a startup failure, or up and unhealthy,
 because its probe keeps failing; the log says which. The daemon keeps no state
 worth a volume: browser profiles are temporary and rebuilt at every start.
@@ -96,10 +98,11 @@ secrets:
 Compose mounts that host file at `/run/secrets/waxseal_tenant_keys` as it is, so
 outside swarm it has to be readable by the image's non-root user, uid 10001:
 `chmod 0444 tenant-keys`, or chown it to that uid. The file holds what the
-variable would, `alice=KEYA,bob=KEYB`, with surrounding whitespace ignored. An
-empty file stops startup rather than starting a keyless daemon, and a non-empty
-value beside the `_FILE` variant is a startup error rather than a silent winner;
-a blank value counts as unset.
+variable would, `alice=KEYA,bob=KEYB`, one entry per line also works, with
+surrounding whitespace ignored. An empty file stops startup rather than starting
+a keyless daemon, and a non-empty value beside the `_FILE` variant is a startup
+error rather than a silent winner; a blank or whitespace-only value counts as
+unset.
 
 ### Metrics on a keyed daemon
 
@@ -122,7 +125,13 @@ daemon itself, which restarts the container:
       resources:
         limits:
           memory: 2g
+    memswap_limit: 2g # equal to the limit; without it Docker grants the same amount of swap on top
 ```
+
+`memswap_limit` is a service-level key, not part of `deploy.resources.limits`,
+which is why it sits at the service indentation. On a host with swap, leaving it
+out means the "kills Chromium" behaviour happens at twice the limit rather than
+at it. The `docker run` equivalent is `--memory 2g --memory-swap 2g`.
 
 ## Read-only root filesystem
 
@@ -135,6 +144,11 @@ read-only rootfs mounts both as tmpfs:
       - /home/waxseal:mode=1777
       - /tmp:mode=1777
 ```
+
+The `mode` is load-bearing: a bare tmpfs mounts root-owned, the non-root user
+cannot create its profile under `/home/waxseal`, and the container loops on
+`permission denied`. `docker run --tmpfs /home/waxseal:mode=1777 --tmpfs
+/tmp:mode=1777` is the equivalent.
 
 ## Run a consumer on the same egress IP
 
@@ -172,6 +186,8 @@ flag it stands in for. They go under `environment:` the way the keys do above.
 One of them touches the file: `WAXSEAL_SHUTDOWN_TIMEOUT` is how long a stopping
 daemon drains in-flight requests, 60s by default, and `stop_grace_period` is
 70s to cover it. Raise them together, or Docker kills the container mid-request.
+`WAXSEAL_MINT_SEPARATION` is read the same way and must parse as a positive Go
+duration, or the daemon refuses to start.
 
 ## Health checks
 

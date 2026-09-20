@@ -31,14 +31,13 @@ import (
 // Creative Commons (Blender Foundation); the NASA clip is U.S.-government public
 // domain. The long videos exist only to seek past the status-2 preview cap.
 const (
-	bbbVideoID       = "aqz-KE-bpKQ" // Big Buck Bunny (Blender, CC-BY), approximately 635 seconds
-	bbbURL           = "https://www.youtube.com/watch?v=" + bbbVideoID
-	bbbContentLength = 30767611      // approximate reference size for logs
-	tearsVideoID     = "R6MlUcmOul8" // Tears of Steel (Blender, CC-BY), approximately 734 seconds
-	tearsURL         = "https://www.youtube.com/watch?v=" + tearsVideoID
-	shortVideoID     = "1UaBgr_sq9A" // NASA: 60 Years in 60 Seconds (public domain), approximately 60 seconds
-	shortURL         = "https://www.youtube.com/watch?v=" + shortVideoID
-	fullLengthFloor  = 8 << 20 // safely beyond a status-2 preview of a long video
+	bbbVideoID      = "aqz-KE-bpKQ" // Big Buck Bunny (Blender, CC-BY), approximately 635 seconds
+	bbbURL          = "https://www.youtube.com/watch?v=" + bbbVideoID
+	tearsVideoID    = "R6MlUcmOul8" // Tears of Steel (Blender, CC-BY), approximately 734 seconds
+	tearsURL        = "https://www.youtube.com/watch?v=" + tearsVideoID
+	shortVideoID    = "1UaBgr_sq9A" // NASA: 60 Years in 60 Seconds (public domain), approximately 60 seconds
+	shortURL        = "https://www.youtube.com/watch?v=" + shortVideoID
+	fullLengthFloor = 8 << 20 // safely beyond a status-2 preview of a long video
 
 	clientWebContext = "WEB_CONTEXT" // info.Client when the attested player-context path is used
 	clientWeb        = "WEB"         // info.Client for the plain WEB chain
@@ -146,7 +145,7 @@ func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string
 	if cfg.Logger == nil {
 		cfg.Logger = testDaemonLogger(t)
 	}
-	srv, err := server.New(cfg)
+	srv, err := server.NewWithContext(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -301,7 +300,7 @@ func TestPlayerContextOnlyFullLengthHTTP(t *testing.T) {
 	if ok {
 		requireFullLength(t, n, info, "player-context only", warnings)
 	}
-	t.Logf("player-context only: %d bytes (%s; contentLength=%d, reference=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength, bbbContentLength)
+	t.Logf("player-context only: %d bytes (%s; contentLength=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
 
 // An adopted session and GVS token must stream full length without a

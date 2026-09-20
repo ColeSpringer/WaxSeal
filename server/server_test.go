@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +73,60 @@ func TestParseTenantKeys(t *testing.T) {
 		t.Errorf("bare key label = %q, want a generated label that is not the key", lbl)
 	}
 
+	// A key file is the documented multi-tenant source, so newline-separated
+	// entries must parse like comma-separated ones, CRLF and a BOM included.
+	for _, tc := range []struct {
+		name, in string
+		want     map[string]string
+	}{
+		{"one entry per line", "alice=KEYA\nbob=KEYB\n", map[string]string{"KEYA": "alice", "KEYB": "bob"}},
+		{"CRLF lines", "alice=KEYA\r\nbob=KEYB\r\n", map[string]string{"KEYA": "alice", "KEYB": "bob"}},
+		{"leading BOM", "\ufeffalice=KEYA", map[string]string{"KEYA": "alice"}},
+	} {
+		got, err := ParseTenantKeys(tc.in)
+		if err != nil {
+			t.Errorf("%s: ParseTenantKeys(%q) = error %v", tc.name, tc.in, err)
+			continue
+		}
+		if !maps.Equal(got, tc.want) {
+			t.Errorf("%s: ParseTenantKeys(%q) = %v, want %v", tc.name, tc.in, got, tc.want)
+		}
+	}
+
+	// A key that carries whitespace matches nothing a client can send, so it is
+	// always a parsing accident and is refused at startup.
+	for _, tc := range []struct{ name, in, wantSub string }{
+		{"whitespace inside a key", "alice=KE YA", "whitespace"},
+		{"control character inside a key", "alice=KE\tYA", "whitespace"},
+	} {
+		err := parseTenantKeysErr(t, tc.name, tc.in)
+		if err != nil && !strings.Contains(err.Error(), tc.wantSub) {
+			t.Errorf("%s: error = %q, want it to mention %q", tc.name, err, tc.wantSub)
+		}
+	}
+
+	// "alice=" and "Zm9vYmE=" are the same shape: a label with no key, or a bare
+	// base64 key with padding. Either reading may be a key, so the message names
+	// the entry by position and echoes nothing.
+	for _, tc := range []struct{ name, in string }{
+		{"bare key with base64 padding", "Zm9vYmFy=="},
+		{"bare key with single padding", "Zm9vYmE="},
+		{"label with an empty key", "alice="},
+	} {
+		err := parseTenantKeysErr(t, tc.name, tc.in)
+		if err == nil {
+			continue
+		}
+		if !strings.Contains(err.Error(), "label=key") || !strings.Contains(err.Error(), "tenant entry 1") {
+			t.Errorf("%s: error = %q, want it to name tenant entry 1 and the label=key form", tc.name, err)
+		}
+		for _, leak := range []string{"Zm9v", "alice"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("%s: error = %q, want it not to echo %q: either reading may be a key", tc.name, err, leak)
+			}
+		}
+	}
+
 	// Generated labels must not collide with explicit labels.
 	for _, in := range []string{"t2=KEYA, KEYB", "KEYB, t1=KEYA"} {
 		mix, err := ParseTenantKeys(in)
@@ -80,6 +138,61 @@ func TestParseTenantKeys(t *testing.T) {
 			t.Errorf("ParseTenantKeys(%q) = %v, want two distinct non-empty labels", in, mix)
 		}
 	}
+}
+
+// A key nobody can see is as broken as one with a space in it: it matches
+// nothing a client sends, and unicode.IsControl alone does not catch the
+// format characters an editor or a copy-paste leaves behind.
+func TestCheckKeyChars(t *testing.T) {
+	for _, ok := range []string{"KEYA", "aB3-_=+/", "ключ"} {
+		if err := CheckKeyChars(ok); err != nil {
+			t.Errorf("CheckKeyChars(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"KE YA", "KE\tYA", "KEY\n", "KE\u200bYA", "\ufeffKEY", "KE\u00a0YA"} {
+		err := CheckKeyChars(bad)
+		if err == nil {
+			t.Errorf("CheckKeyChars(%q) = nil, want a refusal", bad)
+			continue
+		}
+		if strings.Contains(err.Error(), "KE") {
+			t.Errorf("CheckKeyChars(%q) error echoes key material: %q", bad, err)
+		}
+	}
+}
+
+// decodeJSONBody's strict path is a contract on its dst. An embedded struct
+// contributes the keys encoding/json actually accepts, and a non-struct is
+// refused loudly rather than panicking in a handler.
+func TestJSONFieldNames(t *testing.T) {
+	type inner struct {
+		A string `json:"a"`
+	}
+	type outer struct {
+		inner
+		B   string `json:"b,omitempty"`
+		C   string `json:"-"`
+		D   string
+		Ptr *inner `json:"ptr"`
+	}
+	got := jsonFieldNames(reflect.TypeOf(&outer{}))
+	want := map[string]bool{"a": true, "b": true, "D": true, "ptr": true}
+	if !maps.Equal(got, want) {
+		t.Errorf("jsonFieldNames = %v, want %v", got, want)
+	}
+	if got := jsonFieldNames(reflect.TypeOf(map[string]string{})); len(got) != 0 {
+		t.Errorf("jsonFieldNames(map) = %v, want an empty set rather than a panic", got)
+	}
+}
+
+// parseTenantKeysErr asserts that in is refused and returns the error.
+func parseTenantKeysErr(t *testing.T, name, in string) error {
+	t.Helper()
+	got, err := ParseTenantKeys(in)
+	if err == nil {
+		t.Errorf("%s: ParseTenantKeys(%q) = (%v, nil), want a usage error", name, in, got)
+	}
+	return err
 }
 
 func TestMetricsKeyCollision(t *testing.T) {
@@ -364,6 +477,20 @@ func TestHeadGate(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("HEAD /ping: status = %d, want 200 (cheap liveness probe stays working)", w.Code)
 	}
+
+	// HEAD is served on both, so the refusal must name it: a client told only
+	// "GET" would read HEAD as unsupported.
+	for _, path := range []string{"/ping", "/metrics"} {
+		r := httptest.NewRequest(http.MethodPut, path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("PUT %s: status = %d, want 405", path, w.Code)
+		}
+		if got, want := w.Header().Get("Allow"), "GET, HEAD"; got != want {
+			t.Errorf("PUT %s: Allow = %q, want %q", path, got, want)
+		}
+	}
 }
 
 // newHTTPServer's WriteTimeout must exceed requestProcessTimeout, or it can cut
@@ -526,7 +653,7 @@ func TestDecodeErrMsg(t *testing.T) {
 		{"type mismatch field", &json.UnmarshalTypeError{Field: "content_binding", Value: "number"}, `field "content_binding" has the wrong type`},
 		{"type mismatch nested", &json.UnmarshalTypeError{Field: "a.b", Value: "number"}, "request body contains a field with the wrong type"},
 		{"syntax error", &json.SyntaxError{}, "request body contains malformed JSON"},
-		{"unknown field", errors.New(`json: unknown field "videoId"`), `request body contains unknown field "videoId"`},
+		{"read deadline", &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, "request body was not received before the read timeout"},
 		{"plain error", errors.New("boom"), "request body contains invalid JSON"},
 	}
 	for _, tt := range tests {
@@ -569,6 +696,11 @@ func TestDecodeRejectsUnknownField(t *testing.T) {
 		// Without strict decode, "raeson" would be dropped and the report accepted
 		// with no reason at all.
 		{"report typo'd optional reason", "/report", `{"session_generation":1,"raeson":"truncated"}`, `request body contains unknown field "raeson"`},
+		// encoding/json matches field names case-insensitively, so these three
+		// were accepted before the keys were checked against the tags directly.
+		{"report upper-case variant", "/report", `{"session_generation":1,"REASON":"x"}`, `request body contains unknown field "REASON"`},
+		{"report title-case variant", "/report", `{"session_generation":1,"Reason":"x"}`, `request body contains unknown field "Reason"`},
+		{"report case variant of the required field", "/report", `{"SESSION_GENERATION":1}`, `request body contains unknown field "SESSION_GENERATION"`},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -590,6 +722,74 @@ func TestDecodeRejectsUnknownField(t *testing.T) {
 				t.Errorf("message = %q, want %q", env.Error, tt.want)
 			}
 		})
+	}
+}
+
+// A body that decodes without error but is not an object reads as a missing
+// required field on one endpoint and as a type error on another. One message
+// covers all four shapes on every endpoint.
+func TestNonObjectBodiesAreRejectedAlike(t *testing.T) {
+	for _, path := range []string{"/report", "/get_pot", "/player-context"} {
+		for _, body := range []string{"null", "42", "[]", `"s"`} {
+			t.Run(path+" "+body, func(t *testing.T) {
+				w := postKeyed(path, body)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 (%q)", w.Code, w.Body.String())
+				}
+				var env struct {
+					Error string `json:"error"`
+					Code  string `json:"code"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+					t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+				}
+				if env.Code != CodeInvalidRequest {
+					t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+				}
+				if want := "request body must be a JSON object"; env.Error != want {
+					t.Errorf("message = %q, want %q", env.Error, want)
+				}
+			})
+		}
+	}
+}
+
+// stallAfterReader yields body once, then reports the read timeout the server's
+// ReadTimeout produces. A client that stops sending mid-body must be told that,
+// not that it sent a second object.
+type stallAfterReader struct {
+	body string
+	done bool
+}
+
+func (r *stallAfterReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+	}
+	r.done = true
+	return copy(p, r.body), nil
+}
+
+func TestTrailingStallReportsTheTimeout(t *testing.T) {
+	s := &Server{
+		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0),
+		log:     slog.New(slog.DiscardHandler),
+	}
+	r := httptest.NewRequest(http.MethodPost, "/report", &stallAfterReader{body: `{"session_generation":1}`})
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%q)", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if want := "request body was not received before the read timeout"; env.Error != want {
+		t.Errorf("message = %q, want %q", env.Error, want)
 	}
 }
 
@@ -985,10 +1185,26 @@ func TestPingHealthFields(t *testing.T) {
 	if resp["browser_relaunched"] != false {
 		t.Errorf("browser_relaunched = %v, want false when the browser answered", resp["browser_relaunched"])
 	}
-	for _, k := range []string{"ok", "probe", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "reason", "browser_relaunched"} {
+	// keyed says whether the daemon requires a key, so `waxseal ping --key X`
+	// can tell a keyless daemon that ignored it from a keyed one that read it.
+	if resp["keyed"] != true {
+		t.Errorf("keyed = %v, want true on a keyed daemon", resp["keyed"])
+	}
+	for _, k := range []string{"ok", "probe", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "reason", "browser_relaunched", "keyed"} {
 		if _, ok := resp[k]; !ok {
 			t.Errorf("/ping missing field %q", k)
 		}
+	}
+
+	// The same field on a keyless daemon says the other thing.
+	kl := liveServer(t, nil, map[string]*fakePlayerSession{"": {abrURL: "https://r/ok", vd: "vd"}})
+	klr := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	klw := httptest.NewRecorder()
+	kl.routes().ServeHTTP(klw, klr)
+	var klResp map[string]any
+	mustUnmarshal(t, klw.Body.Bytes(), &klResp)
+	if klResp["keyed"] != false {
+		t.Errorf("keyed = %v on a keyless daemon, want false", klResp["keyed"])
 	}
 }
 
@@ -1182,11 +1398,24 @@ func TestMetricsRedaction(t *testing.T) {
 	}
 }
 
+// The v1 New signature still exists and still refuses before it launches
+// anything, so a caller compiled against v1.3.0 keeps working.
+func TestNewKeepsTheV1Signature(t *testing.T) {
+	_, err := New(Config{
+		TenantKeys: map[string]string{"TENANTKEY": "alice"},
+		MetricsKey: "TENANTKEY",
+		Logger:     slog.New(slog.DiscardHandler),
+	})
+	if err == nil {
+		t.Fatal("New accepted a metrics key that collides with a tenant key")
+	}
+}
+
 // TestNewRejectsMetricsKeyCollision checks the public constructor path: a
 // metrics key equal to a tenant key is rejected before the browser launches, and
 // the error names the tenant label without leaking the key.
 func TestNewRejectsMetricsKeyCollision(t *testing.T) {
-	_, err := New(Config{
+	_, err := NewWithContext(context.Background(), Config{
 		TenantKeys: map[string]string{"TENANTKEY": "alice"},
 		MetricsKey: "TENANTKEY",
 		Logger:     slog.New(slog.DiscardHandler),
@@ -2368,6 +2597,39 @@ func TestPlayerContextBotCheckMaps502WithRetryAfter(t *testing.T) {
 	}
 }
 
+// A broadcast on air has no length to confirm past the preview cap, so it is a
+// terminal verdict on the video like any other: 422 with WaxSeal's own details
+// token, and negative-cached.
+func TestPlayerContextLiveBroadcastMaps422AndCaches(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd",
+		pcErr: &browser.UnplayableError{Status: browser.LiveBroadcastStatus, Detail: "broadcast is on air"}}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body = %s, want 422", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeVideoUnavailable {
+		t.Errorf("code = %q, want %q", got, CodeVideoUnavailable)
+	}
+	var env struct {
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Details != browser.LiveBroadcastStatus {
+		t.Errorf("details = %q, want %q", env.Details, browser.LiveBroadcastStatus)
+	}
+
+	if w := playerContextReq(s, "aqz-KE-bpKQ"); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second status = %d, body = %s, want 422 from the negative cache", w.Code, w.Body)
+	}
+	if got := aggregateCounter(t, s, "player_context_negative_cache_hits"); got != 1 {
+		t.Errorf("player_context_negative_cache_hits = %v, want 1", got)
+	}
+}
+
 // The browser pool's relaunch backoff reaches the mint path too, and its wait is
 // the caller's.
 func TestGetPotBackoffCarriesRetryAfter(t *testing.T) {
@@ -2476,6 +2738,9 @@ func TestPingKeylessOnKeyedDaemonProbesTheBrowser(t *testing.T) {
 	}
 	if resp["ok"] != true || resp["reason"] != PingReasonOK || resp["probe"] != PingProbeDaemon || resp["browser_relaunched"] != false {
 		t.Errorf("body = %v, want ok:true reason:ok probe:daemon browser_relaunched:false", resp)
+	}
+	if resp["keyed"] != true {
+		t.Errorf("keyed = %v, want true: the daemon-level answer still says a key is required", resp["keyed"])
 	}
 	for _, k := range []string{"tenant", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "identity", "error"} {
 		if _, leak := resp[k]; leak {

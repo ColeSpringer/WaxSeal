@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -270,7 +271,7 @@ const (
 	// one recycle per interval.
 	ReportBurst = 4
 
-	// defaultMintSeparation is how far apart the daemon keeps an in-page mint and
+	// DefaultMintSeparation is how far apart the daemon keeps an in-page mint and
 	// a context establishment. Two anchors set it, and 12 s covers both.
 	//
 	// Mint: a context established 0.6 s after the mint of the token that streamed
@@ -284,15 +285,15 @@ const (
 	// edge being below 3 s on that egress, not as retiring the earlier result.
 	//
 	// WAXSEAL_MINT_SEPARATION overrides it.
-	defaultMintSeparation = 12 * time.Second
+	DefaultMintSeparation = 12 * time.Second
 
-	// mintSeparationEnv overrides defaultMintSeparation with a positive Go
+	// MintSeparationEnv overrides DefaultMintSeparation with a positive Go
 	// duration, for example "20s".
-	mintSeparationEnv = "WAXSEAL_MINT_SEPARATION"
+	MintSeparationEnv = "WAXSEAL_MINT_SEPARATION"
 
-	// mintSeparationWarn marks an override large enough that a first context has
+	// MintSeparationWarn marks an override large enough that a first context has
 	// to wait most of the way to the per-request budget before it is served.
-	mintSeparationWarn = 60 * time.Second
+	MintSeparationWarn = 60 * time.Second
 
 	// proofRetryCooldown bounds how often a session that failed to prove
 	// full-length streaming pays another proof attempt. A proof can run up to a
@@ -422,25 +423,38 @@ var (
 	mintSeparationLargeOnce       sync.Once
 )
 
-// mintSeparationFromEnv reads the mint-to-establishment spacing. The environment
-// value wins when it parses as a positive Go duration; anything else keeps the
-// default and logs why, once per process.
-func mintSeparationFromEnv(log *slog.Logger) time.Duration {
-	raw := os.Getenv(mintSeparationEnv)
-	if raw == "" {
-		return defaultMintSeparation
+// ParseMintSeparation reads a MintSeparationEnv value: blank is the default,
+// anything else must be a positive Go duration. It is the single definition of
+// what the variable accepts, so the server command can refuse a bad value at
+// startup while a library caller keeps the lenient default below.
+func ParseMintSeparation(raw string) (time.Duration, error) {
+	if raw = strings.TrimSpace(raw); raw == "" {
+		return DefaultMintSeparation, nil
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		mintSeparationUnparseableOnce.Do(func() {
-			log.Warn("minter: ignoring "+mintSeparationEnv+"; want a positive Go duration such as 20s",
-				"value", raw, "using", defaultMintSeparation)
-		})
-		return defaultMintSeparation
+		return 0, fmt.Errorf("invalid %s %q: want a positive Go duration such as 20s", MintSeparationEnv, raw)
 	}
-	if d > mintSeparationWarn {
+	return d, nil
+}
+
+// mintSeparationFromEnv reads the mint-to-establishment spacing for a caller
+// that did not set one. A value ParseMintSeparation refuses keeps the default
+// and logs why, once per process; the server command turns the same refusal
+// into a startup error instead.
+func mintSeparationFromEnv(log *slog.Logger) time.Duration {
+	raw := os.Getenv(MintSeparationEnv)
+	d, err := ParseMintSeparation(raw)
+	if err != nil {
+		mintSeparationUnparseableOnce.Do(func() {
+			log.Warn("minter: ignoring "+MintSeparationEnv+"; want a positive Go duration such as 20s",
+				"value", raw, "using", DefaultMintSeparation)
+		})
+		return DefaultMintSeparation
+	}
+	if d > MintSeparationWarn {
 		mintSeparationLargeOnce.Do(func() {
-			log.Warn("minter: "+mintSeparationEnv+" is large; values near the request budget make first contexts time out",
+			log.Warn("minter: "+MintSeparationEnv+" is large; values near the request budget make first contexts time out",
 				"value", d)
 		})
 	}
@@ -567,10 +581,10 @@ func (m *Minter) ensureProven(ctx context.Context, sess minterSession, gen uint6
 	return m.prove(ctx, sess, gen, what, true)
 }
 
-// prove is ensureProven's body. replaceOnDeath allows one replacement when the
-// browser dies during the proof; the replacement is proved with it false, so a
-// request takes at most one replacement here.
-func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what string, replaceOnDeath bool) (minterSession, uint64, error) {
+// prove is ensureProven's body. allowReplacement permits one replacement, for a
+// death or a bot check during the proof; the replacement is proved with it
+// false, so a request takes at most one replacement here.
+func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what string, allowReplacement bool) (minterSession, uint64, error) {
 	// The cool-down is checked before the established short-circuit: a bot check
 	// can open one on a session that already proved, and that session must be
 	// refused too. A record exists only after a failed proof or a bot check, so an
@@ -630,7 +644,7 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 			m.metrics.UnprovenRejections.Add(1)
 			return sess, gen, ctx.Err()
 		}
-		if replaceOnDeath {
+		if allowReplacement {
 			newSess, newGen, err := m.ensure(ctx)
 			if err != nil {
 				return nil, 0, err
@@ -651,6 +665,19 @@ func (m *Minter) prove(ctx context.Context, sess minterSession, gen uint64, what
 	// and a fresh identity can. The proof-failure streak is a separate rule and is
 	// left untouched here.
 	if errors.Is(proofErr, browser.ErrBotCheck) {
+		if !allowReplacement {
+			// Already on this request's one replacement: open the cool-down on
+			// this generation and refuse, claiming no window, as
+			// relaunchAndProve does for a walled replacement.
+			m.recordBotCheck(gen, proofErr, false)
+			m.log.Warn("minter: refusing "+what+"; the replacement session hit a bot check as well",
+				"gen", gen, "err", proofErr)
+			m.metrics.UnprovenRejections.Add(1)
+			if deadline {
+				return sess, gen, ctx.Err()
+			}
+			return sess, gen, botCheckRefusal(proofErr)
+		}
 		// A caller whose own budget is already spent cannot launch and prove a fresh
 		// session, so it does not claim the window either.
 		if !m.recordBotCheck(gen, proofErr, !deadline) {
@@ -1249,33 +1276,39 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	m.retire(gen, reason, true)
 }
 
-// refreshStreamingSession replaces a stale or reported-degraded session before a
-// streaming handoff. The caller must hold mintMu. Token-only requests bypass this
-// check so they do not recycle an otherwise usable session.
-func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, uint64, error) {
+// retireReported retires the current generation when a consumer report is
+// pending on it, charging the report budget the way an immediate retirement
+// does. Every request that takes the page calls it first, so a deferred report
+// is consumed by the next request of any kind. The caller holds mintMu.
+func (m *Minter) retireReported() bool {
 	m.mu.Lock()
 	cur := m.gen
-	live := m.sess != nil
-	suspect := live && m.reportSuspectGen == cur && cur != 0
-	stale := live && !m.streamingDeadline.IsZero() && time.Now().After(m.streamingDeadline)
+	suspect := m.sess != nil && m.reportSuspectGen == cur && cur != 0
 	m.mu.Unlock()
+	if !suspect || !m.retire(cur, "consumer reported degradation; relaunching", false) {
+		return false
+	}
+	m.metrics.ReportDrivenRecycles.Add(1)
+	// Deferred and immediate report-driven recycles share one budget.
+	m.mu.Lock()
+	m.spendReportTokenLocked()
+	m.mu.Unlock()
+	return true
+}
 
-	if live && (suspect || stale) {
+// refreshStreamingSession replaces a stale or reported-degraded session before a
+// streaming handoff. The caller must hold mintMu. Token-only requests do not
+// recycle an otherwise usable session for age, though they do consume a pending
+// report the same way this does.
+func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, uint64, error) {
+	if !m.retireReported() {
+		m.mu.Lock()
+		cur := m.gen
+		stale := m.sess != nil && !m.streamingDeadline.IsZero() && time.Now().After(m.streamingDeadline)
+		m.mu.Unlock()
 		// retire verifies that cur is still current.
-		reason := "streaming session exceeded max age; relaunching"
-		if suspect {
-			reason = "consumer reported degradation; relaunching"
-		}
-		if m.retire(cur, reason, false) {
-			if suspect {
-				m.metrics.ReportDrivenRecycles.Add(1)
-				// Deferred and immediate report-driven recycles share one budget.
-				m.mu.Lock()
-				m.spendReportTokenLocked()
-				m.mu.Unlock()
-			} else {
-				m.metrics.StreamingRecycles.Add(1)
-			}
+		if stale && m.retire(cur, "streaming session exceeded max age; relaunching", false) {
+			m.metrics.StreamingRecycles.Add(1)
 		}
 	}
 	return m.ensure(ctx)
@@ -1293,8 +1326,10 @@ func (m *Minter) Generation() uint64 {
 // ReportResult describes how the minter handled a degradation report. Accepted
 // indicates that the report applies to the current session. Retired indicates
 // that the session was closed immediately. RetirementPending indicates that it
-// will be closed at the next streaming handoff. RetryAfterSeconds is set when the
-// report was rate-limited.
+// will be closed by the next request that takes the page. Accepted with neither
+// set means the session was already gone when the report was applied, a crash
+// having landed first. RetryAfterSeconds is set when the report was
+// rate-limited.
 type ReportResult struct {
 	Accepted          bool
 	Retired           bool
@@ -1305,8 +1340,9 @@ type ReportResult struct {
 
 // ReportDegraded records that generation gen produced a degraded stream. videoID
 // and reason are diagnostic. The report is rate-limited and applies only to the
-// current generation. If a browser operation is in progress, retirement is
-// deferred until the next streaming handoff.
+// current generation. Its cached tokens are dropped at once either way; if a
+// browser operation is in progress, retirement is deferred to the next request
+// that takes the page.
 func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult {
 	// Marking the generation before releasing m.mu deduplicates concurrent reports.
 	m.mu.Lock()
@@ -1346,12 +1382,20 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	}
 	m.reportSuspectGen = gen
 	m.reportSuspectVideoID = videoID
+	// Dropped now rather than when the retirement lands: a report that has to
+	// wait for the page would otherwise leave the tokens it called degraded
+	// servable to every token request in between.
+	m.dropReportedGenerationLocked(gen)
 	m.metrics.DegradationReportsAccepted.Add(1)
 	m.mu.Unlock()
 
+	retireReason := "consumer report"
+	if reason != "" {
+		retireReason += ": " + reason
+	}
 	// Only the first report for this generation attempts immediate retirement.
 	if m.mintMu.TryLock() {
-		acted := m.retire(gen, "consumer report: "+reason, false)
+		acted := m.retire(gen, retireReason, false)
 		// Spend report budget only when this report actually recycles the session.
 		// If a crash watcher or max-age retirement already closed the generation,
 		// retire is a no-op and should not eat into the next real report's budget.
@@ -1360,6 +1404,8 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 			m.spendReportTokenLocked()
 			m.mu.Unlock()
 			m.metrics.ReportDrivenRecycles.Add(1)
+		} else {
+			m.log.Debug("minter: report accepted but nothing was left to retire; a crash or recycle landed first", "gen", gen)
 		}
 		m.mintMu.Unlock()
 		return ReportResult{Accepted: true, Retired: acted, Generation: gen}
@@ -1413,6 +1459,10 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 
 	m.mintMu.Lock() // one page, so mints serialize
 	defer m.mintMu.Unlock()
+	// A token request takes the page, so it consumes a pending report: minting
+	// on the reported identity would hand out a fresh token for a session the
+	// consumer called degraded.
+	m.retireReported()
 	// Another goroutine may have filled the cache while this call waited for
 	// mintMu, and the session may have crossed its bound during that wait. The age
 	// is read again rather than carried across the wait: a request parked behind a
@@ -1434,11 +1484,12 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		// generation and so never clears the cache. Without this the entry is
 		// unreachable for the rest of its life while every request 502s.
 		//
-		// One sequence deliberately finds nothing here: a consumer degradation
-		// report drops its generation's tokens, so a report followed by a failing
-		// relaunch is a hard failure rather than another serving of the token that
-		// was just called degraded. That is fail-closed on purpose, and ReportBurst
-		// plus the debounce bound how often a consumer can ask for it.
+		// One sequence deliberately finds nothing here: an accepted report drops
+		// its generation's tokens when it arrives, deferred or not, so a report
+		// followed by a failing relaunch is a hard failure rather than another
+		// serving of the token that was just called degraded. That is fail-closed
+		// on purpose, and ReportBurst plus the debounce bound how often a consumer
+		// can ask for it.
 		if ctx.Err() == nil {
 			if r, ok := m.cacheGet(key); ok {
 				m.metrics.CacheHits.Add(1)
@@ -1547,6 +1598,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// retrying a 502 (or a malicious caller) cannot force repeated relaunches.
 	if err := m.negCacheGet(videoID); err != nil {
 		m.metrics.PlayerContextNegativeCacheHits.Add(1)
+		m.log.Debug("minter: player-context refused from the negative cache", "video_id", videoID)
 		return browser.PlayerContext{}, 0, err
 	}
 
@@ -1680,10 +1732,10 @@ func (m *Minter) playerContextOnReplacement(ctx context.Context, videoID string)
 	if err != nil {
 		return browser.PlayerContext{}, 0, err
 	}
-	// This launch is already the request's one extra session, so its proof gets no
-	// death replacement of its own: ensureProven would otherwise launch a third
-	// Chromium under mintMu for a single request, blocking the tenant while it
-	// does, with none of it counted.
+	// This launch is already the request's one extra session, so its proof gets
+	// no replacement of its own, for a death or a bot check: ensureProven would
+	// otherwise launch a third Chromium under mintMu for a single request,
+	// blocking the tenant while it does, with none of it counted.
 	sess, gen, err = m.prove(ctx, sess, gen, "player-context", false)
 	if err != nil {
 		return browser.PlayerContext{}, gen, err
@@ -1784,8 +1836,8 @@ func (m *Minter) negCacheGet(videoID string) error {
 // full.
 func (m *Minter) negCachePut(videoID string, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed { // see cachePutLocked: Close leaves both caches empty
+		m.mu.Unlock()
 		return
 	}
 	now := time.Now()
@@ -1805,6 +1857,19 @@ func (m *Minter) negCachePut(videoID string, err error) {
 		}
 	}
 	m.negCache[videoID] = negEntry{err: err, expiry: now.Add(minterNegCacheTTL)}
+	m.mu.Unlock()
+
+	// The one place a fresh verdict enters the cache, so it fires once per
+	// verdict rather than once per request from a caller looping on one video.
+	// Logged outside m.mu, as retire does, so a slow handler cannot hold it.
+	status := ""
+	if ue, ok := errors.AsType[*browser.UnplayableError](err); ok {
+		status = ue.Status
+	}
+	m.log.Info("minter: video unavailable; verdict cached", "video_id_len", len(videoID), "status", status)
+	// A distinct message, not a second copy of the line above: -v would
+	// otherwise report two verdicts for every one cached.
+	m.log.Debug("minter: negative cache entry written", "video_id", videoID, "status", status, "err", err)
 }
 
 // cacheKey returns the shared key format used by request and startup mints.
@@ -1898,6 +1963,14 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 	if m.closed {
 		return
 	}
+	// A generation under a consumer report is on its way out. A mint that was
+	// already holding the page when the report arrived still returns its token,
+	// but caching it would serve the reported identity from the fast path to
+	// every later request for the binding, none of which would take the page
+	// and consume the retirement.
+	if m.reportSuspectGen != 0 && m.reportSuspectGen == gen {
+		return
+	}
 	ttl := time.Duration(res.Lifetime) * time.Second
 	if ttl <= 0 || ttl > minterMaxCacheTTL {
 		ttl = minterMaxCacheTTL
@@ -1973,9 +2046,10 @@ func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http
 		if err != nil {
 			return browser.Identity{}, nil, 0, err
 		}
-		// The second pass is already running on a replacement, so its proof gets no
-		// death replacement of its own: prove would otherwise launch again, and a
-		// single /session call could serialize four launches under mintMu.
+		// The second pass is already running on a replacement, so its proof gets
+		// no replacement of its own, for a death or a bot check: prove would
+		// otherwise launch again, and a single /session call could serialize four
+		// launches under mintMu.
 		sess, gen, err = m.prove(ctx, sess, gen, "session", !replaced)
 		if err != nil {
 			return browser.Identity{}, nil, 0, err
@@ -2249,6 +2323,7 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 		switch {
 		case err == nil:
 			m.markProved()
+			m.log.Info("minter: self-test streaming proof passed", "gen", gen)
 		case errors.Is(err, browser.ErrBotCheck):
 			// No cool-down for a bot check at boot: a walled daemon would refuse its
 			// first requests without ever trying a fresh identity. With no record the

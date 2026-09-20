@@ -115,7 +115,7 @@ func TestValidateLaunchOptions(t *testing.T) {
 // before it starts Chromium: an invalid LandingURL/StopAfterLoad combination
 // returns the validation error straight away rather than a launch failure.
 func TestLaunchPoolValidatesOptions(t *testing.T) {
-	_, err := LaunchPool(Options{LandingURL: "http://127.0.0.1:1/"})
+	_, err := LaunchPool(context.Background(), Options{LandingURL: "http://127.0.0.1:1/"})
 	if err == nil {
 		t.Fatal("LaunchPool with LandingURL but no StopAfterLoad = nil error, want the validation error")
 	}
@@ -495,7 +495,48 @@ func TestConfirmTerminal(t *testing.T) {
 			r.PlayabilityStatus = "LOGIN_REQUIRED"
 			r.Reason = "This video is private"
 			r.VideoIDMatch = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		// The onError branch keeps its literal only when the page has no fresh
+		// status to report; a fresh non-OK status is the verdict.
+		{"onError 150 with a fresh LOGIN_REQUIRED and no videoDetails", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		// The response object is still the previous load's, so its status is not
+		// this video's verdict; the onError literal stands.
+		{"onError 150 while the response is still the previous load's", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = false
 		}), ErrUnplayable, "ERROR"},
+		// A refusal without videoDetails is terminal on its own once the response
+		// is the new load's, without waiting for onError.
+		{"non-OK status, no videoDetails, response changed", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		{"non-OK status, no videoDetails, response unchanged", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+		}), nil, ""},
+		// An on-air broadcast is refused before any confirmation runs.
+		{"live broadcast on air", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "OK"
+			r.VideoIDMatch = true
+			r.IsLiveNow = true
+		}), ErrUnplayable, LiveBroadcastStatus},
+		{"live flag on another video's response", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "OK"
+			r.IsLiveNow = true
+		}), nil, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -522,6 +563,15 @@ func TestConfirmTerminal(t *testing.T) {
 			}
 			if gotStatus != tt.wantStatus {
 				t.Errorf("status = %q, want %q", gotStatus, tt.wantStatus)
+			}
+			// When a fresh status wins over an onError code, the detail keeps
+			// both: the player's reason, and the code it also raised.
+			if ue, ok := errors.AsType[*UnplayableError](err); ok && tt.wantStatus == "LOGIN_REQUIRED" && tt.raw.ErrCode != 0 {
+				for _, sub := range []string{tt.raw.Reason, fmt.Sprintf("onError %d", tt.raw.ErrCode)} {
+					if !strings.Contains(ue.Detail, sub) {
+						t.Errorf("detail = %q, want it to contain %q", ue.Detail, sub)
+					}
+				}
 			}
 		})
 	}
@@ -1082,5 +1132,43 @@ func TestHTTPCookieFromCDP(t *testing.T) {
 		if got := httpCookieFromCDP(&cdp.Cookie{SameSite: in}).SameSite; got != want {
 			t.Errorf("SameSite(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// setupSession cannot be driven by a fake page (it takes a real *cdp.Browser),
+// so the eval-to-warning mapping is tested on its own. A landing video the page
+// refused is only ever a warning: attestation does not read it.
+func TestWarnLandingPlayability(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		wantWarn  bool
+	}{
+		{"playable", `{"Status":"OK","Reason":""}`, false},
+		{"no status read", `{}`, false},
+		{"unparseable", `not json`, false},
+		{"login required", `{"Status":"LOGIN_REQUIRED","Reason":"Private video"}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			warnLandingPlayability(slog.New(slog.NewTextHandler(&logs, nil)), "vid", tc.raw)
+			if got := strings.Contains(logs.String(), "landing video is not playable"); got != tc.wantWarn {
+				t.Errorf("warned = %v, want %v (log %q)", got, tc.wantWarn, logs.String())
+			}
+			if tc.wantWarn && !strings.Contains(logs.String(), "Private video") {
+				t.Errorf("log = %q, want it to carry the player's reason", logs.String())
+			}
+		})
+	}
+
+	// A wall is the session's problem, not the video's, so it says so rather
+	// than implying another candidate would work.
+	var logs strings.Builder
+	warnLandingPlayability(slog.New(slog.NewTextHandler(&logs, nil)), "vid",
+		`{"Status":"LOGIN_REQUIRED","Reason":"Sign in to confirm you\u2019re not a bot"}`)
+	if !strings.Contains(logs.String(), "bot check") {
+		t.Errorf("log = %q, want the wall named", logs.String())
+	}
+	if strings.Contains(logs.String(), "falls back to another candidate") {
+		t.Errorf("log = %q, want it not to promise a fallback that is also walled", logs.String())
 	}
 }
