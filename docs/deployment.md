@@ -28,12 +28,12 @@ The file pulls `:latest`. `WAXSEAL_VERSION` picks a tag instead, on the command
 line or in a `.env` file beside `compose.yaml`, which compose reads on its own:
 
 ```sh
-WAXSEAL_VERSION=1.4.0 docker compose up -d --wait
+WAXSEAL_VERSION=1.4.1 docker compose up -d --wait
 ```
 
 ```sh
 # .env
-WAXSEAL_VERSION=1.4.0
+WAXSEAL_VERSION=1.4.1
 ```
 
 The release pipeline publishes each tag as a manifest covering linux/amd64 and
