@@ -2746,16 +2746,20 @@ func TestPlayerContextWaitsForMintSeparation(t *testing.T) {
 		t.Fatalf("warm: %v", err)
 	}
 	held.mintSeparation = 50 * time.Millisecond
+	// The wait is measured from the anchor the gate reads, never from a stopwatch
+	// started afterwards: the gate waits exactly the window from its anchor, so
+	// whatever runs between the two starts reads as a short wait, and on a slow
+	// runner under the race detector that was enough to fail.
+	anchor := time.Now()
 	held.mu.Lock()
-	held.lastMintAt = time.Now()
+	held.lastMintAt = anchor
 	held.mu.Unlock()
 
-	start := time.Now()
 	if _, _, err := held.PlayerContext(ctx, "vid"); err != nil {
 		t.Fatalf("player-context: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Errorf("player-context returned after %v, want at least the 50ms separation", elapsed)
+	if elapsed := time.Since(anchor); elapsed < 50*time.Millisecond {
+		t.Errorf("player-context returned %v after the mint, want at least the 50ms separation", elapsed)
 	}
 	if got := held.metrics.SeparationWaits.Load(); got != 1 {
 		t.Errorf("separation_waits = %d, want 1", got)
@@ -2777,7 +2781,7 @@ func TestPlayerContextWaitsForMintSeparation(t *testing.T) {
 	free.lastProofAt = time.Now().Add(-10 * time.Second)
 	free.mu.Unlock()
 
-	start = time.Now()
+	start := time.Now()
 	if _, _, err := free.PlayerContext(ctx, "vid"); err != nil {
 		t.Fatalf("player-context: %v", err)
 	}
@@ -2799,16 +2803,16 @@ func TestMintWaitsAfterEstablishment(t *testing.T) {
 		t.Fatalf("warm: %v", err)
 	}
 	held.mintSeparation = 50 * time.Millisecond
+	anchor := time.Now()
 	held.mu.Lock()
-	held.lastEstablishAt = time.Now()
+	held.lastEstablishAt = anchor
 	held.mu.Unlock()
 
-	start := time.Now()
 	if _, cached, err := held.Mint(ctx, "player", "vid"); err != nil || cached {
 		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
 	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Errorf("mint returned after %v, want at least the 50ms separation", elapsed)
+	if elapsed := time.Since(anchor); elapsed < 50*time.Millisecond {
+		t.Errorf("mint returned %v after the establishment, want at least the 50ms separation", elapsed)
 	}
 	if got := held.metrics.SeparationWaits.Load(); got != 1 {
 		t.Errorf("separation_waits = %d, want 1", got)
@@ -2823,7 +2827,7 @@ func TestMintWaitsAfterEstablishment(t *testing.T) {
 	free.lastEstablishAt = time.Now().Add(-10 * time.Second)
 	free.mu.Unlock()
 
-	start = time.Now()
+	start := time.Now()
 	if _, cached, err := free.Mint(ctx, "player", "vid"); err != nil || cached {
 		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
 	}
@@ -2851,14 +2855,20 @@ func TestFailedPlayerContextArmsMintGate(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); err == nil {
 		t.Fatal("player-context = nil error, want the configured failure")
 	}
+	// The attempt set the anchor itself, so the stopwatch is read back from it.
+	m.mu.Lock()
+	armedAt := m.lastEstablishAt
+	m.mu.Unlock()
+	if armedAt.IsZero() {
+		t.Fatal("the failed player-context attempt left lastEstablishAt zero, so nothing armed the mint gate")
+	}
 	m.mintSeparation = 50 * time.Millisecond
 
-	start := time.Now()
 	if _, cached, err := m.Mint(ctx, "player", "vid2"); err != nil || cached {
 		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
 	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Errorf("mint returned after %v, want at least the 50ms separation from the failed player-context attempt", elapsed)
+	if elapsed := time.Since(armedAt); elapsed < 50*time.Millisecond {
+		t.Errorf("mint returned %v after the failed player-context attempt, want at least the 50ms separation", elapsed)
 	}
 	if got := m.metrics.SeparationWaits.Load(); got != 1 {
 		t.Errorf("separation_waits = %d, want 1", got)
@@ -3199,17 +3209,17 @@ func TestPlayerContextWaitsAfterProof(t *testing.T) {
 		t.Fatalf("first player-context: %v", err)
 	}
 	held.mintSeparation = 50 * time.Millisecond
+	proofAt := time.Now()
 	held.mu.Lock()
-	held.lastMintAt = time.Now().Add(-time.Hour) // an anchor on the mint alone would not wait
-	held.lastProofAt = time.Now()
+	held.lastMintAt = proofAt.Add(-time.Hour) // an anchor on the mint alone would not wait
+	held.lastProofAt = proofAt
 	held.mu.Unlock()
 
-	start := time.Now()
 	if _, _, err := held.PlayerContext(ctx, "vid2"); err != nil {
 		t.Fatalf("player-context: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Errorf("player-context returned after %v, want at least the 50ms separation from the proof", elapsed)
+	if elapsed := time.Since(proofAt); elapsed < 50*time.Millisecond {
+		t.Errorf("player-context returned %v after the proof, want at least the 50ms separation", elapsed)
 	}
 	if got := held.metrics.SeparationWaits.Load(); got != 1 {
 		t.Errorf("separation_waits = %d, want 1", got)
@@ -3231,7 +3241,7 @@ func TestPlayerContextWaitsAfterProof(t *testing.T) {
 	free.lastEstablishAt = time.Now() // the handoff just performed
 	free.mu.Unlock()
 
-	start = time.Now()
+	start := time.Now()
 	if _, _, err := free.PlayerContext(ctx, "vid2"); err != nil {
 		t.Fatalf("player-context: %v", err)
 	}
