@@ -399,6 +399,7 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 			ApproxDurationMs: int64(f.ApproxDurationMs),
 			IsDrc:            f.IsDrc,
 			AudioTrackID:     f.AudioTrackID,
+			AudioIsDefault:   f.AudioIsDefault,
 		})
 	}
 	// Allocate the ladder only when the response carried rungs, so an absent or

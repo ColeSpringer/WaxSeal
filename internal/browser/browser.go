@@ -1701,8 +1701,8 @@ type Thumbnail struct {
 // player-response reload instead of returning media.
 type AudioFormat struct {
 	Itag             int    `json:"itag"`
-	LMT              string `json:"lmt"` // lastModified, kept as a string because it is a large opaque URL parameter
-	XTags            string `json:"xtags"`
+	LMT              string `json:"lmt"`   // lastModified, kept as a string because it is a large opaque URL parameter
+	XTags            string `json:"xtags"` // verbatim: SABR keys the rendition on it, and a consumer reads the audio role (acont) from it
 	MimeType         string `json:"mime_type"`
 	Bitrate          int    `json:"bitrate"`
 	ContentLength    int64  `json:"content_length"`
@@ -1710,8 +1710,9 @@ type AudioFormat struct {
 	AudioSampleRate  int    `json:"audio_sample_rate"`
 	AudioChannels    int    `json:"audio_channels"`
 	AudioQuality     string `json:"audio_quality"`
-	IsDrc            bool   `json:"is_drc"`         // whether client_abr_state.drc_enabled is required
-	AudioTrackID     string `json:"audio_track_id"` // audioTrack.id; empty for the default or only track
+	IsDrc            bool   `json:"is_drc"`                     // whether client_abr_state.drc_enabled is required
+	AudioTrackID     string `json:"audio_track_id"`             // audioTrack.id, such as "en.4"; every entry of a multi-track video carries one, "" on a single-track video
+	AudioIsDefault   *bool  `json:"audio_is_default,omitempty"` // audioTrack.audioIsDefault as the player states it beside a track id: true on a multi-track video's default track, which can be a dub, false on its other tracks; absent otherwise
 }
 
 // playerReadyJS reports whether the player exposes the APIs required to load and
@@ -1811,6 +1812,7 @@ const playerContextExtractJS = `(videoId) => {
 					content_length: Number(f.contentLength || 0), approx_duration_ms: Number(f.approxDurationMs || 0),
 					audio_sample_rate: Number(f.audioSampleRate || 0), audio_channels: Number(f.audioChannels || 0), audio_quality: f.audioQuality || '',
 					is_drc: f.isDrc === true, audio_track_id: (f.audioTrack && f.audioTrack.id) || '',
+					audio_is_default: (f.audioTrack && f.audioTrack.id && typeof f.audioTrack.audioIsDefault === 'boolean') ? f.audioTrack.audioIsDefault : undefined,
 				};
 			});
 		const visitorData = (function () {

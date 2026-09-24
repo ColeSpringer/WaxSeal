@@ -174,8 +174,11 @@ retires the session and serves the replacement.
 `POST /player-context {"video_id":"<id>"}` or `GET /player-context?video_id=<id>`
 returns the browser's streaming context. Select each `audio_formats` entry by its
 full `(itag, lmt, xtags)` tuple, never by `itag` alone: a clean track and a DRC
-track can share `itag` 251 and differ only in `xtags`, and an inconsistent tuple
-makes the SABR server return a player-response reload instead of media.
+track can share `itag` 251 and differ in `lmt` and `xtags`, and an inconsistent tuple
+makes the SABR server return a player-response reload instead of media. `xtags`
+is the player response's value verbatim, an unpadded base64url protobuf of
+key/value pairs: a consumer reads the audio role (`acont`) from it to rank the
+original track, and sends it back byte for byte.
 `playability_status` is YouTube's string status (such as `"OK"`), not the SABR
 status-1 protection code embedded in the signed URL.
 
@@ -205,7 +208,7 @@ status-1 protection code embedded in the signed URL.
     {
       "itag": 251,
       "lmt": "1699999999999999",
-      "xtags": "",                          // "" when the video has one audio track; multi-track videos label every entry (such as "en-US.4"), and the original track's xtags decode to acont=original
+      "xtags": "",                          // "" for a plain single track
       "mime_type": "audio/webm; codecs=\"opus\"",
       "bitrate": 130000,
       "content_length": 10318791,
@@ -214,13 +217,21 @@ status-1 protection code embedded in the signed URL.
       "audio_channels": 2,
       "audio_quality": "AUDIO_QUALITY_MEDIUM",
       "is_drc": false,
-      "audio_track_id": ""                  // empty for the default or only track
+      "audio_track_id": ""                  // "" on a single-track video, which also omits audio_is_default
     },
     {
       "itag": 251, "lmt": "1699999999999998", "xtags": "CggKA2RyYxIBMQ", "is_drc": true
       // same itag as the clean track, different lmt and xtags: the DRC variant.
       // A third variant, xtags "CgcKAnZiEgEx" with is_drc false, can share the itag too.
       // Remaining fields as above. Select by the full tuple, never itag alone.
+    },
+    {
+      "itag": 251, "lmt": "1699999999999997", "xtags": "ChEKBWFjb250EghvcmlnaW5hbAoNCgRsYW5nEgVlbi1VUw",
+      "audio_track_id": "en-US.4", "audio_is_default": true
+      // an entry of a multi-track video, for the two fields a single-track one omits: every entry names
+      // its track (audioTrack.id) and states audioTrack.audioIsDefault as the player does, true on the
+      // default track, which can be a dub, and false on the rest; its xtags carries the audio role, here
+      // acont=original, which a consumer ranks the original track by before falling back to the flag.
     }
   ],
   "session_generation": 1
@@ -707,7 +718,10 @@ since a root-level `go test -tags e2e ./...` silently descends into nothing; the
 need a warm daemon and include the full-length WEB SABR download
 (`go test -tags e2e -run PlayerContextOnlyFullLength ./...`). Set
 `WAXSEAL_E2E_LOG_LEVEL=debug` to see the in-process daemon's debug logs in
-`go test -v` output for that suite. `TestAgingMatrix` is a separate, opt-in
+`go test -v` output for that suite. `WAXSEAL_E2E_MULTITRACK_VIDEO=<id>` names a
+video with several audio tracks for `TestPlayerContextFieldsHTTP`, whose multitrack
+subtest skips without one, since the freely licensed videos the suite uses have
+a single track. `TestAgingMatrix` is a separate, opt-in
 measurement of how an artifact's age affects a capped stream, not a regression
 test: it skips unless `WAXSEAL_E2E_AGING=1` (which artifact's age predicts a
 truncated stream), `=2` (how much separation between a mint and a served context

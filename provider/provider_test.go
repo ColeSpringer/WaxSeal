@@ -149,7 +149,9 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 				"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
 				"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
 				"audio_channels": 2, "audio_quality": "AUDIO_QUALITY_MEDIUM",
-				"is_drc": true, "audio_track_id": "en.4",
+				"is_drc": true, "audio_track_id": "en.4", "audio_is_default": true,
+			}, {
+				"itag": 251, "lmt": "172", "xtags": "Y", "mime_type": "audio/webm", "audio_track_id": "fr.3",
 			}},
 		})
 	})
@@ -196,8 +198,8 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 		pc.Thumbnails[1].Width != 1280 || pc.Thumbnails[1].Height != 720 {
 		t.Errorf("thumbnails = %+v, want the wire order with widths and heights", pc.Thumbnails)
 	}
-	if len(pc.AudioFormats) != 1 {
-		t.Fatalf("audio formats = %d, want 1", len(pc.AudioFormats))
+	if len(pc.AudioFormats) != 2 {
+		t.Fatalf("audio formats = %d, want 2", len(pc.AudioFormats))
 	}
 	f := pc.AudioFormats[0]
 	if f.Itag != 251 || f.LMT != "171" || f.XTags != "X" || f.MimeType != "audio/webm" || f.Bitrate != 130000 {
@@ -210,6 +212,17 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 	// These fields are required by SABR setup and must survive both mappings.
 	if !f.IsDrc || f.AudioTrackID != "en.4" {
 		t.Errorf("DRC/track fields dropped: is_drc=%v audio_track_id=%q", f.IsDrc, f.AudioTrackID)
+	}
+	// The default flag travels as stated, and an entry that states none reaches
+	// WaxTap as nil, which it ranks as unknown rather than as a dub.
+	switch {
+	case f.AudioIsDefault == nil:
+		t.Error("audio_is_default is unstated, want a stated true")
+	case !*f.AudioIsDefault:
+		t.Error("audio_is_default = false, want a stated true")
+	}
+	if g := pc.AudioFormats[1]; g.AudioTrackID != "fr.3" || g.AudioIsDefault != nil {
+		t.Errorf("second format: track %q, default flag stated %v; want fr.3 with no flag", g.AudioTrackID, g.AudioIsDefault != nil)
 	}
 }
 

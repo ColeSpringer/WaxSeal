@@ -324,7 +324,7 @@ func TestDefaultVideoSet(t *testing.T) {
 
 // TestAudioFormatTagDrift keeps the extracted JSON fields in sync with AudioFormat.
 func TestAudioFormatTagDrift(t *testing.T) {
-	const payload = `{"itag":251,"lmt":"171","is_drc":true,"audio_track_id":"en.4"}`
+	const payload = `{"itag":251,"lmt":"171","is_drc":true,"audio_track_id":"en.4","audio_is_default":false}`
 	var f AudioFormat
 	if err := json.Unmarshal([]byte(payload), &f); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -334,6 +334,18 @@ func TestAudioFormatTagDrift(t *testing.T) {
 	}
 	if f.AudioTrackID != "en.4" {
 		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
+	}
+	if f.AudioIsDefault == nil || *f.AudioIsDefault {
+		t.Error("audio_is_default did not decode into AudioIsDefault as a stated false")
+	}
+	// The snippet leaves the key out when the player states nothing, and that
+	// has to decode as unstated, not as false.
+	var bare AudioFormat
+	if err := json.Unmarshal([]byte(`{"itag":251}`), &bare); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if bare.AudioIsDefault != nil {
+		t.Errorf("audio_is_default = %v without the key, want nil", *bare.AudioIsDefault)
 	}
 }
 

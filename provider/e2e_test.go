@@ -4,6 +4,7 @@ package provider_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -12,17 +13,22 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/provider"
 	"github.com/colespringer/waxseal/server"
 	waxtap "github.com/colespringer/waxtap/v3"
+	"github.com/colespringer/waxtap/v3/format"
 	"github.com/colespringer/waxtap/v3/potoken"
+	"github.com/colespringer/waxtap/v3/youtube"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // These manual e2e tests require Chromium and network access. Unless WAXSEAL_URL
@@ -567,73 +573,335 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	}
 }
 
-// TestPlayerContextMetadataLive checks that the metadata WaxTap asked for
-// arrives from a real player response, not just from the wire structs. The
-// landing page is the watch page, so the player's own /player response is a WEB
-// response and carries a microformat; the publish-date assertion still hedges,
-// because a response without one is legal and leaves the field empty.
-func TestPlayerContextMetadataLive(t *testing.T) {
+// multitrackVideoEnv names a video with several audio tracks for
+// TestPlayerContextFieldsHTTP's multitrack subtest. The freely licensed videos
+// this suite uses have one track each, and the labelling WaxTap ranks the
+// original track by only shows on a video with several, so the operator
+// supplies one.
+const multitrackVideoEnv = "WAXSEAL_E2E_MULTITRACK_VIDEO"
+
+// TestPlayerContextFieldsHTTP checks real contexts, as the provider hands them
+// to WaxTap, against what WaxTap consumes: one subtest per concern, on one
+// daemon. The Big Buck Bunny context is fetched once, by the first subtest that
+// needs it, so a focused multitrack run pays no establishment it does not use
+// and a Big Buck Bunny failure stays in its own subtests. The landing page is
+// the watch page, so the player's own /player response is a WEB response and
+// carries a microformat; the publish-date assertion still hedges, because a
+// response without one is legal and leaves the field empty.
+func TestPlayerContextFieldsHTTP(t *testing.T) {
 	base := startColdDaemon(t)
-	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	pc, err := c.PlayerContext(ctx, bbbVideoID)
-	if err != nil {
-		t.Fatalf("PlayerContext(%s): %v", bbbVideoID, err)
+	var (
+		bbbOnce sync.Once
+		bbbPC   potoken.PlayerContext
+		bbbErr  error
+	)
+	bbb := func(t *testing.T) potoken.PlayerContext {
+		t.Helper()
+		bbbOnce.Do(func() { bbbPC, bbbErr = p.ProvidePlayerContext(ctx, bbbVideoID) })
+		if bbbErr != nil {
+			t.Fatalf("ProvidePlayerContext(%s): %v", bbbVideoID, bbbErr)
+		}
+		return bbbPC
 	}
 
-	if !strings.HasPrefix(pc.ChannelID, "UC") {
-		t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
-	}
-	if pc.Description == "" {
-		t.Error("description is empty; videoDetails.shortDescription was not read")
-	}
-	if len(pc.Thumbnails) == 0 {
-		t.Error("thumbnails is empty; the ladder was not read")
-	}
-	for i, th := range pc.Thumbnails {
-		if th.URL == "" {
-			t.Errorf("thumbnails[%d] has no url", i)
+	// The metadata WaxTap asked for has to arrive from a real player response,
+	// not just from the wire structs.
+	t.Run("metadata", func(t *testing.T) {
+		pc := bbb(t)
+		if !strings.HasPrefix(pc.ChannelID, "UC") {
+			t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
 		}
-		if th.Width <= 0 || th.Height <= 0 {
-			t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+		if pc.Description == "" {
+			t.Error("description is empty; videoDetails.shortDescription was not read")
 		}
-	}
-	// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
-	if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
-		t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
-	}
-	switch {
-	case pc.PublishDate == "":
-		t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
-	default:
-		if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
-			if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
-				t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
-			} else {
-				t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+		if len(pc.Thumbnails) == 0 {
+			t.Error("thumbnails is empty; the ladder was not read")
+		}
+		for i, th := range pc.Thumbnails {
+			if th.URL == "" {
+				t.Errorf("thumbnails[%d] has no url", i)
 			}
-		} else {
-			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+			if th.Width <= 0 || th.Height <= 0 {
+				t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+			}
+		}
+		// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
+		if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
+			t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+		}
+		switch {
+		case pc.PublishDate == "":
+			t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
+		default:
+			if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
+				if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
+					t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
+				} else {
+					t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+				}
+			} else {
+				t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+			}
+		}
+		// The context's identity must be the one /session exports, or a consumer
+		// that streams under the context would present a different browser than
+		// the one the URL was issued to.
+		if pc.UserAgent == "" {
+			t.Error("user_agent is empty; the session identity was not carried onto the context")
+		}
+		sess, err := p.Session(ctx)
+		if err != nil {
+			t.Fatalf("Session: %v", err)
+		}
+		if pc.UserAgent != sess.UserAgent {
+			t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+		}
+		if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
+			t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+		}
+		t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
+			pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
+	})
+
+	// audio_formats has to carry what WaxTap's SABR selection reads; checkFormats
+	// says what. Big Buck Bunny has one audio track, so no entry carries an audio
+	// role, but its itags have come in clean, DRC, and vb renditions, and the tag
+	// content is what lets the two-way drc check tell an untouched value from a
+	// rewritten one. A daemon that drops xtags while is_drc still marks a
+	// rendition fails inside checkFormats; a day on which the video offers no
+	// tagged rendition at all leaves nothing to check, which is a skip, not a
+	// verdict.
+	t.Run("formats", func(t *testing.T) {
+		pc := bbb(t)
+		tagged, drc := 0, 0
+		for i, pairs := range checkFormats(t, pc.AudioFormats) {
+			if pairs != nil {
+				tagged++
+			}
+			if pc.AudioFormats[i].IsDrc {
+				drc++
+			}
+		}
+		if tagged == 0 && drc == 0 {
+			t.Skip("no entry carries xtags or is_drc: this video offers no tagged rendition to check today")
+		}
+	})
+
+	// A video with several audio tracks is where the original-track labelling
+	// shows. The daemon's side: every entry names its track and states the
+	// player's default flag. WaxTap's side, asked of WaxTap itself on the same
+	// context: no track is left unranked, the original is found, and it is what
+	// selection picks.
+	t.Run("multitrack", func(t *testing.T) {
+		id := os.Getenv(multitrackVideoEnv)
+		if id == "" {
+			t.Skipf("%s names no video with several audio tracks", multitrackVideoEnv)
+		}
+		pc, err := p.ProvidePlayerContext(ctx, id)
+		if err != nil {
+			t.Fatalf("ProvidePlayerContext(%s): %v", id, err)
+		}
+		tracks := make(map[string]int)
+		for _, f := range pc.AudioFormats {
+			if f.AudioTrackID != "" {
+				tracks[f.AudioTrackID]++
+			}
+		}
+		if len(tracks) < 2 {
+			t.Fatalf("%s names %s, which offers %d audio track(s) %v; this subtest needs a video with several", multitrackVideoEnv, id, len(tracks), tracks)
+		}
+		checkFormats(t, pc.AudioFormats)
+		defaults := 0
+		for i, f := range pc.AudioFormats {
+			if f.AudioTrackID == "" {
+				t.Errorf("audio_formats[%d] (itag %d) names no track on a multi-track video", i, f.Itag)
+			}
+			switch {
+			case f.AudioIsDefault == nil:
+				t.Errorf("audio_formats[%d] (itag %d, track %q) states no audio_is_default; the player marks every track of a multi-track video", i, f.Itag, f.AudioTrackID)
+			case *f.AudioIsDefault:
+				defaults++
+			}
+		}
+		if defaults == 0 {
+			t.Error("no entry states audio_is_default true; the player marks its default track and the daemon dropped it")
+		}
+
+		// WaxTap's verdict on this very context: it reads the audio role out of
+		// xtags and falls back to the default flag, and a download selects by the
+		// result. The context is handed back from memory so the verdict is about
+		// the entries checked above, not a second fetch.
+		yt := youtube.New(youtube.Config{PlayerContextProvider: potoken.PlayerContextProviderFunc(
+			func(context.Context, string) (potoken.PlayerContext, error) { return pc, nil })})
+		ext, err := yt.ExtractWebContext(ctx, id)
+		if err != nil {
+			t.Fatalf("WaxTap rejected the context: %v", err)
+		}
+		formats := ext.Video().Formats
+		originals := make(map[string]int)
+		for i, f := range formats {
+			track := ""
+			if f.AudioTrack != nil {
+				track = f.AudioTrack.ID
+			}
+			switch f.IsOriginal {
+			case format.Unknown:
+				t.Errorf("WaxTap could not rank Formats[%d] (itag %d, track %q): neither xtags nor audio_is_default decided", i, f.Itag, track)
+			case format.Yes:
+				originals[track]++
+			}
+		}
+		if len(originals) != 1 {
+			t.Errorf("WaxTap ranks %d tracks as the original (%v), want exactly one", len(originals), originals)
+		}
+		idx, err := format.BestForTarget(formats, format.MinimizeLoss(), format.Target{})
+		if err != nil {
+			t.Fatalf("BestForTarget: %v", err)
+		}
+		if formats[idx].IsOriginal != format.Yes {
+			t.Errorf("selection picked Formats[%d] (itag %d, original %v), want the original track", idx, formats[idx].Itag, formats[idx].IsOriginal)
+		}
+		t.Logf("multitrack %s: %d entries over %d tracks, %d state default; WaxTap ranks %v as the original and selects itag %d",
+			id, len(pc.AudioFormats), len(tracks), defaults, originals, formats[idx].Itag)
+	})
+}
+
+// checkFormats runs the checks every context's audio_formats has to pass and
+// returns each entry's decoded xtags pairs, nil for an entry that carries none.
+// The (itag, lmt, xtags) triple names one encoding, so a reload can find the
+// rendition it was streaming; xtags is the player's own value, an unpadded
+// base64url protobuf of key/value pairs that WaxTap decodes for the audio role;
+// and a drc=1 tag in it marks exactly the entries is_drc marks, the field WaxTap
+// declares the rendition by on the wire. An entry without a track id states no
+// default flag, since the flag lives inside the player's audioTrack.
+func checkFormats(t *testing.T, formats []potoken.PlayerContextFormat) []map[string]string {
+	t.Helper()
+	if len(formats) == 0 {
+		t.Fatal("audio_formats is empty")
+	}
+	type encoding struct {
+		itag       int
+		lmt, xtags string
+	}
+	seen := make(map[encoding]int)
+	decoded := make([]map[string]string, len(formats))
+	for i, f := range formats {
+		key := encoding{f.Itag, f.LMT, f.XTags}
+		if prev, dup := seen[key]; dup {
+			t.Errorf("audio_formats[%d] repeats the (itag, lmt, xtags) triple of audio_formats[%d]: %+v", i, prev, key)
+		}
+		seen[key] = i
+		if f.LMT == "" {
+			t.Errorf("audio_formats[%d] (itag %d) has no lmt", i, f.Itag)
+		}
+		if f.AudioTrackID == "" && f.AudioIsDefault != nil {
+			t.Errorf("audio_formats[%d] (itag %d) states audio_is_default=%v without a track id", i, f.Itag, *f.AudioIsDefault)
+		}
+		if f.XTags == "" {
+			if f.IsDrc {
+				t.Errorf("audio_formats[%d] (itag %d) has is_drc set but no xtags to carry the drc tag", i, f.Itag)
+			}
+			continue
+		}
+		pairs, err := xtagsPairs(f.XTags)
+		if err != nil {
+			t.Errorf("audio_formats[%d] (itag %d) xtags %q is not the player's value: %v", i, f.Itag, f.XTags, err)
+			continue
+		}
+		decoded[i] = pairs
+		t.Logf("audio_formats[%d]: itag %d lmt %s track %q xtags %s decodes to %v (is_drc=%v, audio_is_default=%s)",
+			i, f.Itag, f.LMT, f.AudioTrackID, f.XTags, pairs, f.IsDrc, stated(f.AudioIsDefault))
+		if drc := pairs["drc"] == "1"; drc != f.IsDrc {
+			t.Errorf("audio_formats[%d] (itag %d): xtags says drc=%q but is_drc is %v", i, f.Itag, pairs["drc"], f.IsDrc)
 		}
 	}
-	// The context's identity must be the one /session exports, or a consumer that
-	// streams under the context would present a different browser than the one the
-	// URL was issued to.
-	if pc.UserAgent == "" {
-		t.Error("user_agent is empty; the session identity was not carried onto the context")
+	return decoded
+}
+
+// stated renders a tri-state flag for a log line.
+func stated(b *bool) string {
+	if b == nil {
+		return "unstated"
 	}
-	sess, err := c.Session(ctx)
+	return strconv.FormatBool(*b)
+}
+
+// xtagsPairs decodes an xtags value as the contract states it: unpadded
+// base64url over a protobuf of repeated pairs (field 1, each {key=1, value=2}),
+// unknown fields skipped, and the first non-empty value of a repeated key kept,
+// as WaxTap keeps it. It is stricter than WaxTap's own reader on purpose. WaxTap
+// tolerates padding and either alphabet, but this side is checking that the
+// daemon handed the player's value on untouched: SABR keys the rendition on
+// those bytes, so a re-encoding WaxTap could still read would still cost the
+// consumer a reload instead of media. The decoder skips CR and LF, which the
+// player never sends.
+func xtagsPairs(s string) (map[string]string, error) {
+	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
 	if err != nil {
-		t.Fatalf("Session: %v", err)
+		return nil, err
 	}
-	if pc.UserAgent != sess.UserAgent {
-		t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+	pairs := make(map[string]string)
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		b = b[n:]
+		if num != 1 || typ != protowire.BytesType {
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			b = b[n:]
+			continue
+		}
+		pair, n := protowire.ConsumeBytes(b)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		b = b[n:]
+		key, value, err := xtagsPair(pair)
+		if err != nil {
+			return nil, err
+		}
+		if pairs[key] == "" {
+			pairs[key] = value
+		}
 	}
-	if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
-		t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+	return pairs, nil
+}
+
+// xtagsPair decodes one {key=1, value=2} pair.
+func xtagsPair(b []byte) (key, value string, err error) {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return "", "", protowire.ParseError(n)
+		}
+		b = b[n:]
+		if (num != 1 && num != 2) || typ != protowire.BytesType {
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return "", "", protowire.ParseError(n)
+			}
+			b = b[n:]
+			continue
+		}
+		v, n := protowire.ConsumeString(b)
+		if n < 0 {
+			return "", "", protowire.ParseError(n)
+		}
+		if !utf8.ValidString(v) {
+			return "", "", fmt.Errorf("field %d is not UTF-8: %q", num, v)
+		}
+		b = b[n:]
+		if num == 1 {
+			key = v
+		} else {
+			value = v
+		}
 	}
-	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
-		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
+	return key, value, nil
 }

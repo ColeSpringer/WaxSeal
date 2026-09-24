@@ -104,7 +104,7 @@ type Thumbnail struct {
 type AudioFormat struct {
 	Itag             int    `json:"itag"`
 	LMT              string `json:"lmt"`
-	XTags            string `json:"xtags"`
+	XTags            string `json:"xtags"` // the player response's value verbatim; a consumer reads the audio role from it
 	MimeType         string `json:"mime_type"`
 	Bitrate          int    `json:"bitrate"`
 	ContentLength    int64  `json:"content_length"`
@@ -112,8 +112,9 @@ type AudioFormat struct {
 	AudioSampleRate  int    `json:"audio_sample_rate"`
 	AudioChannels    int    `json:"audio_channels"`
 	AudioQuality     string `json:"audio_quality"`
-	IsDrc            bool   `json:"is_drc"`         // whether client_abr_state.drc_enabled is required
-	AudioTrackID     string `json:"audio_track_id"` // audioTrack.id; empty for the default or only track
+	IsDrc            bool   `json:"is_drc"`                     // whether client_abr_state.drc_enabled is required
+	AudioTrackID     string `json:"audio_track_id"`             // audioTrack.id, such as "en.4"; every entry of a multi-track video carries one, "" on a single-track video
+	AudioIsDefault   *bool  `json:"audio_is_default,omitempty"` // audioTrack.audioIsDefault as the player states it beside a track id: true on a multi-track video's default track, which can be a dub, false on its other tracks; absent otherwise
 }
 
 // Option configures a Client.

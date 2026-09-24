@@ -348,7 +348,7 @@ func TestAudioFormatTagDrift(t *testing.T) {
 		"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
 		"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
 		"audio_channels": 2, "audio_quality": "AUDIO_QUALITY_MEDIUM",
-		"is_drc": true, "audio_track_id": "en.4"
+		"is_drc": true, "audio_track_id": "en.4", "audio_is_default": true
 	}`
 	var f client.AudioFormat
 	if err := json.Unmarshal([]byte(payload), &f); err != nil {
@@ -359,6 +359,17 @@ func TestAudioFormatTagDrift(t *testing.T) {
 	}
 	if f.AudioTrackID != "en.4" {
 		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
+	}
+	if f.AudioIsDefault == nil || !*f.AudioIsDefault {
+		t.Error("audio_is_default did not decode into AudioIsDefault as a stated true")
+	}
+	// An absent key is unstated, which a consumer must be able to tell from false.
+	var bare client.AudioFormat
+	if err := json.Unmarshal([]byte(`{"itag": 251, "audio_track_id": "fr.3"}`), &bare); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if bare.AudioIsDefault != nil {
+		t.Errorf("audio_is_default = %v without the key, want nil", *bare.AudioIsDefault)
 	}
 }
 
