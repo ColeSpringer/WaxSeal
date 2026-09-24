@@ -6,7 +6,7 @@ require (
 	// What a consumer outside this checkout resolves, since the replace below
 	// is ignored there: keep it at a pushed commit carrying every root member
 	// this module uses, and move it to the tag after each root release.
-	github.com/colespringer/waxseal v1.4.1
+	github.com/colespringer/waxseal v1.4.2-0.20260924043421-c1e9b60ade3c
 	github.com/colespringer/waxtap/v3 v3.6.0
 	google.golang.org/protobuf v1.36.11 // the e2e suite decodes xtags with it
 )

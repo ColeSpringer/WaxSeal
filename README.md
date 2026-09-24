@@ -48,7 +48,7 @@ services:
 docker compose up -d --wait   # pulls ghcr.io/colespringer/waxseal; returns once the daemon is healthy
 ```
 
-That pulls `:latest`, and `WAXSEAL_VERSION=1.4.1 docker compose up -d --wait`
+That pulls `:latest`, and `WAXSEAL_VERSION=1.5.0 docker compose up -d --wait`
 pins a release. [docs/deployment.md](docs/deployment.md) lists everything the
 file leaves out, each as a snippet to paste in: pinning and verifying a release,
 API keys and secrets, memory limits, a read-only rootfs, a consumer sharing the
