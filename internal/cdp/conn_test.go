@@ -75,14 +75,13 @@ func TestConnTeardownClosesPipes(t *testing.T) {
 	}
 }
 
-// newPipeConn wires a Conn to two os.Pipes so a test can act as the browser side:
-// it reads outgoing requests from reqR and writes responses to respW.
+// newPipeConn wires a Conn to two of the transport's own pipe pairs so a test
+// can act as the browser: it reads requests from reqR and writes responses to
+// respW.
 func newPipeConn(t *testing.T) (c *Conn, reqR *os.File, respW *os.File) {
 	t.Helper()
-	// Both pairs are built through the transport's own constructor so these tests
-	// run over the real thing on each platform, and both ask for a pollable child
-	// end: here the test stands in for Chromium, and it needs deadlines on the end
-	// Chromium would otherwise read and write synchronously.
+	// Both pairs ask for pollable child ends: the test stands in for Chromium
+	// and needs deadlines on the ends Chromium would use synchronously.
 	resp, err := newPipePair(pipeParentReads, true)
 	if err != nil {
 		t.Fatal(err)

@@ -9,9 +9,8 @@ import (
 	"testing"
 )
 
-// These goldens pin request bytes captured from the previous CDP driver. They are
-// fast regression checks for fingerprint-relevant payloads: any drift in the
-// launch argv or UA-CH payload fails without needing a browser.
+// These goldens pin request bytes captured from the previous CDP driver, so any
+// drift in the launch argv, UA-CH, or eval payloads fails without a browser.
 
 func readFixture(t *testing.T, name string) []byte {
 	t.Helper()
@@ -22,9 +21,8 @@ func readFixture(t *testing.T, name string) []byte {
 	return b
 }
 
-// TestArgvGolden asserts the cdp launch argv equals the previous driver's formatted
-// argv for the same launcher, minus remote-debugging-port (replaced by
-// remote-debugging-pipe).
+// TestArgvGolden asserts BuildArgs equals the previous driver's captured argv,
+// with remote-debugging-port replaced by remote-debugging-pipe.
 func TestArgvGolden(t *testing.T) {
 	const profile = "/waxseal-profile"
 
@@ -75,11 +73,10 @@ func TestArgvHeadfulDropsHeadless(t *testing.T) {
 // pinned golden byte-for-byte, including the non-omitempty empty
 // model/platformVersion.
 //
-// The literal below is written for this test and is deliberately independent of
-// what internal/browser produces: this pins the wire shape (field order, tags,
-// which fields survive omitempty), not the values WaxSeal chooses. They are
-// allowed to diverge, and they do, since the browser package now echoes the real
-// browser's brands and build version. internal/browser's own TestUAOverride and
+// The literal below is independent of what internal/browser produces: this pins
+// the wire shape (field order, tags, which fields survive omitempty), not the
+// values, which differ because the browser package echoes the real browser's
+// brands and build version. internal/browser's TestUAOverride and
 // TestUAOverrideFromMetadata pin the producer.
 func TestUACHGolden(t *testing.T) {
 	const major = "149"

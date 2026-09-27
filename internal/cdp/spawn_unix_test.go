@@ -4,10 +4,9 @@ package cdp
 
 import "testing"
 
-// assertSpawnArgv checks what the helper was launched with. On Unix the spawn
-// path adds nothing to the argv: the transport travels as fd 3 and fd 4 by
-// convention, so the argv the caller passed is the argv the child sees.
-// TestArgvGolden pins BuildArgs; this pins that nothing is appended after it.
+// assertSpawnArgv checks what the helper was launched with. TestArgvGolden
+// pins BuildArgs; this pins that Spawn appends nothing after it, since on Unix
+// the transport travels as fd 3 and fd 4.
 func assertSpawnArgv(t *testing.T, argv []string, _ *Browser) {
 	t.Helper()
 	if flag, ok := helperArgvContains(argv, ioPipesFlagPrefix); ok {

@@ -224,10 +224,8 @@ func TestTenantsCloseIsTerminal(t *testing.T) {
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("newSession calls = %d, want 1 (only the pre-Close warm)", got)
 	}
-	// The post-shutdown tenant is served but not registered. Shutdown has already
-	// torn down every registered Minter and will not run again, so registering it
-	// would leak it and count a tenant the daemon never ran. Close still leaves
-	// the tenants that did run in place, so metrics report the run.
+	// The post-shutdown tenant is served but not registered (see Tenants.Minter),
+	// while the tenants that did run stay in place so metrics report the run.
 	snap := tn.MetricsSnapshot()
 	if n, _ := snap["tenants"].(int); n != 1 {
 		t.Errorf("tenants = %v, want 1 after Close (alice ran; bob never did)", snap["tenants"])
@@ -239,22 +237,20 @@ func TestTenantsCloseIsTerminal(t *testing.T) {
 
 // fakeProber is a BrowserProber with fixed answers, for the seam tests.
 type fakeProber struct {
-	rec       browser.Recovery
-	err       error
-	probes    int64
-	relaunchs int64
+	rec        browser.Recovery
+	err        error
+	probes     int64
+	relaunches int64
 }
 
 func (f *fakeProber) Health(context.Context) (browser.Recovery, error) { return f.rec, f.err }
 func (f *fakeProber) ProbeFailures() int64                             { return f.probes }
-func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunchs }
+func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunches }
 
-// A Minter handed out after the registry closed is born closed, but it must also
-// be unable to launch a browser of its own: NewMinter's default launcher calls
-// browser.Launch, which would start a second Chromium outside the pool and leave
-// it running. Both paths that build a tenant Minter go through newMinter, so the
-// launcher is always the registry's, and after Close the registry's is what a
-// shut-down pool answers with.
+// A Minter handed out after the registry closed is born closed, and it must
+// also launch through the registry (newMinter), never through NewMinter's
+// default launcher, which would start a second Chromium outside the pool and
+// leave it running.
 func TestMinterAfterCloseLaunchesThroughTheRegistry(t *testing.T) {
 	// ChromeBin names nothing, so the regression this guards against fails at the
 	// exec instead of starting a real Chromium and leaking it out of a package
@@ -302,7 +298,7 @@ func TestTenantsBrowserHealthWithoutPool(t *testing.T) {
 func TestTenantsBrowserProberSeam(t *testing.T) {
 	tn := NewTenants(nil, "v", nil, browser.Options{}, 0, 0, 0)
 	want := errors.New("waxseal: relaunch chromium: exec: no such file")
-	tn.SetBrowserProberForTest(&fakeProber{rec: browser.RecoveryTornDown, err: want, probes: 3, relaunchs: 2})
+	tn.SetBrowserProberForTest(&fakeProber{rec: browser.RecoveryTornDown, err: want, probes: 3, relaunches: 2})
 	if rec, err := tn.BrowserHealth(context.Background()); !errors.Is(err, want) || rec != browser.RecoveryTornDown {
 		t.Errorf("BrowserHealth = (%v, %v), want the installed prober's answer", rec, err)
 	}
@@ -315,12 +311,11 @@ func TestTenantsBrowserProberSeam(t *testing.T) {
 }
 
 // Both /metrics views carry the daemon-wide browser counters at top level. They
-// count browsers lost and launches failed, not per-tenant events, so they are
-// not among the summed aggregate counters and appear in the redacted view as
-// themselves.
+// count browsers lost and launches failed, not per-tenant events, so the
+// redacted view reports them as they are, outside the summed aggregate.
 func TestTenantsMetricsCarryBrowserCounters(t *testing.T) {
 	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
-	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunchs: 2})
+	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunches: 2})
 	full, redacted := tn.MetricsSnapshot(), tn.AggregateMetricsSnapshot()
 	want := map[string]int64{"browser_probe_failures": 3, "browser_relaunch_failures": 2}
 	for name, snap := range map[string]map[string]any{"full": full, "redacted": redacted} {

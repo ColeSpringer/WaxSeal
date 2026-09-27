@@ -34,8 +34,8 @@ func TestCommandTree(t *testing.T) {
 	}
 }
 
-// TestGenerateRequiresBinding: the root (generate mode) with no -c prints "{}"
-// and errors before ever launching a browser.
+// TestGenerateRequiresBinding pins that generate mode without -c prints "{}"
+// and fails before launching a browser.
 func TestGenerateRequiresBinding(t *testing.T) {
 	root := newRootCmd()
 	var out, errb bytes.Buffer
@@ -50,9 +50,8 @@ func TestGenerateRequiresBinding(t *testing.T) {
 	}
 }
 
-// pflag reads the shorthand form "-c=" as the value "=", so the binding a
-// caller thought was empty becomes a one-character one and the daemon mints
-// against it.
+// TestGenerateShorthandEqualsIsUsageError pins that "-c=" is a usage error:
+// pflag reads it as "=", which would otherwise be minted as a binding.
 func TestGenerateShorthandEqualsIsUsageError(t *testing.T) {
 	code, stdout, stderr := runCLI("-c=")
 	if code != 2 {
@@ -66,10 +65,9 @@ func TestGenerateShorthandEqualsIsUsageError(t *testing.T) {
 	}
 }
 
-// A one-shot mint logs at warn, so the things a caller should act on reach
-// stderr: an ignored WAXSEAL_UA_HINTS, a fallback-only token, the profile
-// reaper. This is the only test in the package that may trigger the UA-hints
-// warning, which internal/browser guards with a process-wide sync.Once.
+// A one-shot mint logs at warn, so an ignored WAXSEAL_UA_HINTS reaches stderr.
+// internal/browser warns once per process (sync.Once), so this must stay the
+// only test in the package that triggers that warning.
 func TestGenerateWarnsAtDefaultLevel(t *testing.T) {
 	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "missing"))
 	t.Setenv("WAXSEAL_UA_HINTS", "banana")
@@ -80,7 +78,7 @@ func TestGenerateWarnsAtDefaultLevel(t *testing.T) {
 	if !strings.Contains(stderr, "ignoring WAXSEAL_UA_HINTS") {
 		t.Errorf("stderr = %q, want the ignored-variable warning. "+
 			"internal/browser guards it with a process-wide sync.Once, so if another "+
-			"test in this package now sets an unrecognised WAXSEAL_UA_HINTS, it spent "+
+			"test in this package now sets an unrecognized WAXSEAL_UA_HINTS, it spent "+
 			"the warning before this ran", stderr)
 	}
 }
@@ -283,11 +281,9 @@ func TestWarnKeylessExposure(t *testing.T) {
 	}
 }
 
-// clearServerEnv removes every environment variable the server command reads, so
-// a test sees only what it passes and configuration parsing reaches the step it
-// is about regardless of the caller's environment. The variables are removed
-// rather than emptied, because an empty value is a meaningful one for the three
-// duration settings.
+// clearServerEnv unsets every environment variable the server command reads, so
+// a test sees only what it passes. Emptying them would not do: an empty
+// WAXSEAL_STREAMING_MAX_AGE disables recycling instead of meaning unset.
 func clearServerEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
@@ -324,8 +320,8 @@ func TestServerInvalidPortUsageError(t *testing.T) {
 	if !strings.Contains(stderr, "invalid --port") {
 		t.Errorf("stderr = %q, want it to mention the invalid port", stderr)
 	}
-	// Configuration is decided before anything is announced, so the refusal is
-	// the first thing in the log rather than the end of a startup narration.
+	// The port is validated before any setting is announced, so the refusal is
+	// the first log line.
 	first, _, _ := strings.Cut(stdout, "\n")
 	if !strings.Contains(first, "startup: invalid configuration") {
 		t.Errorf("first log line = %q, want the configuration refusal", first)
@@ -395,11 +391,11 @@ func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
 	}
 }
 
-// Tenant keys reach the daemon from a flag, a file flag, or either environment
-// variable, flags outranking envs, and a tier that sets both its value and its
-// file is refused rather than picking one. Every arm carries key material a
-// duplicate label makes unusable, so the daemon names the source it read and
-// exits 2 before it binds or launches anything.
+// Tenant keys come from a flag, a file flag, or either environment variable,
+// flags outranking envs; a tier that sets both its value and its file is
+// refused. The key material repeats a label, so reading a source fails with an
+// exit-2 refusal naming the source and the label before anything binds or
+// launches.
 func TestServerTenantKeySources(t *testing.T) {
 	clearServerEnv(t)
 	const (
@@ -417,24 +413,24 @@ func TestServerTenantKeySources(t *testing.T) {
 		{
 			name: "the flag is read",
 			args: []string{"--tenant-keys", fromA},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`--tenant-keys: duplicate tenant label "dupA"`},
 		},
 		{
 			name: "the file flag is read",
 			file: fromA,
 			args: []string{"--tenant-keys-file", "$FILE"},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`--tenant-keys-file: duplicate tenant label "dupA"`},
 		},
 		{
 			name: "the value env is read",
 			env:  map[string]string{"WAXSEAL_TENANT_KEYS": fromA},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`WAXSEAL_TENANT_KEYS: duplicate tenant label "dupA"`},
 		},
 		{
 			name: "the file env is read",
 			file: fromA,
 			env:  map[string]string{"WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`WAXSEAL_TENANT_KEYS_FILE: duplicate tenant label "dupA"`},
 		},
 		{
 			name:    "a flag outranks an env",
@@ -449,7 +445,7 @@ func TestServerTenantKeySources(t *testing.T) {
 			name: "a blank value env leaves the file env alone",
 			file: fromA,
 			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`WAXSEAL_TENANT_KEYS_FILE: duplicate tenant label "dupA"`},
 		},
 		{
 			name: "a trailing newline is not part of the value",
@@ -481,7 +477,7 @@ func TestServerTenantKeySources(t *testing.T) {
 			name: "a whitespace-only value env counts as unset",
 			file: fromA,
 			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "  ", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
-			want: []string{`duplicate tenant label "dupA"`},
+			want: []string{`WAXSEAL_TENANT_KEYS_FILE: duplicate tenant label "dupA"`},
 		},
 		{
 			// A flag the operator typed is a choice, so a blank one is loud
@@ -497,6 +493,29 @@ func TestServerTenantKeySources(t *testing.T) {
 			want:    []string{"--tenant-keys is empty"},
 			notWant: []string{"dupB"},
 		},
+		{
+			// Only an unset source means keyless: a value with no entry was
+			// meant to key the daemon, whichever source carried it.
+			name: "a flag holding only separators is refused",
+			args: []string{"--tenant-keys", ","},
+			want: []string{"--tenant-keys: tenant keys contain no entries"},
+		},
+		{
+			name: "a value env holding only separators is refused",
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": ","},
+			want: []string{"WAXSEAL_TENANT_KEYS: tenant keys contain no entries"},
+		},
+		{
+			name: "a key file holding only separators is refused",
+			file: ",\n,\n",
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{"--tenant-keys-file: tenant keys contain no entries"},
+		},
+		{
+			name: "a flag holding only a byte-order mark is refused",
+			args: []string{"--tenant-keys", "\ufeff"},
+			want: []string{"--tenant-keys: tenant keys contain no entries"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runKeySourceCase(t, "K1", "K2", tc.file, tc.args, tc.env, tc.want, tc.notWant)
@@ -504,10 +523,9 @@ func TestServerTenantKeySources(t *testing.T) {
 	}
 }
 
-// The metrics key reaches the daemon from the same four sources. Each arm names
-// a key that collides with a tenant key, so the refusal names the tenant label
-// the resolved value matched, which is what says which source was read: no other
-// path reports the value without serving traffic.
+// The metrics key comes from the same four sources. Each arm's key collides
+// with a tenant key, and the refusal naming that tenant shows which source was
+// read; nothing else reveals the value without serving traffic.
 func TestServerMetricsKeySources(t *testing.T) {
 	clearServerEnv(t)
 	const tenants = "alice=KEYA,bob=KEYB"
@@ -549,9 +567,8 @@ func TestServerMetricsKeySources(t *testing.T) {
 			notWant: []string{"bob"},
 		},
 		{
-			// The collision is an exact match, so a file that an editor wrapped in a
-			// newline or a byte-order mark only reaches it once both are gone. Left
-			// in, they give a key that matches nothing and explains nothing.
+			// The collision is an exact match, so it fires only once the BOM
+			// and the whitespace are stripped.
 			name: "surrounding whitespace and a BOM are not part of the value",
 			file: "\ufeff  KEYA\n",
 			args: []string{"--metrics-key-file", "$FILE"},
@@ -599,11 +616,9 @@ func TestServerMetricsKeySources(t *testing.T) {
 	}
 }
 
-// runKeySourceCase runs one key-source arm. A "$FILE" placeholder in args or env
-// is replaced with the scratch file's path, and the path is also substituted into
-// the wanted strings so an arm can require it by name. Every arm is expected to
-// exit 2 before the daemon binds or launches, and none of them may put key
-// material on stderr.
+// runKeySourceCase runs one key-source arm. "$FILE" in args, env, and want is
+// replaced with the scratch file's path. Every arm must exit 2 and keep key
+// material off stderr.
 func runKeySourceCase(t *testing.T, secretA, secretB, file string, args []string, env map[string]string, want, notWant []string) {
 	t.Helper()
 	path := ""
@@ -614,7 +629,10 @@ func runKeySourceCase(t *testing.T, secretA, secretB, file string, args []string
 	for name, value := range env {
 		t.Setenv(name, fill(value))
 	}
-	cmdArgs := []string{"server"}
+	// An arm the command wrongly accepts then fails at the browser launch
+	// instead of serving on the default port until the test times out.
+	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "missing"))
+	cmdArgs := []string{"server", "--port", "0"}
 	for _, a := range args {
 		cmdArgs = append(cmdArgs, fill(a))
 	}
@@ -796,11 +814,9 @@ func TestResolveMintSeparation(t *testing.T) {
 	}
 }
 
-// TestPingAddrSchemeGuard checks the --addr guard uses a scheme-only test, not
-// the broader watch-URL detector. A doubled scheme is a usage error rejected
-// before any network call; a bare host:port with a youtube.com host must pass the
-// guard and fail only at the network call. Swapping hasScheme for
-// browser.LooksLikeWatchURL would wrongly reject the host and regress this.
+// TestPingAddrSchemeGuard pins that the --addr guard is scheme-only: a doubled
+// scheme is a usage error before any network call, while a youtube.com
+// host:port passes the guard, which browser.LooksLikeWatchURL would reject.
 func TestPingAddrSchemeGuard(t *testing.T) {
 	if !hasScheme("http://h:1") {
 		t.Error(`hasScheme("http://h:1") = false, want true (a scheme is rejected)`)
@@ -821,11 +837,9 @@ func TestPingAddrSchemeGuard(t *testing.T) {
 	}
 }
 
-// runPingGuard runs runPing with an already-cancelled context so a request that
-// clears the address guards fails immediately at the network call instead of
-// dialing. That isolates the guard behavior without a live server. It carries
-// the flag's own default, since nothing here binds the flags that would supply
-// one and a zero budget is its own usage error.
+// runPingGuard runs runPing with a canceled context, so an address that clears
+// the guards fails at once instead of dialing. It passes pingTimeout itself: no
+// flags are bound here, and a zero budget is its own usage error.
 func runPingGuard(t *testing.T, addr string) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1024,20 +1038,16 @@ func TestResolveShutdownTimeout(t *testing.T) {
 	}
 }
 
-// The 60 second default has to cover first-session establishment (documented as
-// typically under ten seconds) with real headroom, or a routine stop under load
-// goes back to severing connections the way the bare 5 second literal it
-// replaced did.
+// The default drain must keep real headroom over first-session establishment
+// (typically under 10 s), or a routine stop under load severs connections.
 func TestDefaultShutdownTimeoutCoversEstablishment(t *testing.T) {
 	if defaultShutdownTimeout < 45*time.Second {
 		t.Errorf("defaultShutdownTimeout = %v, want at least 45s", defaultShutdownTimeout)
 	}
 }
 
-// TestShutdownOutcome checks the routine-vs-failed classification the shutdown
-// path in runServer applies to srv.Shutdown's error: a nil error or a
-// context.DeadlineExceeded (wrapped or bare) is a routine drain-budget expiry,
-// while any other error means the stop itself failed.
+// TestShutdownOutcome pins shutdownOutcome's classification: nil and a wrapped
+// or bare DeadlineExceeded are routine; any other error is a failed stop.
 func TestShutdownOutcome(t *testing.T) {
 	cases := []struct {
 		name string

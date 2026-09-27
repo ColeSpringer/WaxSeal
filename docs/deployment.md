@@ -8,19 +8,20 @@ and run
 docker compose up -d --wait
 ```
 
-`--wait` returns once the image's healthcheck passes, which is when the daemon
-has attested a session and can serve tokens, typically under ten seconds after
-Chromium starts. The first token or context request may still wait up to 12
-seconds behind the daemon's mint-separation gate (README, `/player-context`).
-`docker compose logs -f` follows startup, and `docker compose ps` shows the
-health state. A container that never turns healthy is either
-restarting, because the daemon exited on a startup failure, or up and unhealthy,
-because its probe keeps failing; the log says which. The daemon keeps no state
-worth a volume: browser profiles are temporary and rebuilt at every start.
+`--wait` returns once the image's healthcheck passes and the daemon can serve
+tokens, typically within ten seconds of Chromium starting. The first token or
+context request may still wait up to 12 seconds behind the mint-separation gate
+(README, `/player-context`).
 
-Everything below is optional. Unless a section says otherwise, its snippet is
-pasted into that file under the `waxseal:` service, at the indentation shown,
-and none of them needs a second compose file.
+`docker compose logs -f` follows startup, and `docker compose ps` shows health.
+A container that never turns healthy is either restarting (the daemon exited on
+a startup failure) or up and unhealthy (its probe keeps failing); the log says
+which. The daemon needs no volume: browser profiles are temporary and rebuilt
+at every start.
+
+Everything below is optional. Unless a section says otherwise, paste its
+snippet into that file under the `waxseal:` service at the indentation shown;
+none needs a second compose file.
 
 ## Pin a release
 
@@ -36,17 +37,15 @@ WAXSEAL_VERSION=1.5.0 docker compose up -d --wait
 WAXSEAL_VERSION=1.5.0
 ```
 
-The release pipeline publishes each tag as a manifest covering linux/amd64 and
-linux/arm64, so Docker resolves the right architecture, and keeps the
-per-architecture tags it is assembled from (`<version>-amd64`,
-`<version>-arm64`) pullable for pinning one platform. Each image tag and each
-release binary carries a GitHub build provenance attestation naming the commit
-and workflow run that built it, and the image's
-`org.opencontainers.image.version` label, in `docker inspect`, names the
-release. Releases up to and including 1.3.0 predate that pipeline: they are
-linux/amd64 only, with no per-architecture tags, no attestation, and no version
-label, and on an arm64 host `:latest` resolves to that amd64 image until a newer
-release moves it.
+Each release tag is a manifest covering linux/amd64 and linux/arm64, so Docker
+pulls the right architecture; `<version>-amd64` and `<version>-arm64` pin one
+platform.
+
+Each image tag and release binary carries a GitHub build provenance attestation
+naming the commit and workflow run that built it, and the image's
+`org.opencontainers.image.version` label (see `docker inspect`) names the
+release. Releases through 1.3.0 predate this: linux/amd64 only, with no
+per-architecture tags, attestation, or version label.
 
 ```sh
 gh attestation verify oci://ghcr.io/colespringer/waxseal:<version> --repo ColeSpringer/WaxSeal
@@ -56,11 +55,10 @@ gh attestation verify waxseal-linux-amd64 --repo ColeSpringer/WaxSeal   # a down
 ## Expose the daemon and require API keys
 
 A keyless daemon hands its guest identity to anyone who can reach `/session` or
-`/player-context`, so publishing on every interface, or on a LAN address, goes
-together with API keys. Each key gets its own isolated browser context, and a
-consumer sends its key as `X-API-Key` or `Authorization: Bearer <key>`. This
-one replaces the file's `ports:` block rather than adding to it, since a
-service cannot carry two:
+`/player-context`, so publish it on all interfaces or a LAN address only with
+API keys. Each key gets its own isolated browser context; a consumer sends it as
+`X-API-Key` or `Authorization: Bearer <key>`. This snippet replaces the file's
+`ports:` block (a service cannot carry two):
 
 ```yaml
     ports:
@@ -70,12 +68,12 @@ service cannot carry two:
 ```
 
 Compose interpolates `$` in that value, so `alice=aB3$xK9q` reaches the daemon
-as `alice=aB3`, with nothing but a warning on stderr to show for it. Write `$$`
-for each `$`, or use the file form below, which compose never interpolates. The
-image's healthcheck needs no change either way: a keyed daemon answers the
-keyless probe with the shared browser's liveness rather than `401`.
+as `alice=aB3`, with only a warning on stderr. Write `$$` for each `$`, or use
+the file form below, which compose never interpolates. The image's healthcheck
+needs no change: a keyed daemon answers its keyless probe with the browser's
+liveness, not `401`.
 
-A value under `environment` shows in `docker inspect`. A file does not, and the
+A value under `environment` shows in `docker inspect`; a file does not. The
 `_FILE` variant names a path the daemon reads the keys from. To use it, swap the
 `environment:` block above for this one and give the service the secret:
 
@@ -95,14 +93,15 @@ secrets:
     file: ./tenant-keys
 ```
 
-Compose mounts that host file at `/run/secrets/waxseal_tenant_keys` as it is, so
-outside swarm it has to be readable by the image's non-root user, uid 10001:
-`chmod 0444 tenant-keys`, or chown it to that uid. The file holds what the
-variable would, `alice=KEYA,bob=KEYB`, one entry per line also works, with
-surrounding whitespace ignored. An empty file stops startup rather than starting
-a keyless daemon, and a non-empty value beside the `_FILE` variant is a startup
-error rather than a silent winner; a blank or whitespace-only value counts as
-unset.
+Outside swarm, compose mounts the host file as it is and ignores a secret's
+`uid`, `gid`, and `mode`, so the image's non-root user (uid 10001) must be able
+to read it: `chmod 0444 tenant-keys`, or chown it to that uid.
+
+The file holds what the variable would, `alice=KEYA,bob=KEYB` or one entry per
+line, with surrounding whitespace ignored. An empty file, or one with no
+entries, stops startup rather than starting a keyless daemon. Setting
+`WAXSEAL_TENANT_KEYS` as well is a startup error, unless it is blank, which
+counts as unset.
 
 ### Metrics on a keyed daemon
 
@@ -114,10 +113,9 @@ the full detail.
 
 ## Limit memory
 
-Chromium's memory use is spiky, and one browser hosts a context per tenant, so
-the file sets no limit. To cap the container, size the limit to the tenant
-count and the load. A limit set too low kills Chromium under load, which the
-daemon counts in `crashes` and recovers from by relaunching it, or kills the
+Chromium's memory use is spiky and grows with the tenant count, so the file sets
+no limit. Size a cap to the tenants and the load: too low a limit kills Chromium
+under load, which the daemon counts in `crashes` and relaunches, or kills the
 daemon itself, which restarts the container:
 
 ```yaml
@@ -129,9 +127,9 @@ daemon itself, which restarts the container:
 ```
 
 `memswap_limit` is a service-level key, not part of `deploy.resources.limits`,
-which is why it sits at the service indentation. On a host with swap, leaving it
-out means the "kills Chromium" behaviour happens at twice the limit rather than
-at it. The `docker run` equivalent is `--memory 2g --memory-swap 2g`.
+so it sits at the service indentation. On a host with swap, leaving it out moves
+the kill point from the limit to twice the limit. The `docker run` equivalent is
+`--memory 2g --memory-swap 2g`.
 
 ## Read-only root filesystem
 
@@ -145,19 +143,18 @@ read-only rootfs mounts both as tmpfs:
       - /tmp:mode=1777
 ```
 
-The `mode` is load-bearing: a bare tmpfs mounts root-owned, the non-root user
-cannot create its profile under `/home/waxseal`, and the container loops on
-`permission denied`. `docker run --tmpfs /home/waxseal:mode=1777 --tmpfs
-/tmp:mode=1777` is the equivalent.
+The `mode` matters: a bare tmpfs mounts root-owned, so the non-root user cannot
+create its profile under `/home/waxseal` and the container loops on `permission
+denied`. `docker run --tmpfs /home/waxseal:mode=1777 --tmpfs /tmp:mode=1777` is
+the equivalent.
 
 ## Run a consumer on the same egress IP
 
-A PO token is bound to the egress IP of the host that minted it, so an
-application that fetches media with WaxSeal's tokens has to leave the network
-from the same address. A consumer running on the host itself already does, and
-reaches the daemon through the published port. A consumer that runs as its own
-container shares the daemon's network namespace instead, which guarantees the
-same address on any host and puts the daemon at `127.0.0.1:4416` for it. This
+A PO token is bound to the minting host's egress IP, so an application that
+fetches media with WaxSeal's tokens must leave from the same address. A consumer
+on the host already does and reaches the daemon through the published port. A
+containerized consumer shares the daemon's network namespace, which guarantees
+the same address on any host and puts the daemon at `127.0.0.1:4416`. This
 snippet is a second service, beside `waxseal:` rather than under it:
 
 ```yaml
@@ -175,32 +172,32 @@ snippet is a second service, beside `waxseal:` rather than under it:
 
 The consumer starts once the daemon's healthcheck passes. It has no network of
 its own, so any port it needs is published on the `waxseal` service. A daemon
-that serves only that consumer needs no port on the host at all, in which case
-delete the `ports:` block from `waxseal`.
+that serves only that consumer needs no host port at all: delete the `ports:`
+block from `waxseal`.
 
 ## Tune the daemon
 
-The daemon reads its settings from the environment, and the README's
-[Operations](../README.md#operations) section lists every variable with the
-flag it stands in for. They go under `environment:` the way the keys do above.
-One of them touches the file: `WAXSEAL_SHUTDOWN_TIMEOUT` is how long a stopping
-daemon drains in-flight requests, 60s by default, and `stop_grace_period` is
-70s to cover it. Raise them together, or Docker kills the container mid-request.
-`WAXSEAL_MINT_SEPARATION` is read the same way and must parse as a positive Go
-duration, or the daemon refuses to start.
+Settings go under `environment:` like the keys above; the README's
+[Operations](../README.md#operations) section lists every variable and the flag
+it stands in for. `WAXSEAL_SHUTDOWN_TIMEOUT` (default 60s) is how long a
+stopping daemon drains in-flight requests, and the file's `stop_grace_period`
+of 70s covers it: raise both together, or Docker kills the container
+mid-request. `WAXSEAL_MINT_SEPARATION` must be a positive Go duration, or the
+daemon refuses to start.
 
 ## Health checks
 
-The image declares its own healthcheck, `waxseal ping --strict` against the
-daemon on loopback every 30 seconds, with a 110 second timeout and a two minute
-start period, so compose, `docker ps`, and `--wait` all see the daemon's health
-with nothing added to the file. An orchestrator that probes over HTTP uses
-`GET /ping?strict=true`: 200 while the daemon is healthy or inside the benign
-window after a session was retired, 503 only once a probe has confirmed the
-session or the browser lost. Give such a probe the same generous timeout, since a
-probe that finds a wedged browser tears it down and relaunches it before
-answering. The README's Operations section has the full account, including what
-a probe on a keyed daemon checks.
+The image's own healthcheck runs `waxseal ping --strict` on loopback every 30
+seconds, with a 110 second timeout and a two minute start period, so compose,
+`docker ps`, and `--wait` see the daemon's health with nothing added to the
+file.
+
+An orchestrator probing over HTTP uses `GET /ping?strict=true`: 200 while the
+daemon is healthy or in the benign window after a session is retired, 503 once
+a probe confirms the session or the browser lost. Give it the same generous
+timeout, since a probe that finds a wedged browser relaunches it before
+answering. The README's [Operations](../README.md#operations) section has the
+details, including what a probe on a keyed daemon checks.
 
 ## Upgrade, follow, stop
 
@@ -226,6 +223,6 @@ docker run -d --name waxseal --restart unless-stopped \
 
 `make docker-build` builds the image from the checkout and tags it under the
 published name, `:latest` included, so `docker compose up` on that machine runs
-the local build rather than pulling. `make docker-smoke` builds it and proves it
-can start Chromium and render a page on an isolated network, the same check the
+the local build instead of pulling. `make docker-smoke` builds it and proves it
+can start Chromium and render a page on an isolated network, the check the
 release runs before it publishes.

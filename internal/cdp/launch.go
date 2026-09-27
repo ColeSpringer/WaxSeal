@@ -10,8 +10,7 @@ import (
 	"time"
 )
 
-// defaultLaunchTimeout bounds the Browser.getVersion handshake. On timeout,
-// Spawn kills the process group and closes the pipes.
+// defaultLaunchTimeout bounds the Browser.getVersion handshake.
 const defaultLaunchTimeout = 60 * time.Second
 
 // waitDelay bounds how long cmd.Wait blocks on the stderr-copy goroutine after the
@@ -27,11 +26,10 @@ type SpawnOptions struct {
 	Logger        *slog.Logger  // nil discards
 }
 
-// baseArgs are the Chromium flags WaxSeal launches with. They match the previous
-// launcher's defaults plus WaxSeal's explicit flags, with remote-debugging-port
-// replaced by remote-debugging-pipe and automation/watchdog flags omitted. The
-// captured source argv lives in testdata/argv_baseline.txt. Several flags affect
-// fingerprinting and process cleanup, so TestArgvGolden pins the set.
+// baseArgs are the Chromium flags WaxSeal launches with; --enable-automation
+// is not among them. Several affect fingerprinting and process cleanup, so
+// TestArgvGolden pins the whole BuildArgs argv to testdata/argv_baseline.txt,
+// with remote-debugging-port swapped for remote-debugging-pipe.
 var baseArgs = []string{
 	"--remote-debugging-pipe",
 	"--no-sandbox",
@@ -62,9 +60,8 @@ var baseArgs = []string{
 	"--use-mock-keychain",
 }
 
-// BuildArgs assembles the sorted Chromium argv for a profile directory. headful
-// drops the headless flag; otherwise headless=new is used. The result is sorted
-// so it is order-independent.
+// BuildArgs returns the Chromium argv for a profile directory, sorted so the
+// order of baseArgs does not matter. headful drops --headless=new.
 func BuildArgs(profileDir string, headful bool) []string {
 	args := make([]string, 0, len(baseArgs)+2)
 	args = append(args, baseArgs...)
@@ -92,11 +89,9 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 		stderrMax = defaultStderrMax
 	}
 
-	// The command pipe carries commands from this process to Chromium; the event
-	// pipe carries responses and events back. How each pair is built, and how
-	// Chromium is told where to find its ends, is the one platform difference in
-	// this package: Unix passes fd 3 and fd 4, Windows passes two inherited handle
-	// values in the argv. Both are the guard's business.
+	// The command pipe carries commands to Chromium; the event pipe carries
+	// responses and events back. Building the pairs and handing them to
+	// Chromium is platform code (newPlatformPipePair, procGuard.attach).
 	cmdPipe, err := newPipePair(pipeParentWrites, false)
 	if err != nil {
 		return nil, fmt.Errorf("cdp: command pipe: %w", err)
@@ -110,9 +105,8 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 	cmd := exec.Command(bin, args...)
 	stderr := &ringBuffer{max: stderrMax}
 	cmd.Stderr = stderr
-	// Stderr uses a ringBuffer, so os/exec copies from a pipe in a goroutine that
-	// Wait joins. If a Chromium helper inherits fd 2 and outlives the main process,
-	// that pipe can stay open after the parent exits. WaitDelay bounds the join.
+	// A ringBuffer is not an *os.File, so Wait joins a stderr copy goroutine;
+	// see waitDelay.
 	cmd.WaitDelay = waitDelay
 	guard := newProcGuard(opts.Logger)
 	guard.attach(cmd, cmdPipe, evtPipe)
@@ -124,10 +118,8 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 		return nil, fmt.Errorf("cdp: start chromium: %w", err)
 	}
 	guard.started(cmd)
-	// Close the parent's copies of the child-side ends. A lingering child-side
-	// write end would keep the event pipe from ever reaching EOF on Chromium exit.
-	// Both ends stayed referenced until here so os.NewFile's finalizer could not
-	// close a descriptor Chromium was about to inherit.
+	// Chromium has inherited the child ends, so drop the parent's copies (see
+	// pipePair and closeChild).
 	cmdPipe.closeChild()
 	evtPipe.closeChild()
 
@@ -150,23 +142,18 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 	defer cancel()
 	if _, err := b.Context(hctx).Version(); err != nil {
 		c.forceClose(fmt.Errorf("version handshake: %w", err))
-		// Wait for the reap before reporting the failure. The caller removes the
-		// profile directory on the next line, and a Chromium that has been killed
-		// but not yet reaped still holds it open. The wait ignores ctx by design:
-		// an expired caller deadline is one of the reasons the handshake fails, and
-		// it must not turn this wait into a no-op.
+		// The caller removes the profile next, so wait for the reap (see
+		// waitExited). The wait ignores ctx: an expired caller deadline is one
+		// way the handshake fails, and it must not turn the wait into a no-op.
 		if !c.waitExited() {
 			opts.Logger.Warn("cdp: chromium was not reaped after a failed handshake; the profile may not remove cleanly",
 				"budget", waitDelay, "pid", c.pid())
 		}
-		// The read loop (EOF), the reaper (process exited), and a write into a
-		// closed pipe (broken pipe) race to record the loss, so a Chromium that
-		// died is named by its exit rather than by whichever wording won. Only a
-		// lost connection qualifies: forceClose above kills the child, so
-		// procExited is true for every failure by the time we get here, and a live
-		// browser that failed the handshake some other way (a protocol error)
-		// would otherwise be reported as an exit. A timeout or a cancellation
-		// keeps its own wording for the same reason.
+		// The read loop (EOF), the reaper, and a write into a closed pipe race
+		// to record a death, so name it by its exit, not whichever wording won.
+		// procExited alone cannot tell a death from the forceClose kill above,
+		// so only a lost connection counts; a protocol error, timeout, or
+		// cancellation keeps its own wording.
 		if c.procExited.Load() && errors.Is(err, ErrConnClosed) &&
 			!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			err = fmt.Errorf("chromium exited during the version handshake (%s): %w", c.exitStatus(), err)
@@ -176,7 +163,7 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 	return b, nil
 }
 
-// tail returns the last n characters of s.
+// tail returns the last n bytes of s.
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s

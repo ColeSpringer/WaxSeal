@@ -16,12 +16,11 @@ func writeDoc(t *testing.T, body string) string {
 	return p
 }
 
-// TestFence pins the scanner's reading of Markdown: the block is picked by its
-// section and by the first word of its info string, a fence of another kind on
-// the way is skipped whole, a "#" comment inside a fence is neither the heading
-// nor the end of the section, and a deeper subheading does not end it either.
-// The json block exists only in the section after, so finding it would mean
-// the section boundary was not honoured.
+// TestFence pins the scanner's reading of Markdown: a block is picked by its
+// section and the first word of its info string, other fences are skipped
+// whole, a "#" comment inside a fence neither matches the heading nor ends the
+// section, and a deeper subheading does not end it either. The json block sits
+// only in the next section, so finding it would mean the boundary was ignored.
 func TestFence(t *testing.T) {
 	doc := writeDoc(t, strings.Join([]string{
 		"# Title",

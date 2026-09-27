@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -48,6 +49,9 @@ func TestParseTenantKeys(t *testing.T) {
 		"=KEYA",                  // empty label
 		"alice=KEYA, bob=KEYA",   // duplicate key
 		"alice=KEYA, alice=KEYB", // duplicate label collapses two identities
+		",",                      // only separators: not blank, so not keyless
+		"\n,\n",                  // the same with line breaks
+		"\ufeff",                 // a lone byte-order mark is not blank either
 	} {
 		got, err := ParseTenantKeys(in)
 		if err == nil {
@@ -60,7 +64,7 @@ func TestParseTenantKeys(t *testing.T) {
 
 	m, err := ParseTenantKeys("alice=KEYA, bob=KEYB")
 	if err != nil || len(m) != 2 || m["KEYA"] != "alice" || m["KEYB"] != "bob" {
-		t.Errorf("labelled keys = (%v, %v)", m, err)
+		t.Errorf("labeled keys = (%v, %v)", m, err)
 	}
 	if tc, err := ParseTenantKeys("alice=KEYA,"); err != nil || len(tc) != 1 || tc["KEYA"] != "alice" {
 		t.Errorf("trailing comma = (%v, %v), want one tenant", tc, err)
@@ -162,8 +166,8 @@ func TestCheckKeyChars(t *testing.T) {
 }
 
 // decodeJSONBody's strict path is a contract on its dst. An embedded struct
-// contributes the keys encoding/json actually accepts, and a non-struct is
-// refused loudly rather than panicking in a handler.
+// contributes the keys encoding/json accepts, and a non-struct is refused
+// loudly rather than panicking in a handler.
 func TestJSONFieldNames(t *testing.T) {
 	type inner struct {
 		A string `json:"a"`
@@ -216,9 +220,8 @@ func TestMetricsKeyCollision(t *testing.T) {
 }
 
 // TestAPIKeyExtraction pins where a tenant key may be presented and which source
-// wins. The cases that matter beyond the happy path are the ones where a header
-// carries no usable key: it has to fall through to ?key= instead of resolving to
-// the empty key, which a keyed daemon would 401.
+// wins, including that a header with no usable key falls through to ?key=
+// instead of resolving to the empty key, which a keyed daemon would 401.
 func TestAPIKeyExtraction(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
@@ -274,11 +277,9 @@ func TestPlayerContextVideoID(t *testing.T) {
 		{name: "body", body: `{"video_id":"VID"}`, wantID: "VID", wantOK: true},
 		{name: "empty body + query", body: "", query: "?video_id=QID", wantID: "QID", wantOK: true},
 		{name: "body wins over query", body: `{"video_id":"BID"}`, query: "?video_id=QID", wantID: "BID", wantOK: true},
-		// Lenient decode: an unmodeled body key does not block the query fallback
-		// (a typo'd body field is ignored, and the query video_id is used).
+		// Lenient decode: an unmodeled body key is ignored and the query used.
 		{name: "unknown body field falls through to query", body: `{"videoId":"abc"}`, query: "?video_id=QID", wantID: "QID", wantOK: true},
-		// With no query fallback, a typo'd field still surfaces via the required-field
-		// check instead of being dropped silently.
+		// With no query fallback, a typo'd field still fails the required check.
 		{name: "unknown body field alone is required-error", body: `{"videoId":"abc"}`, wantOK: false, wantCode: http.StatusBadRequest, wantMsg: "video_id is required"},
 		{name: "empty body no query", body: "", wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "empty json no query", body: `{}`, wantOK: false, wantCode: http.StatusBadRequest},
@@ -406,7 +407,7 @@ func TestRoutesMethodMatching(t *testing.T) {
 		{http.MethodGet, "/report", "/report"},
 		{http.MethodGet, "/metrics", "GET /metrics"},
 		{http.MethodPost, "/metrics", "/metrics"},
-		// Registered routes and their method fallbacks must beat the catch-all.
+		// Only unknown paths, trailing-slash variants included, reach the catch-all.
 		{http.MethodGet, "/nope", "/"},
 		{http.MethodPost, "/get_pot/", "/"},
 	}
@@ -445,10 +446,9 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 }
 
 // HEAD on the browser-backed endpoints must 405 (ServeMux otherwise maps HEAD to
-// the GET handler, driving a real proof/context fetch); HEAD /ping stays a cheap
-// liveness probe. The methodNotAllowed handler runs before any tenant lookup, and
-// /ping's Health reports no-session without launching a browser, so no Chromium is
-// needed.
+// the GET handler, driving a real proof or context fetch), while HEAD /ping
+// stays a cheap liveness probe. No Chromium is needed: the 405 precedes tenant
+// lookup, and /ping reports no-session without launching one.
 func TestHeadGate(t *testing.T) {
 	s := &Server{
 		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0, 0), // keyless, no browser
@@ -531,9 +531,9 @@ func TestErrEnvelopeClampPreservesCode(t *testing.T) {
 	}
 }
 
-// TestNotFoundJSONEnvelope verifies that unknown canonical paths use the
-// structured 404 while method enforcement, auth, and ServeMux path cleaning keep
-// their existing behavior.
+// TestNotFoundJSONEnvelope pins the JSON 404 for unknown canonical paths, sent
+// before auth, while a known path's bad method still 405s and non-canonical
+// paths still get ServeMux's 307.
 func TestNotFoundJSONEnvelope(t *testing.T) {
 	mux := (&Server{}).routes()
 
@@ -682,10 +682,9 @@ func postKeyed(path, body string) *httptest.ResponseRecorder {
 	return w
 }
 
-// TestDecodeRejectsUnknownField checks DisallowUnknownFields on /report, whose
-// optional fields would otherwise swallow a typo'd key with no error. A client
-// typo returns a 400 invalid-request that names the offending key. /get_pot and
-// /player-context are excluded here because they are lenient (see
+// TestDecodeRejectsUnknownField pins /report's strict decoding: an unknown key,
+// including a case variant of a known one, is a 400 invalid-request that names
+// it. /get_pot and /player-context are lenient (see
 // TestGetPotToleratesBgutilFields and TestPlayerContextVideoID).
 func TestDecodeRejectsUnknownField(t *testing.T) {
 	cases := []struct {
@@ -696,8 +695,8 @@ func TestDecodeRejectsUnknownField(t *testing.T) {
 		// Without strict decode, "raeson" would be dropped and the report accepted
 		// with no reason at all.
 		{"report typo'd optional reason", "/report", `{"session_generation":1,"raeson":"truncated"}`, `request body contains unknown field "raeson"`},
-		// encoding/json matches field names case-insensitively, so these three
-		// were accepted before the keys were checked against the tags directly.
+		// encoding/json matches field names case-insensitively, so only the exact
+		// tag check catches these three.
 		{"report upper-case variant", "/report", `{"session_generation":1,"REASON":"x"}`, `request body contains unknown field "REASON"`},
 		{"report title-case variant", "/report", `{"session_generation":1,"Reason":"x"}`, `request body contains unknown field "Reason"`},
 		{"report case variant of the required field", "/report", `{"SESSION_GENERATION":1}`, `request body contains unknown field "SESSION_GENERATION"`},
@@ -793,15 +792,12 @@ func TestTrailingStallReportsTheTimeout(t *testing.T) {
 	}
 }
 
-// TestGetPotToleratesBgutilFields checks that /get_pot stays lenient for the
-// bgutil/yt-dlp use case. The plugin's extra request fields are ignored rather
-// than rejected. The request reaches the content_binding required-field check,
-// which proves the decoder accepted the unknown fields, instead of failing as an
-// unknown field.
+// TestGetPotToleratesBgutilFields pins /get_pot's leniency: the extra fields
+// the yt-dlp bgutil plugin sends are ignored, so the request reaches the
+// content_binding required check instead of failing as an unknown field.
 func TestGetPotToleratesBgutilFields(t *testing.T) {
-	// The field set the real yt-dlp bgutil HTTP plugin POSTs, with an empty
-	// content_binding so the request stops at the required-field check rather than
-	// attempting a real mint.
+	// The field set the yt-dlp bgutil HTTP plugin POSTs, with content_binding
+	// empty so the request stops at the required check instead of minting.
 	body := `{"content_binding":"","bypass_cache":false,"challenge":"c","disable_tls_verification":true,"proxy":"http://p","innertube_context":{"client":{}},"source_address":"0.0.0.0"}`
 	w := postGetPot(body)
 	if w.Code != http.StatusBadRequest {
@@ -822,10 +818,9 @@ func TestGetPotToleratesBgutilFields(t *testing.T) {
 	}
 }
 
-// TestDecodeSecondObjectStaysGeneric checks that DisallowUnknownFields on the
-// second decode does not leak a field name. On a strict endpoint, a trailing
-// object still returns the generic single-object message rather than "unknown
-// field".
+// TestDecodeSecondObjectStaysGeneric pins that a trailing object on a strict
+// endpoint gets the generic single-object message, not an "unknown field" error
+// that leaks its key.
 func TestDecodeSecondObjectStaysGeneric(t *testing.T) {
 	w := postKeyed("/report", `{"session_generation":1} {"typo":1}`)
 	if w.Code != http.StatusBadRequest {
@@ -1074,10 +1069,9 @@ func aggregateCounter(t *testing.T, s *Server, name string) float64 {
 	return v
 }
 
-// TestPlayerContextRecyclesStaleStreamingSession exercises the HTTP boundary
-// after the streaming deadline has passed. The handler recycles the stale
-// session, echoes the new generation, and surfaces the recycle through /metrics.
-// The deadline is forced into the past to keep the test deterministic.
+// TestPlayerContextRecyclesStaleStreamingSession pins that a /player-context
+// past the streaming deadline recycles the session, echoes the new generation,
+// and counts the recycle in /metrics. The deadline is forced into the past.
 func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 	ctx := context.Background()
 	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
@@ -1107,9 +1101,8 @@ func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 	}
 }
 
-// TestMetricsSurfacesCacheEvictions confirms that cache_evictions reaches
-// /metrics after a capacity eviction. It ties the minter's unit-covered cache
-// behavior to the operator-visible metrics contract.
+// TestMetricsSurfacesCacheEvictions pins that a capacity eviction reaches
+// /metrics as cache_evictions; the minter's own tests cover the eviction.
 func TestMetricsSurfacesCacheEvictions(t *testing.T) {
 	ctx := context.Background()
 	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
@@ -1246,9 +1239,8 @@ func TestMetricsSchemaStableAfterReport(t *testing.T) {
 			t.Errorf("%q = %v, want false", k, v)
 		}
 	}
-	// Detail fields stay present after retirement. liveServer builds with
-	// streamingMaxAge == 0, so the recycle field stays absent because time-based
-	// recycling is disabled.
+	// Detail fields stay present after retirement. The recycle field stays absent
+	// because liveServer disables time-based recycling (streamingMaxAge 0).
 	wantSentinel := map[string]any{
 		"last_browser_proof_outcome":  "",
 		"last_browser_proof_age_secs": nil,
@@ -1398,8 +1390,8 @@ func TestMetricsRedaction(t *testing.T) {
 	}
 }
 
-// The v1 New signature still exists and still refuses before it launches
-// anything, so a caller compiled against v1.3.0 keeps working.
+// New keeps its v1 signature and refuses a colliding metrics key before
+// launching anything, so v1 callers keep working.
 func TestNewKeepsTheV1Signature(t *testing.T) {
 	_, err := New(Config{
 		TenantKeys: map[string]string{"TENANTKEY": "alice"},
@@ -1428,6 +1420,47 @@ func TestNewRejectsMetricsKeyCollision(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "TENANTKEY") {
 		t.Errorf("error leaks key material: %v", err)
+	}
+}
+
+// A caller-built TenantKeys skips ParseTenantKeys, so NewWithContext refuses
+// the maps that would open the daemon or break a tenant before anything
+// launches, while a label shared by two keys stays allowed so keys can rotate.
+// The browser binary is missing, so a map that passes fails at the launch with
+// an error naming the binary, which no refusal does.
+func TestNewRejectsBadTenantKeys(t *testing.T) {
+	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "no-such-browser"))
+	for _, tc := range []struct {
+		name, want string // want is a phrase of the refusal, or "" for a map that passes
+		keys       map[string]string
+	}{
+		{"empty map", "empty TenantKeys", map[string]string{}},
+		{"empty key", "empty key", map[string]string{"KEYA": "alice", "": "bob"}},
+		{"key with a space", "contains whitespace", map[string]string{"KE YA": "alice"}},
+		{"empty label", "empty label", map[string]string{"KEYA": ""}},
+		{"blank label", "empty label", map[string]string{"KEYA": " "}},
+		{"shared label", "", map[string]string{"KEYA": "alice", "KEYB": "alice"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewWithContext(context.Background(), Config{
+				TenantKeys: tc.keys,
+				Logger:     slog.New(slog.DiscardHandler),
+			})
+			if err == nil {
+				_ = s.Shutdown(context.Background())
+				t.Fatal("NewWithContext succeeded without a browser binary")
+			}
+			launched := strings.Contains(err.Error(), "no-such-browser")
+			switch {
+			case tc.want == "" && !launched:
+				t.Errorf("error = %v, want the map accepted and the launch to fail", err)
+			case tc.want != "" && (launched || !strings.Contains(err.Error(), tc.want)):
+				t.Errorf("error = %v, want a refusal containing %q before any launch", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "KE") {
+				t.Errorf("error leaks key material: %v", err)
+			}
+		})
 	}
 }
 
@@ -1476,9 +1509,8 @@ func TestPingReason(t *testing.T) {
 }
 
 // TestBenignPingReason pins which /ping reasons stay healthy under ?strict=true.
-// Both the handler's status code and `waxseal ping --strict` read this, so a
-// reason added on one side and not the other is how the image's HEALTHCHECK
-// starts failing on a healthy daemon.
+// The handler's status and `waxseal ping --strict` both call BenignPingReason,
+// so omitting a benign reason fails the Docker HEALTHCHECK on a healthy daemon.
 func TestBenignPingReason(t *testing.T) {
 	for _, r := range []string{PingReasonNoSession, PingReasonBusy} {
 		if !BenignPingReason(r) {
@@ -1495,11 +1527,9 @@ func TestBenignPingReason(t *testing.T) {
 	}
 }
 
-// A probe failure that cannot take the page from a running request is reported
-// as busy, not probe-failed: nothing was retired, so the failure says as much
-// about contention as about the browser. It stays 200 even under ?strict=true,
-// for the same reason no-session does. Three of these in a row would otherwise
-// mark a healthy container unhealthy while it was simply busy.
+// A probe failure that cannot take the page from a running request is busy,
+// not probe-failed, and stays 200 under ?strict=true: nothing was retired, and
+// three in a row must not mark a busy but healthy container unhealthy.
 func TestPingBusyStaysHealthyUnderStrict(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1549,10 +1579,9 @@ func TestPingBusyStaysHealthyUnderStrict(t *testing.T) {
 	}
 }
 
-// TestStrictPingParsing covers how the ?strict query parameter is read: a bare
-// flag enables it, common truthy spellings enable it, absence and explicit false
-// values disable it, and anything ParseBool cannot read is rejected rather than
-// quietly disabling the mode the operator asked for.
+// TestStrictPingParsing pins how ?strict is read: a bare flag or a ParseBool
+// true enables it, absence or a ParseBool false disables it, and anything else
+// is rejected rather than quietly disabling the mode the operator asked for.
 func TestStrictPingParsing(t *testing.T) {
 	type want struct{ strict, ok bool }
 	cases := map[string]want{
@@ -1672,10 +1701,9 @@ func TestGetPotWarnsOnURLBinding(t *testing.T) {
 	}
 }
 
-// TestGetPotCacheHeaderAndExpiry covers the cache disposition a consumer reads
-// off /get_pot: the first request for a binding mints and reports a miss, the
-// repeat is served from the cache and reports a hit, and both echo the token's
-// own attested expiry rather than one recomputed from the time of the response.
+// TestGetPotCacheHeaderAndExpiry pins X-POT-Cache (miss on a binding's first
+// request, hit on the repeat) and that both echo the token's attested expiry,
+// not one recomputed at response time.
 func TestGetPotCacheHeaderAndExpiry(t *testing.T) {
 	// Whole seconds, because the response formats with RFC3339.
 	expires := time.Now().Add(2 * time.Hour).Truncate(time.Second)
@@ -1990,10 +2018,10 @@ func TestHandleReportRateLimited(t *testing.T) {
 	}
 }
 
-// TestHandleReportAlreadyRetiredMetric drives the already-retired disposition end
-// to end over HTTP: a first report retires the live generation, then a second
-// report for the same still-current generation is a benign no-op that increments
-// degradation_reports_already_retired in /metrics without touching rejected_stale.
+// TestHandleReportAlreadyRetiredMetric pins that a second report for the
+// still-current generation the first one retired is a benign no-op, counted in
+// /metrics as degradation_reports_already_retired, not as rejected_stale or
+// rate_limited.
 func TestHandleReportAlreadyRetiredMetric(t *testing.T) {
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"}
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
@@ -2115,10 +2143,9 @@ func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-// WithAttrs and WithGroup intentionally return the same handler: the capturer
-// records every record by level and message only, ignoring attrs and groups, so
-// there is no child state to isolate. That keeps assertions simple and is safe for
-// these synchronous, single-goroutine tests.
+// WithAttrs and WithGroup return the receiver, dropping logger-level attrs and
+// groups. The server logs its attrs at the call site, and each record keeps
+// those, which is all the attrs method reads.
 func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
 
@@ -2172,9 +2199,9 @@ func TestPresentErr(t *testing.T) {
 	}
 }
 
-// TestPingClientGoneSuppressesProbeFailure checks that a client disconnect during
-// /ping is not reported as a server failure. It should not log a probe-failed
-// WARN, return a strict-mode 503, or write a response body.
+// TestPingClientGoneSuppressesProbeFailure pins that a client disconnect during
+// /ping writes nothing, not even a strict-mode 503, and logs no probe-failed
+// WARN.
 func TestPingClientGoneSuppressesProbeFailure(t *testing.T) {
 	sess := &fakePlayerSession{abrURL: "https://r/x", vd: "vd", pingErr: errors.New("cdp connection closed")}
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
@@ -2363,11 +2390,10 @@ func decodeCode(t *testing.T, body []byte) string {
 	return env.Code
 }
 
-// TestGetPotServerTimeoutMaps504 exercises the real requestProcessTimeout path.
-// The mint blocks until the server's own shortened deadline fires while the
-// client stays connected, so /get_pot should report 504/timeout instead of a
-// generic 502. The minter guard should return the timeout without counting a mint
-// failure or relaunching.
+// TestGetPotServerTimeoutMaps504 pins that the server's own (shortened)
+// requestProcessTimeout, firing while the client stays connected, maps to
+// 504/timeout rather than 502, and that the minter counts no mint failure and
+// does not relaunch.
 func TestGetPotServerTimeoutMaps504(t *testing.T) {
 	shortRequestTimeout(t, 20*time.Millisecond)
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", mintBlocks: true}
@@ -2394,8 +2420,7 @@ func TestGetPotServerTimeoutMaps504(t *testing.T) {
 }
 
 // TestPlayerContextServerTimeoutMaps504 checks the same requestProcessTimeout
-// mapping for /player-context. The outer budget fires while the client stays
-// connected, so the response is 504 rather than 502.
+// mapping (504, not 502) for /player-context.
 func TestPlayerContextServerTimeoutMaps504(t *testing.T) {
 	shortRequestTimeout(t, 20*time.Millisecond)
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", pcBlocks: true}
@@ -2431,9 +2456,9 @@ func TestSessionServerTimeoutMaps504(t *testing.T) {
 	}
 }
 
-// TestInnerDeadlineIsNot504 checks that an inner browser deadline is not treated
-// as the request timeout. When the outer request context is still live, a wrapped
-// context.DeadlineExceeded should remain a generic upstream failure.
+// TestInnerDeadlineIsNot504 pins that an inner browser deadline, a
+// context.DeadlineExceeded while the request context is still live, stays a 502
+// upstream failure rather than the request timeout.
 func TestInnerDeadlineIsNot504(t *testing.T) {
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", mintErr: context.DeadlineExceeded}
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
@@ -2525,7 +2550,7 @@ func playerContextReq(s *Server, video string) *httptest.ResponseRecorder {
 }
 
 // A refusal from inside a cool-down states what is left of it, not the whole
-// window: a consumer that waits the stated time finds the daemon ready. Ageing
+// window: a consumer that waits the stated time finds the daemon ready. Aging
 // the record by a known amount is what makes that testable, since the whole
 // window also satisfies "somewhere in the window".
 func TestPlayerContextCooldownRetryAfterIsRemaining(t *testing.T) {
@@ -2754,10 +2779,9 @@ func TestPingKeylessOnKeyedDaemonProbesTheBrowser(t *testing.T) {
 }
 
 // The daemon-level outcomes. A browser that had exited and was relaunched is
-// healthy and says so; a browser this probe found wedged is a loss, probe-failed
-// and 503 under strict even though it was replaced, as a retired session is;
-// a browser that cannot be replaced is the failure a health check exists to
-// surface.
+// healthy and says so. One this probe found wedged is a loss (probe-failed, 503
+// under strict) even though it was replaced, as a retired session is. One that
+// cannot be replaced is the failure a health check exists to surface.
 func TestPingDaemonProbeOutcomes(t *testing.T) {
 	launchErr := errors.New("waxseal: relaunch chromium: exec: no such file")
 	cases := []struct {
@@ -2821,10 +2845,10 @@ func TestPingWrongKeyOnKeyedDaemonStays401(t *testing.T) {
 	}
 }
 
-// A keyless daemon keeps answering a keyless probe at tenant scope: it has one
-// tenant, the empty key selects it, and single-tenant deployments see the same
-// body as before. The browser check still follows a tenant probe that found no
-// page, as on any daemon; here the browser answers, so the tenant reason stands.
+// A keyless daemon answers a keyless probe at tenant scope, since the empty key
+// selects its one tenant. The browser check still follows a tenant probe that
+// found no page, as on any daemon; here the browser answers, so the tenant
+// reason stands.
 func TestPingKeylessDaemonKeepsTenantProbe(t *testing.T) {
 	s := liveServer(t, nil, nil)
 	proberOf(s, &fakeProber{})
@@ -2897,12 +2921,10 @@ func TestPingBrowserCheckClientGoneWritesNothing(t *testing.T) {
 	}
 }
 
-// A tenant probe that found no answering page is followed by the browser
-// check. A browser that answered, or had exited and was relaunched, leaves the
-// tenant reason standing (and says when it relaunched); a browser this probe
-// found wedged, or one that could not be replaced, is a loss the probe found,
-// so the reason becomes probe-failed and the error says what happened to the
-// browser after what the tenant probe said.
+// A tenant probe that found no answering page runs the browser check. A browser
+// that answered or was relaunched leaves the tenant reason standing and reports
+// any relaunch; one found wedged or unreplaceable turns it into probe-failed,
+// with the browser's error appended to the tenant probe's.
 func TestPingTenantProbeEscalatesToBrowser(t *testing.T) {
 	launchErr := errors.New("waxseal: relaunch chromium: exec: no such file")
 	sessions := map[string]map[string]*fakePlayerSession{
@@ -2959,7 +2981,7 @@ func TestPingTenantProbeEscalatesToBrowser(t *testing.T) {
 
 // A busy page is escalated too: the request holding it is stuck if the browser
 // is wedged, and tearing the browser down is what frees it. When the browser
-// answers, the page was merely in use and busy stands, still benign under strict.
+// answers, the page was only in use and busy stands, still benign under strict.
 func TestPingBusyEscalatesOnlyWhenTheBrowserIsWedged(t *testing.T) {
 	for _, wedged := range []bool{false, true} {
 		t.Run(fmt.Sprintf("wedged=%v", wedged), func(t *testing.T) {

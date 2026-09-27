@@ -14,12 +14,10 @@ import (
 	"github.com/colespringer/waxseal/internal/cdp"
 )
 
-// This file holds the offline page fake and the tests it makes possible. Before
-// it, the establish, confirm, proof, and identity-capture loops were reachable
-// only through a real Chromium, so every change to them was verified by a
-// network run. The fake is a scripted pageDriver: each Eval is answered from a
-// list keyed by the JS constant the production code passes, so a test states
-// what the page reports and when, and the loops run in milliseconds.
+// This file holds an offline fake page for the establish, confirm, proof, and
+// identity-capture loops, and their tests. The fake is a scripted pageDriver
+// that answers each Eval from a list keyed by its JS constant, so a test states
+// what the page reports and when, without Chromium.
 
 // fakeStep is one scripted answer to an Eval. Exactly one of value, err, and
 // block is meaningful.
@@ -64,13 +62,12 @@ func jsBlock() fakeStep { return fakeStep{block: true} }
 
 // jsSlowErr scripts an Eval that takes d and then fails with err. A caller's
 // deadline can expire inside it, which is the only way to reach the branches
-// that have to tell a timed-out call apart from a page that actually broke.
+// that tell a timed-out call apart from a broken page.
 func jsSlowErr(d time.Duration, err error) fakeStep { return fakeStep{err: err, delay: d} }
 
-// fakeCall is one Eval the session made: which snippet, and what it passed. The
-// arguments matter as much as the snippet does. The page fake answers from a
-// table keyed by the JS alone, so without recording them a session that loaded
-// or extracted the wrong video would satisfy every scripted answer.
+// fakeCall is one Eval the session made: which snippet, and what it passed.
+// Answers are keyed by the JS alone, so only the recorded arguments show that a
+// session loaded or extracted the right video.
 type fakeCall struct {
 	js   string
 	args []any
@@ -88,9 +85,7 @@ type fakePageState struct {
 	crash      string
 
 	// wantVideoID, when set, makes Eval fail any load or extract call that names a
-	// different video. The scripted answers are keyed by the snippet alone, so
-	// without this a session that pointed the player at the wrong id, or asked for
-	// the wrong one back, would be handed the same canned payload and pass.
+	// different video instead of handing it the canned payload (see fakeCall).
 	wantVideoID string
 }
 
@@ -227,9 +222,7 @@ func (p fakePage) evalArgs(js string) [][]any {
 }
 
 // assertEveryCallCarries fails unless every call to js passed want as its first
-// argument. It is what keeps the scripted answers honest: the fake keys on the
-// snippet alone, so nothing else would notice a session asking about the wrong
-// video.
+// argument, which keeps the snippet-keyed answers honest (see fakeCall).
 func assertEveryCallCarries(t *testing.T, page fakePage, js, label, want string) {
 	t.Helper()
 	calls := page.evalArgs(js)
@@ -315,9 +308,8 @@ func bufferedPayload(current, bufferedEnd float64, coversTarget bool) map[string
 	}
 }
 
-// A single transient CDP error in the ready probe must not fail establishment.
-// Phase 2 and reReadContext have always tolerated two; before this, one hiccup
-// here failed the whole request.
+// A single transient CDP error in the ready probe must not fail establishment;
+// the probe shares the three-strike rule of phase 2 and reReadContext.
 func TestEstablishToleratesTransientReadyProbeError(t *testing.T) {
 	page := newFakePageFor("vid", map[string][]fakeStep{
 		playerReadyJS:          {jsErr(errors.New("cdp: transient")), jsBool(true)},
@@ -337,11 +329,9 @@ func TestEstablishToleratesTransientReadyProbeError(t *testing.T) {
 	}
 }
 
-// Every video-scoped snippet must be handed the video the caller asked for. The
-// page fake answers from a table keyed by the snippet alone, so nothing else in
-// this file would notice a session that pointed the player at one video and then
-// read the context of another; that mis-wiring would reach a consumer as a
-// streaming URL for the wrong video.
+// Every video-scoped snippet must be handed the video the caller asked for, or
+// a consumer gets a streaming URL for the wrong video. The snippet-keyed fake
+// cannot notice that on its own (see fakeCall).
 func TestEstablishPassesTheRequestedVideoIDToThePage(t *testing.T) {
 	const want = "requested-id"
 	page := newFakePage(map[string][]fakeStep{
@@ -358,8 +348,8 @@ func TestEstablishPassesTheRequestedVideoIDToThePage(t *testing.T) {
 	assertEveryCallCarries(t, page, playerLoadJS, "loadVideoById", want)
 	assertEveryCallCarries(t, page, playerContextExtractJS, "the context extraction", want)
 
-	// And the guard the other tests rely on must actually refuse a mismatch,
-	// rather than passing because it never fires.
+	// The wantVideoID guard the other tests rely on must refuse a mismatch, not
+	// pass because it never fires.
 	strict := newFakePageFor(want, map[string][]fakeStep{
 		playerContextExtractJS: {jsStringified(t, establishedPayload(want, 635))},
 	})
@@ -459,8 +449,53 @@ func TestEstablishPrivateWithoutVideoDetailsIsTerminal(t *testing.T) {
 	if !errors.As(err, &ue) || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Private video" {
 		t.Fatalf("err = %v, want UnplayableError LOGIN_REQUIRED / Private video", err)
 	}
+	if ue.UnrecognizedLogin {
+		t.Error("the private-video shape was flagged, so the minter would never negative-cache it")
+	}
 	if got := page.evalCount(playerContextExtractJS); got != 1 {
 		t.Errorf("extract ran %d times, want 1", got)
+	}
+}
+
+// The flag assumes an English page, since "private" is matched in English. A
+// session that pinned acceptLanguage flags this refusal; one that did not
+// (headful on a French host, say) grades it as before, a verdict the minter
+// caches. Both the establish and the re-read paths read the session's pin.
+func TestUnrecognizedLoginNeedsThePinnedLanguage(t *testing.T) {
+	payload := map[string]any{
+		"error": "pending: player response not yet for vid", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Vidéo privée", "video_id_match": false, "response_changed": true,
+	}
+	for _, pinned := range []bool{true, false} {
+		page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
+		s := newFakeSession(page)
+		s.englishPinned = pinned
+		_, establishErr := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
+		_, reReadErr := s.reReadContext(context.Background(), page, "vid", time.Now().Add(s.timing.reReadBudget))
+		for path, err := range map[string]error{"establish": establishErr, "re-read": reReadErr} {
+			ue, ok := errors.AsType[*UnplayableError](err)
+			if !ok || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Vidéo privée" {
+				t.Fatalf("pinned=%v %s: err = %v, want UnplayableError LOGIN_REQUIRED", pinned, path, err)
+			}
+			if ue.UnrecognizedLogin != pinned {
+				t.Errorf("pinned=%v %s: UnrecognizedLogin = %v, want %v", pinned, path, ue.UnrecognizedLogin, pinned)
+			}
+		}
+	}
+}
+
+// normalizeUA installs the override that carries acceptLanguage, so it is the
+// one place a session's page becomes English for confirmTerminal.
+func TestNormalizeUAPinsTheLanguage(t *testing.T) {
+	s := newFakeSession(newFakePage(nil))
+	if s.englishPinned {
+		t.Fatal("a session that never ran normalizeUA claims a pinned language")
+	}
+	if err := s.normalizeUA(context.Background(), UAHintsSynthetic, &uaOverrideCache{}); err != nil {
+		t.Fatalf("normalizeUA: %v", err)
+	}
+	if !s.englishPinned {
+		t.Error("normalizeUA pinned acceptLanguage but did not mark the session")
 	}
 }
 
@@ -510,11 +545,10 @@ func TestEstablishBotCheckIsSessionLevel(t *testing.T) {
 	}
 }
 
-// The shape YouTube actually refuses with: a LOGIN_REQUIRED playability status
-// and no videoDetails, so the extract reports video_id_match false and the page
-// looks like it is still loading. The wall must still be recognised on the first
-// poll, or it hides behind the establish deadline and the session is never
-// relaunched.
+// The real bot-wall shape: LOGIN_REQUIRED with no videoDetails, so the extract
+// reports video_id_match false as if the page were still loading. The wall
+// must be recognized on the first poll, or it hides behind the establish
+// deadline and the session is never relaunched.
 func TestEstablishBotCheckWithoutVideoDetails(t *testing.T) {
 	payload := map[string]any{
 		"error": "pending: player response not yet for vid", "playability_status": "LOGIN_REQUIRED",
@@ -579,9 +613,8 @@ func TestEstablishDeadlineReportsLastError(t *testing.T) {
 	}
 }
 
-// The establish deadline is checked before each poll, so a budget expiry reports
-// what the page was last waiting for. With no reason yet recorded, the message
-// says the page never answered rather than coming back bare.
+// When the deadline passes before the page reports any reason, the error says
+// the page never answered instead of coming back bare.
 func TestEstablishDeadlineWithNoReasonNamesIt(t *testing.T) {
 	page := newFakePage(map[string][]fakeStep{
 		playerContextExtractJS: {jsBlock()},
@@ -597,11 +630,10 @@ func TestEstablishDeadlineWithNoReasonNamesIt(t *testing.T) {
 	}
 }
 
-// A wall WaxSeal does not recognise reads as pending, so the establish timeout is
-// the only place it surfaces. The deadline error names the status and the phrase
-// the page sat on, which is what makes a rephrased or translated wall
-// diagnosable from one log line, and it stays a plain timeout: neither a graded
-// bot check nor a per-video verdict.
+// A wall WaxSeal does not recognize reads as pending and surfaces only at the
+// establish timeout. The deadline error names the status and phrase the page
+// sat on, so a rephrased or translated wall is diagnosable from one log line,
+// and it stays a plain timeout: neither a bot check nor a per-video verdict.
 func TestEstablishDeadlineNamesTheLastPlayabilityStatus(t *testing.T) {
 	payload := map[string]any{
 		"error":              "pending: player response not yet for vid",
@@ -624,14 +656,13 @@ func TestEstablishDeadlineNamesTheLastPlayabilityStatus(t *testing.T) {
 		}
 	}
 	if errors.Is(err, ErrBotCheck) || errors.Is(err, ErrUnplayable) {
-		t.Errorf("error = %v, want a plain deadline: an unrecognised wall is graded as neither", err)
+		t.Errorf("error = %v, want a plain deadline: an unrecognized wall is graded as neither", err)
 	}
 }
 
-// An extraction that fails for a real reason must say so even when the deadline
-// has also passed. The deadline is checked before each poll, so the only way to
-// reach this is for the deadline to expire inside an Eval; the page's last
-// pending reason must not be substituted for a genuine failure.
+// An extraction that fails for a real reason reports that error, not the last
+// pending reason, even when the deadline has passed. The deadline is checked
+// before each poll, so this needs it to expire inside an Eval (jsSlowErr).
 func TestEstablishGenuineEvalErrorSurvivesAnExpiredDeadline(t *testing.T) {
 	boom := errors.New("cdp: eval exception: extraction threw")
 	page := newFakePage(map[string][]fakeStep{
@@ -729,9 +760,8 @@ func TestConfirmPastCapSeekFailureIsUnavailable(t *testing.T) {
 }
 
 // seekTo returns at once, so a seek that outlives the whole confirm budget is
-// page trouble, not status-2 timing, and keeps the confirm-unavailable class.
-// Only the reason names the budget rather than quoting the derived context's
-// deadline error.
+// page trouble, not status-2 timing, and stays confirm-unavailable. The reason
+// names the budget instead of quoting the derived context's deadline error.
 func TestConfirmPastCapSeekBudgetExpiryIsUnavailable(t *testing.T) {
 	page := newFakePage(map[string][]fakeStep{playerSeekJS: {jsBlock()}})
 	s := newFakeSession(page)
@@ -931,8 +961,8 @@ func TestCaptureIdentityClampsToContextDeadline(t *testing.T) {
 	}
 }
 
-// The captured identity carries the browser's cookie count, which is what tells
-// an operator the guest session actually exists.
+// The captured identity carries the browser's cookie count, which tells an
+// operator the guest session exists.
 func TestCaptureIdentityReadsCookies(t *testing.T) {
 	page := newFakePage(map[string][]fakeStep{
 		identityCaptureJS: {jsStringified(t, identityPayload("VD", "2.99"))},
@@ -969,7 +999,7 @@ func TestRevertPlayerContextEvalsCleanup(t *testing.T) {
 }
 
 // PlayerContext hands back the metadata the page reported, with a nil thumbnail
-// ladder normalised to an empty slice so the wire never shows null.
+// ladder normalized to an empty slice so the wire never shows null.
 func TestSessionPlayerContextFromFakePage(t *testing.T) {
 	payload := establishedPayload("vid", 635)
 	page := newFakePageFor("vid", map[string][]fakeStep{
@@ -1065,10 +1095,9 @@ func TestSessionPlayerContextFromFakePage(t *testing.T) {
 	})
 }
 
-// A Session built without setupSession has a zero timing, and a zero poll
-// interval makes time.After fire immediately, so a loop reading it would spin
-// the CPU instead of pacing. Every loop reads through tuning, which fills the
-// production values back in.
+// A Session built without setupSession has a zero timing, and a zero poll makes
+// time.After fire at once, so a loop would spin instead of pacing. Every loop
+// reads through tuning, which fills unset fields with the production values.
 func TestTuningFillsUnsetTimings(t *testing.T) {
 	zero := (&Session{}).tuning()
 	want := defaultTiming()
@@ -1085,8 +1114,8 @@ func TestTuningFillsUnsetTimings(t *testing.T) {
 		t.Errorf("tuning left establishTimeout at %v, want the default %v", partial.establishTimeout, want.establishTimeout)
 	}
 
-	// fastTiming sets every field, so the offline tests really do run on their own
-	// values rather than silently falling back to the production ones.
+	// fastTiming must set every field, or an offline test would silently fall
+	// back to production timings.
 	if fast := fastTiming(); fast.withDefaults() != fast {
 		t.Errorf("fastTiming leaves a field unset, so that loop would run at production speed: %+v", fast)
 	}

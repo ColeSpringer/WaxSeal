@@ -51,9 +51,9 @@ func TestClassifyAttestation(t *testing.T) {
 	})
 }
 
-// TestMintFallbackDispatch is a bonus check that Mint serves the fallback token
-// without touching the page once the session has attested to the fallback kind.
-// It proves dispatch only; classifyAttestation covers the decision itself.
+// TestMintFallbackDispatch checks that a fallback-attested session's Mint
+// serves the stored token without touching the page. It covers dispatch only;
+// TestClassifyAttestation covers the decision.
 func TestMintFallbackDispatch(t *testing.T) {
 	s := &Session{attestKind: "fallback", fallbackToken: "FAKE", lifetimeSecs: 3600}
 	res, err := s.Mint(context.Background(), "vid")

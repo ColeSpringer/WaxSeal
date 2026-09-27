@@ -1,10 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# WaxSeal is a real-browser PO-token service. The image includes Chromium and
-# drives it through the Chrome DevTools Protocol. Chromium runs with
-# --no-sandbox inside the container, so the container boundary provides the
-# isolation. The image uses a non-root user, and the compose file drops
-# capabilities and disables privilege escalation.
+# Chromium runs with --no-sandbox, so the container is the isolation boundary:
+# the image uses a non-root user, and the compose file drops capabilities and
+# disables privilege escalation.
 
 # build
 FROM golang:1.26-trixie AS build
@@ -18,8 +16,7 @@ COPY . .
 # Version stamping: pass `--build-arg VERSION=1.2.3`. ARG must be declared in this
 # stage for the RUN to see it.
 ARG VERSION=docker
-# Disable CGO for a pure Go binary. The embedded JavaScript bundle does not remove
-# the runtime dependency on Chromium.
+# A static, pure Go binary; it still needs Chromium at runtime.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
@@ -27,17 +24,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # runtime
 FROM debian:trixie-slim
-# Chromium renders WebGL with its own bundled SwiftShader because --disable-gpu is
-# set (unconditional in internal/cdp/launch.go), so the Mesa/LLVM stack chromium
-# pulls in is never loaded. Purging it drops 272 MB, and the dangling dlopen
-# targets it leaves behind have no runtime effect.
-#
-# The assertion guards the list, which is release specific (bookworm had
-# libllvm15, no mesa-libgallium) and fails silently: dpkg --purge exits 0 with a
-# warning for a package that is not installed. The globs catch a rename that
-# leaves its files, dpkg-query catches a package in any state short of
-# not-installed, such as a remove that left a config record. If a build trips
-# either, fix the list rather than the assertion.
+# --disable-gpu (always set in internal/cdp/launch.go) makes Chromium render
+# WebGL with its bundled SwiftShader, so the Mesa/LLVM stack chromium pulls in
+# is never loaded. Purging it saves 272 MB; the dlopen targets it leaves
+# dangling are never used. The list is release specific and dpkg --purge exits
+# 0 for a package that is not installed, so the checks after it fail the build
+# when the list goes stale. Fix the list, not the checks.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium fonts-liberation ca-certificates tini \
@@ -77,17 +69,15 @@ ENV WAXSEAL_CHROME_BIN=/usr/bin/chromium \
 USER waxseal
 EXPOSE 4416
 
-# tini reaps the many short-lived Chromium child processes (PID-1 zombie reaping).
+# tini, as PID 1, reaps Chromium's many short-lived child processes.
 ENTRYPOINT ["/usr/bin/tini", "--", "waxseal"]
 CMD ["server", "--host", "0.0.0.0"]
 
-# Use the built-in health probe instead of curl. The start period covers browser
-# warm-up, and the timeout covers a lazy attestation. --strict fails only on a
-# probe failure: a `POST /report` retires the session and re-establishment is lazy,
-# and that benign window must not mark the container unhealthy. The probe sends
-# no key on purpose. A keyed daemon (--tenant-keys) answers a keyless /ping with
-# the shared browser's health, relaunching a browser that has exited, so this
-# works unchanged once the daemon is keyed. Add `--key <key>` to also probe that
-# tenant's session; the browser is checked either way.
+# The built-in probe replaces curl. The start period covers browser warm-up, and
+# the timeout outlasts ping's own budget (TestImageHealthcheckOutlastsPing).
+# --strict fails only on a probe failure, not in the benign window after a
+# `POST /report` retires the session. The probe sends no key and still works on
+# a keyed daemon (--tenant-keys), which reports the shared browser's health and
+# relaunches an exited one; add `--key <key>` to also probe a tenant's session.
 HEALTHCHECK --interval=30s --timeout=110s --start-period=120s --retries=3 \
   CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416", "--strict"]

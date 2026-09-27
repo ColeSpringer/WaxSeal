@@ -23,43 +23,18 @@ func mkResp(status int, body string) *http.Response {
 	}
 }
 
-func TestResolveEndpoint(t *testing.T) {
-	cases := []struct {
-		mode     string
-		wantHost string
-		wantErr  bool
-	}{
-		{"", "www.youtube.com", false},
-		{"youtube", "www.youtube.com", false},
-		{"YouTube", "www.youtube.com", false}, // case-insensitive
-		{"googleapis", "jnn-pa.googleapis.com", false},
-		{" googleapis ", "jnn-pa.googleapis.com", false}, // trimmed
-		{"jnn-pa", "", true},                             // not an accepted alias
-		{"bogus", "", true},
-	}
-	for _, tc := range cases {
-		ep, err := ResolveEndpoint(tc.mode)
-		if tc.wantErr {
-			if err == nil {
-				t.Errorf("ResolveEndpoint(%q) = nil error, want error", tc.mode)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("ResolveEndpoint(%q): %v", tc.mode, err)
-			continue
-		}
-		if !strings.Contains(ep.CreateURL, tc.wantHost) || !strings.Contains(ep.GenerateITURL, tc.wantHost) {
-			t.Errorf("ResolveEndpoint(%q) = %+v, want host %q", tc.mode, ep, tc.wantHost)
-		}
-	}
+// clearInterpreterCache empties the process-wide interpreter cache.
+func clearInterpreterCache() {
+	interpCache.mu.Lock()
+	defer interpCache.mu.Unlock()
+	clear(interpCache.m)
 }
 
 func TestEndpointOrDefault(t *testing.T) {
 	if got := (Endpoint{}).orDefault(); got != DefaultEndpoint {
 		t.Errorf("zero Endpoint.orDefault() = %+v, want DefaultEndpoint", got)
 	}
-	custom := Endpoint{CreateURL: "https://x/Create", GenerateITURL: "https://x/GenerateIT"}
+	custom := Endpoint{GenerateITURL: "https://x/GenerateIT"}
 	if got := custom.orDefault(); got != custom {
 		t.Errorf("non-zero Endpoint.orDefault() changed it to %+v", got)
 	}
@@ -68,8 +43,8 @@ func TestEndpointOrDefault(t *testing.T) {
 // TestInterpreterCacheReuse confirms a fetched interpreter is reused for the same
 // hash (no second fetch), and a different hash fetches again.
 func TestInterpreterCacheReuse(t *testing.T) {
-	ClearInterpreterCache()
-	t.Cleanup(ClearInterpreterCache)
+	clearInterpreterCache()
+	t.Cleanup(clearInterpreterCache)
 
 	var fetches atomic.Int32
 	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -114,11 +89,11 @@ func TestInterpreterCacheReuse(t *testing.T) {
 	}
 }
 
-// TestInterpreterCacheURLKey confirms the URL is the cache key when no hash is
-// supplied (the Create-with-URL path).
+// TestInterpreterCacheURLKey confirms the URL is the cache key when att/get
+// supplies no interpreterHash.
 func TestInterpreterCacheURLKey(t *testing.T) {
-	ClearInterpreterCache()
-	t.Cleanup(ClearInterpreterCache)
+	clearInterpreterCache()
+	t.Cleanup(clearInterpreterCache)
 
 	var fetches atomic.Int32
 	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -144,8 +119,8 @@ func TestInterpreterCacheURLKey(t *testing.T) {
 // TestInterpreterInlineSkipsCache confirms an inline interpreter is never cached
 // or fetched.
 func TestInterpreterInlineSkipsCache(t *testing.T) {
-	ClearInterpreterCache()
-	t.Cleanup(ClearInterpreterCache)
+	clearInterpreterCache()
+	t.Cleanup(clearInterpreterCache)
 
 	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
 		t.Fatal("inline interpreter must not trigger a fetch")

@@ -3,10 +3,11 @@
 // JSON. The package preserves the request JSON and Chromium argv that WaxSeal's
 // browser fingerprint depends on.
 //
-// Two transports, one protocol. Unix passes an anonymous pair as the child's fd 3
-// and fd 4, where --remote-debugging-pipe looks by convention; Windows has no such
-// convention and no pollable anonymous pipe, so the pair is two overlapped named
-// pipes named in the argv. Everything above the pipe is identical.
+// Unix passes an anonymous pipe pair as the child's fd 3 and fd 4, where
+// --remote-debugging-pipe looks by convention. Windows has no such convention
+// and no pollable anonymous pipe, so it uses two named pipes (overlapped on the
+// parent side) and passes the child's handle values in the argv. Everything
+// above the pipe is identical.
 //
 // The package must not import internal/browser.
 package cdp
@@ -25,11 +26,10 @@ import (
 	"time"
 )
 
-// Tunables for the transport. writeTimeout bounds a single pipe write so an
-// unresponsive Chromium cannot stall the transport indefinitely;
-// defaultStderrMax bounds the crash-diagnostics ring buffer. maxFrameBytes bounds
-// per-frame memory. Normal CDP eval responses are small, and media bytes are
-// fetched over HTTPS by the consumer rather than through this pipe.
+// Tunables for the transport. writeTimeout bounds one pipe write so an
+// unresponsive Chromium cannot stall the transport; defaultStderrMax sizes the
+// crash-diagnostics ring buffer. maxFrameBytes caps per-frame memory: eval
+// responses are small, and consumers fetch media over HTTPS, not this pipe.
 const (
 	writeTimeout     = 10 * time.Second
 	defaultStderrMax = 64 << 10
@@ -47,8 +47,8 @@ var ErrConnClosed = errors.New("cdp: connection closed")
 // waiting for the pipe EOF used by normal teardown.
 var errFrameTooLarge = errors.New("cdp: inbound frame exceeds size limit")
 
-// rpcError is a CDP protocol error returned in a response. It is the error value
-// surfaced from a Call so context-loss retries can match on it.
+// rpcError is a CDP protocol error returned in a response. rawCall returns it
+// as the error so context-loss retries can match on it.
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -65,8 +65,7 @@ func (e *rpcError) Error() string {
 	return fmt.Sprintf("cdp rpc error %d: %s", e.Code, e.Message)
 }
 
-// request is the outbound JSON-RPC envelope (id, sessionId, method, params), the
-// standard CDP JSON-RPC request framing.
+// request is the outbound CDP JSON-RPC envelope.
 type request struct {
 	ID        int64           `json:"id"`
 	SessionID string          `json:"sessionId,omitempty"`
@@ -85,7 +84,7 @@ type inFrame struct {
 	Params    json.RawMessage `json:"params"`
 }
 
-// rpcResult delivers a response to a waiting Call.
+// rpcResult delivers a response to a waiting rawCall.
 type rpcResult struct {
 	result json.RawMessage
 	err    error
@@ -98,7 +97,7 @@ type eventMsg struct {
 }
 
 // subscription receives events for one session, filtered to a method set so a
-// busy domain cannot crowd out the events a watcher actually waits for.
+// busy domain cannot crowd out the events a watcher waits for.
 type subscription struct {
 	id        int
 	sessionID string
@@ -119,11 +118,9 @@ type Conn struct {
 	// use goes through killProcess.
 	guard *procGuard
 
-	// exited is closed by the reaper once cmd.Wait has returned. Callers that
-	// remove the profile directory right after teardown wait on it so they are not
-	// racing files Chromium still has open. Only Spawn starts that reaper, so on a
-	// Conn built without a process the channel is never closed; that is why
-	// waitExited keys off cmd rather than off this channel.
+	// exited is closed by the reaper once cmd.Wait has returned; waitExited
+	// waits on it. Only Spawn starts a reaper, so on a Conn built without a
+	// process it is never closed, which is why waitExited checks cmd first.
 	exited chan struct{}
 
 	// procExited is set by the reaper once cmd.Wait has returned. After that the OS
@@ -224,9 +221,9 @@ func (c *Conn) readLoop() {
 }
 
 // readFrame reads one NUL-delimited frame and returns errFrameTooLarge if the
-// accumulated frame would exceed limit. The returned slice is freshly allocated:
-// readLoop may hand it to other goroutines as json.RawMessage, while ReadSlice
-// aliases bufio.Reader's buffer. Partial chunks are copied before the next read.
+// accumulated frame would exceed limit. The returned slice is freshly allocated
+// because readLoop may hand it to other goroutines as json.RawMessage, while
+// ReadSlice aliases bufio.Reader's buffer.
 func readFrame(r *bufio.Reader, limit int) ([]byte, error) {
 	var buf []byte
 	for {
@@ -241,9 +238,7 @@ func readFrame(r *bufio.Reader, limit int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// append copies chunk, which aliases the bufio buffer, into either a new slice
-		// for single-chunk frames or the heap slice from prior iterations. The returned
-		// frame never aliases the reader buffer.
+		// append copies chunk out of the reader's buffer even when buf is nil.
 		return append(buf, chunk...), nil
 	}
 }
@@ -285,7 +280,7 @@ func (c *Conn) dispatchEvent(f inFrame) {
 }
 
 // teardown marks the connection closed, releases the pipes, fails every pending
-// Call, and wakes everything waiting on Done. It is idempotent, so it owns pipe
+// call, and wakes everything waiting on Done. It is idempotent, so it owns pipe
 // closing for every shutdown path: read-loop EOF, the process-exit reaper, and
 // forceClose. Closing the pipes also wakes a readLoop parked on rpipe.
 func (c *Conn) teardown(err error) {
@@ -307,9 +302,8 @@ func (c *Conn) teardown(err error) {
 	}
 }
 
-// rawCall sends method+params and returns the raw response result. It registers a
-// pending entry, writes under the cancellable write semaphore with a deadline, and
-// selects on the response, the caller ctx, and connection teardown.
+// rawCall sends method+params and waits for the raw result, the caller's ctx,
+// or teardown, whichever comes first. A protocol error returns as *rpcError.
 func (c *Conn) rawCall(ctx context.Context, sessionID, method string, params any) (json.RawMessage, error) {
 	var raw json.RawMessage
 	if params != nil {
@@ -376,12 +370,10 @@ func (c *Conn) dropPending(id int64) {
 	c.mu.Unlock()
 }
 
-// write serializes one frame through a 1-token semaphore and sets a fixed pipe
-// deadline. The semaphore acquire observes ctx and teardown, so callers with short
-// deadlines do not wait behind another writer stuck in wpipe.Write. The pipe
-// deadline is deliberately independent of ctx: a short request deadline should not
-// tear down the shared Conn for every tenant, and aborting mid-frame would corrupt
-// the stream. Any actual write failure force-closes the connection.
+// write serializes one frame through writeSem. The pipe deadline is the fixed
+// writeTimeout, not ctx: any write failure force-closes the Conn every tenant
+// shares, and a frame cut off midway would corrupt the stream, so one caller's
+// short deadline must not abort a write.
 func (c *Conn) write(ctx context.Context, data []byte) error {
 	select {
 	case c.writeSem <- struct{}{}:
@@ -401,10 +393,9 @@ func (c *Conn) write(ctx context.Context, data []byte) error {
 	default:
 	}
 	if derr := c.wpipe.SetWriteDeadline(time.Now().Add(writeTimeout)); derr != nil {
-		// A pipe that cannot take a deadline leaves the write unbounded, so the
-		// 10 s stall guard is silently gone. That should be impossible (Windows
-		// proves the association when it builds the pair, and Unix pipes are always
-		// pollable), which is exactly why it is worth one line if it ever happens.
+		// Without a deadline the write is unbounded and the stall guard is
+		// gone. That should be impossible (Windows proves the association when
+		// it builds the pair; Unix pipes are always pollable), so it is logged.
 		c.warnDeadlineOnce.Do(func() {
 			c.log.Warn("cdp: command pipe does not support write deadlines; the write-stall guard is inactive", "err", derr)
 		})
@@ -443,12 +434,10 @@ func (c *Conn) unsubscribe(s *subscription) {
 	c.subMu.Unlock()
 }
 
-// closePipes closes the parent ends, which lets Chromium read EOF on its command
-// pipe and exit, and unblocks the read loop and cmd.Wait. Both platforms rely on
-// Close waking a parked reader: on Unix the poller does it, and on Windows the
-// parent ends are overlapped files the runtime registered with IOCP, so Close
-// cancels the pending overlapped read rather than leaving the goroutine stuck
-// until data arrives.
+// closePipes closes the parent ends, so Chromium reads EOF on its command pipe
+// and exits, and the read loop wakes. That relies on Close waking a parked
+// reader: on Unix the poller does it; on Windows the parent ends are overlapped
+// files registered with IOCP, so Close cancels the pending read.
 func (c *Conn) closePipes() {
 	if c.wpipe != nil {
 		_ = c.wpipe.Close()
@@ -458,11 +447,9 @@ func (c *Conn) closePipes() {
 	}
 }
 
-// killProcess terminates Chromium the way this platform does it (a SIGKILL to the
-// process group on Unix, a job-object termination on Windows), unless the process
-// has already been reaped. Once cmd.Wait has returned, the OS may have recycled
-// the PID, so a kill by pid could hit an unrelated process; and when the process
-// is already gone there is nothing left to kill.
+// killProcess SIGKILLs Chromium's process group on Unix, or terminates its job
+// object on Windows, unless the process has been reaped: after cmd.Wait
+// returns, the OS may have recycled the PID.
 func (c *Conn) killProcess() {
 	if c.procExited.Load() || c.guard == nil {
 		return
@@ -470,10 +457,9 @@ func (c *Conn) killProcess() {
 	c.guard.kill(c.cmd)
 }
 
-// forceClose terminates the process group, then tears down (which closes the pipes
-// and fails every pending call). It is the single force-close sequence shared by
-// the handshake-timeout, write-stall, oversized-frame, and browser-close paths.
-// teardown keeps the sequence idempotent.
+// forceClose kills the process, then tears down, which closes the pipes and
+// fails every pending call. A failed handshake, a failed write, an oversized
+// frame, and closeRoot all use it; teardown keeps it idempotent.
 func (c *Conn) forceClose(err error) {
 	c.killProcess()
 	c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))

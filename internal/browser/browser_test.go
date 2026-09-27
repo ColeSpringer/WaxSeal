@@ -60,8 +60,8 @@ func TestWithDefaults(t *testing.T) {
 		t.Errorf("explicit NavTimeout overwritten: %v", got)
 	}
 
-	// Client hints default to the browser's own, and the kill switch is honoured
-	// from either the field or the environment. An unrecognised env value keeps
+	// Client hints default to the browser's own, and the kill switch is honored
+	// from either the field or the environment. An unrecognized env value keeps
 	// the default rather than disabling the override.
 	if o.UAHints != UAHintsReal {
 		t.Errorf("UAHints default = %q, want %q", o.UAHints, UAHintsReal)
@@ -111,9 +111,8 @@ func TestValidateLaunchOptions(t *testing.T) {
 	}
 }
 
-// LaunchPool must reject the same invalid Options as Launch, and it must do so
-// before it starts Chromium: an invalid LandingURL/StopAfterLoad combination
-// returns the validation error straight away rather than a launch failure.
+// LaunchPool rejects the same invalid Options as Launch before starting
+// Chromium, returning the validation error rather than a launch failure.
 func TestLaunchPoolValidatesOptions(t *testing.T) {
 	_, err := LaunchPool(context.Background(), Options{LandingURL: "http://127.0.0.1:1/"})
 	if err == nil {
@@ -124,11 +123,10 @@ func TestLaunchPoolValidatesOptions(t *testing.T) {
 	}
 }
 
-// TestUAOverride pins normalizeUA's actual emitted Network.setUserAgentOverride
-// payload. The CDP wire golden marshals a separate hand-written struct, so it
-// cannot catch drift in this producer, such as Architecture changing to x86_64,
-// brand version changes, or Bitness being omitted. This asserts the real
-// producer's bytes.
+// TestUAOverride pins the bytes of the synthetic Network.setUserAgentOverride
+// payload normalizeUA emits. The CDP wire golden marshals a separate struct,
+// so it cannot catch drift in this producer, such as Architecture becoming
+// x86_64, a brand version change, or a dropped Bitness.
 func TestUAOverride(t *testing.T) {
 	const realUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","acceptLanguage":"en-US,en","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
@@ -160,7 +158,7 @@ func TestUAOverride(t *testing.T) {
 // TestUAOverrideFromMetadata covers the real-hint path: everything the browser
 // reports is passed through untouched, and the only edit is the headless marker.
 // The inputs are shaped like real getHighEntropyValues payloads, including the
-// randomised GREASE brand and the four-part build version, neither of which can
+// randomized GREASE brand and the four-part build version, neither of which can
 // be derived from the reduced UA string.
 func TestUAOverrideFromMetadata(t *testing.T) {
 	decode := func(t *testing.T, raw string) *uaMetadata {
@@ -195,8 +193,8 @@ func TestUAOverrideFromMetadata(t *testing.T) {
 			t.Errorf("userAgent = %q", got.UserAgent)
 		}
 		md := got.UserAgentMetadata
-		// The brand the old synthesized block dropped, the GREASE value it replaced
-		// with a constant, and the build version it coarsened to x.0.0.0.
+		// The brand the synthesized block drops, the GREASE value it replaces with
+		// a constant, and the build version it coarsens to x.0.0.0.
 		if !hasBrand(md.Brands, "Google Chrome", "152") {
 			t.Errorf("brands lost the Google Chrome entry: %+v", brandPairs(md.Brands))
 		}
@@ -225,7 +223,7 @@ func TestUAOverrideFromMetadata(t *testing.T) {
 
 	t.Run("macos arm64 follows the capture", func(t *testing.T) {
 		// The case the synthesized block gets wrong: it pins Linux/x86/64 on every
-		// platform, so a darwin arm64 build emitted Linux hints under a Macintosh UA.
+		// platform, so a darwin arm64 build emits Linux hints under a Macintosh UA.
 		m := decode(t, `{"ua":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
 			"brands":[{"brand":"Chromium","version":"152"},{"brand":"Not?A_Brand","version":"24"}],
 			"mobile":false,"platform":"macOS",
@@ -291,7 +289,7 @@ func brandPairs(brands []*cdp.UserAgentBrandVersion) []string {
 	return out
 }
 
-// TestUAOverrideCacheKeepsOnlyAUsableCapture pins the memoisation rule: the first
+// TestUAOverrideCacheKeepsOnlyAUsableCapture pins the memoization rule: the first
 // usable capture is kept for the browser's lifetime and later sessions never
 // capture again, while a failed or incomplete capture leaves the cache empty so
 // the next session retries instead of inheriting the fallback.
@@ -309,7 +307,7 @@ func TestUAOverrideCacheKeepsOnlyAUsableCapture(t *testing.T) {
 		t.Error("capture ran again after a usable one was cached")
 		return nil
 	}); got != want {
-		t.Errorf("cached call returned %+v, want the memoised override", got)
+		t.Errorf("cached call returned %+v, want the memoized override", got)
 	}
 	if calls != 2 {
 		t.Errorf("capture ran %d times, want 2 (a failure, then the one that was kept)", calls)
@@ -378,15 +376,13 @@ var sessionFilledContextKeys = map[string]string{
 	"user_agent": "the identity holds the post-override navigator.userAgent already",
 }
 
-// TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
-// every documented key in the object literal it returns on success, bar the ones
-// the session fills itself, and every grading field in the evidence block it
-// attaches to a pending or unplayable payload. The JS runs only in Chromium, so a
-// key dropped from either literal would otherwise surface as an empty field in a
-// live run, and a missing evidence key reads as a zero value that confirmTerminal
-// grades on. Only those literals are searched, and only for a whole property
-// name, so a key that survives elsewhere in the snippet, or as the tail of
-// another key, cannot satisfy the check.
+// TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet
+// emits every documented key in its success literal, bar the session-filled
+// ones, and every grading field in its pending/unplayable evidence block. The
+// JS runs only in Chromium, so a dropped key would otherwise show up only in a
+// live run, as an empty field or a zero value confirmTerminal grades on. The
+// check matches whole property names inside those literals only, so a key
+// found elsewhere in the snippet or ending a longer name cannot satisfy it.
 func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	const open = "return JSON.stringify({\n"
 	start := strings.Index(playerContextExtractJS, open)
@@ -498,8 +494,8 @@ func TestConfirmTerminal(t *testing.T) {
 			r.Reason = "Sign in to confirm you're not a bot"
 			r.VideoIDMatch = true
 		}), ErrBotCheck, "LOGIN_REQUIRED"},
-		// A per-video reason never outranks the onError evidence, so the ordering
-		// change is confined to the wall.
+		// A per-video reason never outranks the onError evidence; only the wall's
+		// phrase is read before the code.
 		{"private video alongside a terminal onError code", raw(func(r *playerContextRaw) {
 			r.ErrCode = 150
 			r.ErrGenMatch = true
@@ -552,7 +548,7 @@ func TestConfirmTerminal(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := confirmTerminal(tt.raw, want)
+			err := confirmTerminal(tt.raw, want, true)
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("err = %v, want nil (not terminal)", err)
@@ -586,6 +582,71 @@ func TestConfirmTerminal(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestConfirmTerminalFlagsUnrecognizedLogin pins the shape a rephrased bot wall
+// takes: a fresh LOGIN_REQUIRED with no videoDetails and a reason that is not a
+// private video's. It is flagged in both terminal branches, so the minter does
+// not negative-cache it; a private video, a response with videoDetails, and
+// another status are not flagged, and the wall's own phrase still wins. Without
+// the English pin nothing is flagged and the verdict is otherwise the same.
+func TestConfirmTerminalFlagsUnrecognizedLogin(t *testing.T) {
+	const want = "vid123"
+	// refusal is the wall's shape: tied to this load, but not naming the video.
+	refusal := func(reason string, mut func(*playerContextRaw)) playerContextRaw {
+		r := playerContextRaw{Error: "pending: player response not yet for " + want}
+		r.PlayabilityStatus, r.Reason, r.ResponseChanged = "LOGIN_REQUIRED", reason, true
+		if mut != nil {
+			mut(&r)
+		}
+		return r
+	}
+	onError := func(r *playerContextRaw) { r.ErrCode, r.ErrGenMatch, r.ErrVideoID = 150, true, want }
+	tests := []struct {
+		name     string
+		raw      playerContextRaw
+		wantFlag bool
+	}{
+		{"rephrased wall", refusal("Sign in to continue watching", nil), true},
+		{"rephrased wall with a terminal onError code", refusal("Sign in to continue watching", onError), true},
+		{"no reason", refusal("", nil), true},
+		{"private video", refusal("Private video", nil), false},
+		{"private video with a terminal onError code", refusal("Private video", onError), false},
+		{"private, any case", refusal("This video is PRIVATE", nil), false},
+		{"videoDetails present", refusal("Sign in to confirm your age", func(r *playerContextRaw) { r.VideoIDMatch = true }), false},
+		{"another status", refusal("Video unavailable", func(r *playerContextRaw) { r.PlayabilityStatus = "ERROR" }), false},
+		{"onError against the previous load's response", refusal("Sign in to continue watching", func(r *playerContextRaw) {
+			onError(r)
+			r.ResponseChanged = false
+		}), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := confirmTerminal(tt.raw, want, true)
+			ue, ok := errors.AsType[*UnplayableError](err)
+			if !ok {
+				t.Fatalf("err = %v, want an UnplayableError", err)
+			}
+			if ue.UnrecognizedLogin != tt.wantFlag {
+				t.Errorf("UnrecognizedLogin = %v, want %v (err %v)", ue.UnrecognizedLogin, tt.wantFlag, err)
+			}
+			unpinned, ok := errors.AsType[*UnplayableError](confirmTerminal(tt.raw, want, false))
+			if !ok {
+				t.Fatal("unpinned: want an UnplayableError")
+			}
+			if unpinned.UnrecognizedLogin || unpinned.Status != ue.Status || unpinned.Detail != ue.Detail {
+				t.Errorf("unpinned verdict = %+v, want %+v unflagged", *unpinned, *ue)
+			}
+		})
+	}
+	for _, english := range []bool{true, false} {
+		for _, mut := range []func(*playerContextRaw){nil, onError} {
+			err := confirmTerminal(refusal("Sign in to confirm you\u2019re not a bot", mut), want, english)
+			if !errors.Is(err, ErrBotCheck) || errors.Is(err, ErrUnplayable) {
+				t.Errorf("english=%v: err = %v, want a BotCheckError, never a flagged verdict", english, err)
+			}
+		}
 	}
 }
 
@@ -746,12 +807,11 @@ func TestBufferedReachesEnd(t *testing.T) {
 	}
 }
 
-// TestReduceStreamingURL pins reduceStreamingURL's output for the cases the
-// diagnostic log lines depend on: a realistic googlevideo SABR URL, one missing
-// some of the kept parameters, and input that net/url cannot parse at all. Every
-// case's want string is checked to contain none of the signed fields (sig, lsig,
-// pot, n) present in the realistic input, so a regression that widens the kept
-// parameter set fails here instead of in a live log line.
+// TestReduceStreamingURL pins reduceStreamingURL's output for a realistic
+// googlevideo SABR URL, one missing some kept parameters, and inputs that are
+// not absolute URLs. No output may contain the realistic input's signed fields
+// (sig, lsig, pot, n), so a regression that widens the kept parameter set fails
+// here instead of in a live log line.
 func TestReduceStreamingURL(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -860,10 +920,10 @@ func TestBufferedSampleDecode(t *testing.T) {
 	}
 }
 
-// TestProofCandidatesClearTheMinimum pins that every fallback candidate can
-// actually be probed. A candidate at or below fullLengthMinVideoSecs is rejected
-// as OutcomeVideoTooShort before it is ever tried, so it costs a page load and an
-// establish and can never establish a session.
+// TestProofCandidatesClearTheMinimum pins that every fallback candidate is long
+// enough for a full-length proof. proveFullLength rejects one at or below
+// fullLengthMinVideoSecs as OutcomeVideoTooShort, but only after spending a
+// page load and an establish on it.
 func TestProofCandidatesClearTheMinimum(t *testing.T) {
 	// Durations are recorded here rather than fetched, so the offline suite stays
 	// offline. Update alongside proofCandidates. Measured with
@@ -1083,9 +1143,9 @@ func TestValidatePlayerContext(t *testing.T) {
 	}
 }
 
-// TestUsableAudioFormats keeps only selectable formats: a positive itag and an
-// audio/* MIME type. If every entry is filtered out, validatePlayerContext should
-// reject the empty list.
+// TestUsableAudioFormats pins that usableAudioFormats keeps only formats with a
+// positive itag and an audio/* MIME type, and that validatePlayerContext
+// rejects a list filtered to nothing.
 func TestUsableAudioFormats(t *testing.T) {
 	in := []AudioFormat{
 		{Itag: 140, MimeType: "audio/mp4"},  // keep
@@ -1117,9 +1177,9 @@ func TestUsableAudioFormats(t *testing.T) {
 	}
 }
 
-// TestHTTPCookieFromCDP maps CDP cookies to *http.Cookie values. Session cookies
-// keep a zero Expires value, persistent cookies convert from Unix seconds, flags
-// carry through, and sameSite maps to the net/http enum.
+// TestHTTPCookieFromCDP pins the CDP to *http.Cookie mapping: session cookies
+// keep a zero Expires, persistent ones convert from Unix seconds, flags carry
+// through, and sameSite maps to the net/http enum.
 func TestHTTPCookieFromCDP(t *testing.T) {
 	sessionCk := httpCookieFromCDP(&cdp.Cookie{Name: "YSC", Value: "s", Domain: ".youtube.com", Path: "/", Expires: -1, Session: true})
 	if !sessionCk.Expires.IsZero() {

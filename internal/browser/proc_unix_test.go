@@ -10,16 +10,15 @@ import (
 	"time"
 )
 
-// setProfileBase points profileBase at dir for the duration of the test. On Unix
-// that is $HOME, because snap-confined Chromium cannot open a profile under /tmp.
+// setProfileBase points profileBase, which is $HOME on Unix, at dir for the
+// duration of the test.
 func setProfileBase(t *testing.T, dir string) {
 	t.Helper()
 	t.Setenv("HOME", dir)
 }
 
-// The Unix lock is an advisory flock, so a lock this package holds must be
-// visible to a plain flock attempt from the same test, and an unrelated open of
-// the marker must still succeed: nothing here relies on exclusive file access.
+// The Unix lock is an advisory flock: it blocks a second flock on the marker
+// but not an ordinary open or an unlink.
 func TestUnixProfileLockIsAnAdvisoryFlock(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), creatorMarkerFile)
 	if err := os.WriteFile(marker, []byte("1"), 0o600); err != nil {
@@ -48,9 +47,9 @@ func TestUnixProfileLockIsAnAdvisoryFlock(t *testing.T) {
 	}
 }
 
-// cleanupProfile can fail to remove the tree, for instance when a still-exiting
-// child writes into the profile after the directory scan. RemoveAll has taken
-// creator.pid by then, so the marker has to go back for the startup sweep.
+// A cleanupProfile that cannot remove the tree (a still-exiting child writing
+// into the profile, say) must leave creator.pid behind, dated abandoned, so the
+// next sweep collects the directory.
 func TestUnixCleanupProfileLeavesMarkerWhenRemovalFails(t *testing.T) {
 	dir, err := os.MkdirTemp(t.TempDir(), profilePrefix)
 	if err != nil {
@@ -70,8 +69,8 @@ func TestUnixCleanupProfileLeavesMarkerWhenRemovalFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creator.pid is gone after a cleanup that could not finish (%v); the reaper would never collect this directory", err)
 	}
-	// The marker still carries its launch date, which for a short run sits inside
-	// markerGrace and reads as a browser that is still starting.
+	// Left with its launch date, a short run's marker would sit inside
+	// markerGrace and read as a browser that is still starting.
 	if age := time.Since(marker.ModTime()); age < markerGrace {
 		t.Errorf("the marker is dated %v ago, inside the %v grace; the next sweep would read an abandoned profile as a live launch", age, markerGrace)
 	}

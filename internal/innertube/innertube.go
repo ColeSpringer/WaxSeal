@@ -1,9 +1,5 @@
-// Package innertube fetches BotGuard challenges and guest visitor_data from
-// YouTube's InnerTube API. att/get returns structured challenges, and browse
-// supplies visitor_data when a caller does not already have it.
-//
-// Requests use the shared httpx retry and response-limit behavior. Interpreter
-// URLs are resolved through botguard.ResolveInterpreter.
+// Package innertube fetches BotGuard challenges from YouTube's InnerTube
+// att/get endpoint and builds the guest WEB context it takes.
 package innertube
 
 import (
@@ -18,37 +14,25 @@ import (
 )
 
 const (
-	// clientName is the InnerTube client these guest endpoints require.
-	//
-	// clientVersion is a last-resort fallback, used only when a caller passes no
-	// version of its own. The daemon path always supplies the live value: the
-	// browser session captures ytcfg.INNERTUBE_CLIENT_VERSION and passes it to
-	// every InnerTube call, so this constant is reached only by a page that never
-	// exposed the field (which is logged at warn) or by a caller that hardcodes an
-	// empty version. YouTube ships a new WEB version most days, so this literal
-	// will drift; refresh it from a live session with
-	// `go run ./cmd/waxseal doctor 2>&1 | grep client_version` when it gets far
-	// enough behind to matter (doctor logs to stderr).
+	// clientName is the InnerTube client the guest att/get call requires.
+	// clientVersion is the fallback for a caller with no version of its own; the
+	// daemon passes the one it captures (see FallbackClientVersion). YouTube
+	// ships a new WEB version most days, so when it falls far behind, refresh it
+	// from `go run ./cmd/waxseal doctor 2>&1 | grep client_version`.
 	clientName    = "WEB"
 	clientVersion = "2.20260901.00.00"
 
 	maxBody = 4 << 20 // response body cap
 )
 
-// FallbackClientVersion is the pinned WEB version above, exported for the one
-// caller that must hand a version to someone else: a browser session whose page
-// never exposed ytcfg.INNERTUBE_CLIENT_VERSION publishes this instead of an empty
-// string, because a consumer that adopts the session builds its own InnerTube
-// context from what /session hands it, and an empty version there is worse than a
-// version that has drifted.
+// FallbackClientVersion is the pinned WEB version above. A browser session
+// whose page never exposed ytcfg.INNERTUBE_CLIENT_VERSION publishes it through
+// /session instead of an empty string, because a consumer builds its InnerTube
+// context from that value and a drifted version beats an empty one.
 const FallbackClientVersion = clientVersion
 
-// att/get returns the bgChallenge, and browse returns visitor_data. Variables let
-// tests point these endpoints at an httptest server.
-var (
-	attGetURL = "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false"
-	browseURL = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
-)
+// attGetURL is a variable so tests can point it at an httptest server.
+var attGetURL = "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false"
 
 // GetChallenge fetches a structured BotGuard challenge from att/get and resolves
 // its interpreter URL. A non-empty innertubeContext is sent verbatim. An empty
@@ -81,8 +65,7 @@ func GetChallenge(ctx context.Context, client *httpx.Client, userAgent string, i
 	return ch, nil
 }
 
-// bgChallengeEnvelope is the part of the att/get response used by WaxSeal. Field
-// names match the camelCase InnerTube wire format.
+// bgChallengeEnvelope is the part of the att/get response WaxSeal reads.
 type bgChallengeEnvelope struct {
 	BGChallenge struct {
 		InterpreterURL struct {
@@ -115,41 +98,6 @@ func parseBGChallenge(raw []byte) (*botguard.Challenge, error) {
 		Program:         bg.Program,
 		GlobalName:      bg.GlobalName,
 	}, nil
-}
-
-// GenerateVisitorData fetches fresh guest visitor_data via browse. It is used
-// only when a caller supplies none of its own.
-//
-// Nothing in the daemon calls it today: every path gets visitor_data from the
-// browser session's captured identity, and only innertube_test.go exercises this.
-// It also builds its context with defaultContext(""), so it cannot carry a live
-// client version. Whether to keep it is a separate decision.
-func GenerateVisitorData(ctx context.Context, client *httpx.Client, userAgent string) (string, error) {
-	body, err := json.Marshal(map[string]any{
-		"context":  json.RawMessage(defaultContext("")),
-		"browseId": "FEwhat_to_watch",
-	})
-	if err != nil {
-		return "", stageErr(botguard.StageTransport, "build browse body: %w", err)
-	}
-
-	raw, err := postJSON(ctx, client, browseURL, body, userAgent)
-	if err != nil {
-		return "", err
-	}
-
-	var resp struct {
-		ResponseContext struct {
-			VisitorData string `json:"visitorData"`
-		} `json:"responseContext"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", stageErr(botguard.StageParse, "browse response not JSON: %w", err)
-	}
-	if resp.ResponseContext.VisitorData == "" {
-		return "", stageErr(botguard.StageParse, "visitorData not found in browse response")
-	}
-	return resp.ResponseContext.VisitorData, nil
 }
 
 // GuestContext builds a guest WEB InnerTube context, adding visitorData when set.
@@ -197,7 +145,7 @@ func postJSON(ctx context.Context, client *httpx.Client, url string, body []byte
 }
 
 // stageErr tags InnerTube failures with a botguard.Stage so callers can
-// categorize them alongside Create/VM/validate failures.
+// categorize them alongside interpreter-fetch and GenerateIT failures.
 func stageErr(stage botguard.Stage, format string, a ...any) error {
 	return &botguard.StageError{Stage: stage, Err: fmt.Errorf(format, a...)}
 }

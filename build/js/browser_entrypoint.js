@@ -1,11 +1,9 @@
 /*
- * WaxSeal BotGuard entrypoint for a real Chromium.
+ * WaxSeal BotGuard entrypoint for a real Chromium. BgUtils runs the BotGuard VM
+ * against the browser's real global scope, with no shims.
  *
- * BgUtils runs the BotGuard VM against the browser's real global scope. No
- * navigator, window, or performance shim is installed.
- *
- * Exposes runBotguard, newMinter, and mint on globalThis for calls from Go via
- * page.Eval. All HTTP requests remain in Go.
+ * Exposes runBotguard, newMinter, and mint on globalThis for Go to call via
+ * page.Eval. All HTTP requests stay in Go.
  */
 // bgutils-js is subpath-exported and has no root entry, so the BotGuard client
 // and the minter are imported from their own paths.
@@ -26,9 +24,9 @@ let minter;
  * Load the fetched interpreter into the real global scope, create the BotGuard
  * client against the real navigator, and retain the snapshot signal.
  *
- * @param {string} interpreterJavascript - descrambled interpreter JS
- * @param {string} program - challenge program (arr[4])
- * @param {string} globalName - VM global name (arr[5])
+ * @param {string} interpreterJavascript - the challenge's interpreter JS
+ * @param {string} program - challenge program (att/get bgChallenge.program)
+ * @param {string} globalName - VM global name (bgChallenge.globalName)
  * @returns {Promise<string>} botguardResponse
  */
 defHidden('runBotguard', async (interpreterJavascript, program, globalName) => {

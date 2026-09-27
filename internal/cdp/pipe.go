@@ -3,9 +3,8 @@ package cdp
 import "os"
 
 // ioPipesFlagPrefix is the Windows-only switch that carries the two inherited
-// pipe handle values in the argv. It lives here, untagged, because the spawn path
-// writes it and both the Unix and the Windows spawn tests read it: three copies
-// of the same literal is one typo away from a test that proves nothing.
+// pipe handle values in the argv. It is untagged so the Unix spawn test checks
+// the same literal the Windows spawn path writes.
 const ioPipesFlagPrefix = "--remote-debugging-io-pipes="
 
 // pipeDir names which side of a pipe the parent holds.
@@ -19,14 +18,10 @@ const (
 	pipeParentReads
 )
 
-// pipePair is one direction of the CDP transport. The parent keeps parent and
-// hands child to Chromium: on Unix through ExtraFiles, on Windows through an
-// inherited handle named in --remote-debugging-io-pipes.
-//
-// Both ends stay referenced until after cmd.Start. os.NewFile installs a
-// finalizer, so a pair whose child end went out of scope early could have its
-// descriptor closed by the garbage collector between construction and spawn, and
-// Chromium would inherit a closed descriptor.
+// pipePair is one direction of the CDP transport: the parent keeps parent, and
+// procGuard.attach has Chromium inherit child. The pair holds child until after
+// cmd.Start so the *os.File finalizer cannot close it first and hand Chromium a
+// closed descriptor.
 type pipePair struct {
 	parent *os.File
 	child  *os.File

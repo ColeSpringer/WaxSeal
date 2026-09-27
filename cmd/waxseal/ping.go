@@ -18,11 +18,9 @@ import (
 	"github.com/colespringer/waxseal/server"
 )
 
-// hasScheme reports whether s carries a URL scheme. Unlike
-// browser.LooksLikeWatchURL, it does not treat a bare host such as
-// "youtube.com:4416" as a URL, so a legitimate --addr with a youtube.com host is
-// accepted. The --addr guard only ever needs to catch a doubled scheme
-// (http://<addr>).
+// hasScheme reports whether s carries a URL scheme. The --addr guard only needs
+// to catch a doubled scheme (http://<addr>); browser.LooksLikeWatchURL would
+// also reject a legitimate youtube.com host such as "youtube.com:4416".
 func hasScheme(s string) bool { return strings.Contains(s, "://") }
 
 // pingOpts holds ping-subcommand flags.
@@ -33,15 +31,11 @@ type pingOpts struct {
 	timeout time.Duration
 }
 
-// pingTimeout is the whole probe's budget, which covers the probe's own connect,
-// transfer, and decode as well as the daemon's work, so it has to be more than
-// the daemon's worst case rather than equal to it.
-//
-// That worst case adds up to 102 seconds: four session round trips and a session
-// teardown at pingProbeTimeout and teardownTimeout, two browser round trips at
-// aliveProbeTimeout, a browser teardown of gracefulCloseTimeout plus the
-// launcher's waitDelay, and a relaunch bounded by launchTimeout. Windows adds
-// profileRemoveTimeout for 105. The rest is the probe's own.
+// pingTimeout is the whole probe's budget: the daemon's worst case plus the
+// probe's own connect, transfer, and decode. That worst case is 102 s: four
+// session round trips (pingProbeTimeout) and a teardownTimeout, two browser
+// round trips (aliveProbeTimeout), gracefulCloseTimeout plus waitDelay, and a
+// launchTimeout relaunch. Windows adds profileRemoveTimeout, for 105 s.
 const pingTimeout = 108 * time.Second
 
 // newPingCmd checks a running server with GET /ping and exits nonzero on failure.
@@ -72,11 +66,9 @@ func newPingCmd() *cobra.Command {
 }
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
-	// An empty --key is a usage error rather than "no key". A compose file that
-	// passes `--key ${VAR}` with the variable unset would otherwise send no
-	// header, and on a keyed daemon that turns the tenant probe the operator
-	// configured into the daemon-level one without a word: healthy, while the
-	// tenant it meant to watch is never checked.
+	// An empty --key is a usage error, not "no key": with `--key ${VAR}` and
+	// VAR unset, a keyed daemon would get no header and answer the daemon-level
+	// probe, which passes while the tenant goes unchecked.
 	if cmd.Flags().Changed("key") && strings.TrimSpace(p.key) == "" {
 		return &usageError{msg: "--key is empty or only whitespace: pass the tenant key, or omit --key to probe the daemon's browser"}
 	}
@@ -98,30 +90,27 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	if err != nil {
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: use host:port (%v)", p.addr, err)}
 	}
-	// Validate the port here so an out-of-range, empty, non-numeric, or signed port
-	// is a usage error (exit 2) rather than a plain dial failure (exit 1), like
-	// `waxseal server --port`. Unlike a listener bind, a client dial to port 0 is
-	// meaningless, so require 1-65535 (not bindListener's 0-65535). ParseUint with
-	// bitSize 16 bounds the upper end and rejects the leading '+' that Atoi accepts.
+	// A bad port is a usage error (exit 2), as with `waxseal server --port`,
+	// not a dial failure (exit 1). Dialing port 0 is meaningless, so the range
+	// is 1-65535, not bindListener's 0-65535. ParseUint with bitSize 16 caps
+	// the range and rejects the leading '+' that Atoi accepts.
 	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n < 1 {
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: port must be 1-65535", p.addr)}
 	}
-	// Build the URL with url.URL instead of string concatenation. p.addr is already
-	// validated as host:port above. An empty RawQuery yields no "?", and
-	// NewRequestWithContext still rejects anything malformed that slips through.
+	// An empty RawQuery adds no "?". NewRequestWithContext rejects any
+	// malformed authority the checks above let through.
 	u := (&url.URL{Scheme: "http", Host: p.addr, Path: "/ping", RawQuery: q.Encode()}).String()
 	ctx, cancel := context.WithTimeout(cmd.Context(), p.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		// Keep malformed authorities (spaces, bad escapes, broken brackets) on the
-		// usage-error path. Passing a nil request to http.DefaultClient.Do would panic.
+		// usage-error path.
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: %v", p.addr, err)}
 	}
-	// The key travels in a header, never in the query string. A health check runs
-	// every few seconds, and reverse proxies and container runtimes log request
-	// lines, so ?key= would write the tenant key into those logs forever. ?strict
-	// stays in the query because it is not a secret.
+	// The key goes in a header, never the query: proxies and container
+	// runtimes log request lines, and a health check runs every few seconds.
+	// ?strict is not a secret, so it stays in the query.
 	if p.key != "" {
 		req.Header.Set("X-API-Key", p.key)
 	}
@@ -138,9 +127,9 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
 		Keyed      *bool  `json:"keyed"`              // nil from a daemon older than the field
 	}
-	// A body the probe cannot read is not health, whatever the status line says,
-	// and naming it apart from ok=false is what tells an operator they are
-	// probing something that is not this daemon.
+	// An unreadable body is not health, whatever the status line says. Naming
+	// it apart from ok=false tells an operator they are probing something that
+	// is not this daemon.
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 64<<10))
 	if err := dec.Decode(&body); err != nil {
 		return fmt.Errorf("unhealthy: status=%d unreadable body: %v", resp.StatusCode, err)
@@ -153,13 +142,10 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	if p.key != "" && body.Keyed != nil && !*body.Keyed {
 		return errors.New("unhealthy: the daemon is keyless and ignored --key; drop --key or key the daemon")
 	}
-	// Health semantics:
-	//   default: require a live session or browser (ok:true), so the benign
-	//   no-session window reads as not ready.
-	//   strict: accept the benign reasons as healthy, but still fail on probe-failed.
-	//
-	// Do not trust HTTP 200 alone in strict mode. Older daemons ignore ?strict and
-	// can return 200 with {"ok":false}; non-WaxSeal endpoints can do the same.
+	// By default only ok:true is healthy, so the benign no-session window reads
+	// as not ready; strict also accepts the benign reasons. Even in strict mode
+	// a 200 is not enough: older daemons ignore ?strict and can answer 200 with
+	// {"ok":false}, and so can non-WaxSeal endpoints.
 	healthy := body.OK
 	if p.strict {
 		// server.BenignPingReason is the daemon's own strict-200 policy, so the
@@ -174,8 +160,7 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		}
 		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
 	}
-	// A relaunch is worth a word in the health log: the probe found the browser
-	// gone and replaced it, which otherwise shows only in the daemon's own log.
+	// Name a relaunch here; otherwise it shows only in the daemon's own log.
 	detail := ""
 	if body.Relaunched {
 		detail = ", browser relaunched"

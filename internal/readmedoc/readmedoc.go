@@ -1,8 +1,7 @@
-// Package readmedoc reads the examples README.md documents, so a contract test
-// can hold what a package produces against the block that is the contract.
-// Response returns an endpoint's documented JSON, and Fence a fenced block held
-// against a file on disk, such as the compose file the quick start embeds. It
-// is test support: nothing the daemon runs calls it.
+// Package readmedoc extracts examples from README.md so contract tests can hold
+// the code to them. Response returns an endpoint's documented JSON, and Fence a
+// fenced block such as the compose file the quick start embeds. It is test
+// support; the daemon never calls it.
 package readmedoc
 
 import (
@@ -11,12 +10,11 @@ import (
 	"strings"
 )
 
-// Response returns the response example under the first "###" heading
-// containing heading, as JSON with its line comments stripped.
-//
-// The example is located by that heading and by the "// response" line
-// introducing it, so a neighbouring endpoint's block cannot leak keys in, and
-// neither can the request example some sections put in the same fence.
+// Response returns the response example under the first "###" (or deeper)
+// heading containing heading, as JSON with its line comments stripped. The
+// section bounds the search and the example starts after its "// response"
+// line, so neither a neighboring endpoint's block nor an earlier request
+// example in the same fence leaks in.
 func Response(readmePath, heading string) ([]byte, error) {
 	lines, err := readLines(readmePath)
 	if err != nil {
@@ -39,9 +37,8 @@ func Response(readmePath, heading string) ([]byte, error) {
 				continue
 			}
 			body := stripLineComments(strings.Join(lines[j+1:stop], "\n"))
-			// A "// response" line with nothing after it is a documentation bug,
-			// not a response. Saying so beats handing the caller an empty slice to
-			// report as a JSON parse failure.
+			// An empty response block is a documentation bug. Say so rather than
+			// return an empty slice the caller would report as a JSON parse error.
 			if strings.TrimSpace(body) == "" {
 				return nil, fmt.Errorf("readmedoc: the %s response block is empty", heading)
 			}
@@ -52,12 +49,10 @@ func Response(readmePath, heading string) ([]byte, error) {
 	return nil, fmt.Errorf("readmedoc: the %s section has no // response block", heading)
 }
 
-// Fence returns the body of the first fenced block whose info string starts
-// with info, so "```yaml" and "```yaml title=x" both match, under the first
-// heading, at any level, containing heading. Each body line comes back with its
-// newline, which is how the source spells it, so the result holds byte for byte
-// against a file that ends in one. An empty block is an error, the way an empty
-// response example is.
+// Fence returns the body of the first fenced block whose info string's first
+// word is info ("```yaml title=x" matches "yaml"), under the first heading of
+// any level containing heading. Each line keeps its newline, so the result
+// matches a newline-terminated file byte for byte. An empty block is an error.
 func Fence(readmePath, heading, info string) ([]byte, error) {
 	lines, err := readLines(readmePath)
 	if err != nil {
@@ -95,11 +90,10 @@ func readLines(path string) ([]string, error) {
 }
 
 // section returns the line range [start, end) under the first heading of level
-// minLevel or deeper that contains heading. The range runs to the next heading
-// of the same or a shallower level, so a subheading stays inside its section.
-// Only ATX headings count, "#" to "######" followed by a space, and a fenced
-// block is skipped whole on both scans, so a "#" comment in an embedded YAML or
-// shell block can neither open a section nor close one.
+// minLevel or deeper that contains heading, up to the next heading of the same
+// or a shallower level, so subheadings stay inside. Only ATX headings count
+// (see headingLevel). Both scans skip fenced blocks whole, so a "#" comment in
+// an embedded YAML or shell block can neither open nor close a section.
 func section(lines []string, heading string, minLevel int) (start, end int, err error) {
 	level := 0
 	i := 0

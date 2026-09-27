@@ -12,10 +12,10 @@ import (
 )
 
 // Windows has no process group and no SIGKILL. A job object is the equivalent:
-// everything in it dies when the job handle closes, which covers both an explicit
-// kill and this process exiting for any reason. It is the second line of defense;
-// the first is the pipe EOF that Unix relies on too. syscall exports none of the
-// job calls, so they come from kernel32.
+// it can be terminated outright, and everything in it dies when its handle
+// closes, which also happens when this process exits for any reason. It is the
+// second line of defense; the first is the pipe EOF that Unix relies on too.
+// syscall exports none of the job calls, so they come from kernel32.
 var (
 	procCreateJobObjectW         = kernel32.NewProc("CreateJobObjectW")
 	procSetInformationJobObject  = kernel32.NewProc("SetInformationJobObject")
@@ -59,9 +59,8 @@ type jobObjectBasicLimitInformation struct {
 	SchedulingClass         uint32
 }
 
-// jobObjectExtendedLimitInfo mirrors JOB_OBJECT_EXTENDED_LIMIT_INFORMATION. A
-// hand-rolled Win32 layout is where a port breaks silently, so its size is pinned
-// by a test.
+// jobObjectExtendedLimitInfo mirrors JOB_OBJECT_EXTENDED_LIMIT_INFORMATION;
+// TestJobObjectExtendedLimitInfoSize pins its size.
 type jobObjectExtendedLimitInfo struct {
 	BasicLimitInformation jobObjectBasicLimitInformation
 	IoInfo                ioCounters
@@ -74,20 +73,17 @@ type jobObjectExtendedLimitInfo struct {
 // procGuard carries the platform-specific work of spawning Chromium and making
 // sure it dies with, or before, this process.
 //
-// kill and release run on different goroutines: a force-close can come from the
-// read loop or a stalled write while the reaper is returning from cmd.Wait. The
-// Unix guard holds no mutable state, but this one owns a handle, so mu guards it.
-// Without that the handle could be closed out from under a kill still reading it.
+// kill and release run on different goroutines (a force-close from the read
+// loop or a stalled write can race the reaper returning from cmd.Wait), so mu
+// guards the job handle against being closed under a kill still using it.
 type procGuard struct {
 	log *slog.Logger
 
 	mu  sync.Mutex
 	job syscall.Handle // 0 when the job could not be created, or once released
-	// assigned records that Chromium actually reached the job. A job exists from
-	// attach onward, but started can still fail to put the process in it, and
-	// TerminateJobObject reports success on a job holding no processes. Killing on
-	// job != 0 would therefore swallow the direct-kill fallback in exactly the case
-	// it exists for.
+	// assigned records that Chromium reached the job. started can fail to
+	// put it there, and TerminateJobObject succeeds on an empty job, so kill
+	// keyed on job != 0 would skip the direct-kill fallback when it matters.
 	assigned bool
 
 	// warned keeps a job failure to one log line rather than one per teardown.
@@ -127,9 +123,8 @@ func (g *procGuard) attach(cmd *exec.Cmd, cmdPipe, evtPipe *pipePair) {
 	job := syscall.Handle(h)
 	info := jobObjectExtendedLimitInfo{}
 	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
-	// SyscallN rather than Call: a pointer converted to uintptr is kept alive and
-	// in place for the call only when the conversion sits in the argument list of
-	// a syscall.Syscall* function, and Call is an ordinary Go method in between.
+	// Keep the uintptr(unsafe.Pointer(&info)) conversion inside the call's
+	// argument list: only there is info kept alive and in place for the call.
 	ret, _, serr := syscall.SyscallN(procSetInformationJobObject.Addr(),
 		uintptr(job),
 		jobObjectExtendedLimitInformation,
@@ -149,11 +144,10 @@ func (g *procGuard) attach(cmd *exec.Cmd, cmdPipe, evtPipe *pipePair) {
 // started assigns the spawned process to the job. os/exec does not expose its
 // process handle, so this opens its own.
 //
-// Assigning after Start is the one place this guard is weaker than the Unix one,
-// where Setpgid applies before exec: a helper spawned in that window escapes the
-// job. Closing it needs CREATE_SUSPENDED and a resume os/exec gives no handle
-// for, so the window is accepted; it is two syscalls wide and Chromium spawns
-// nothing that early.
+// Unlike Setpgid on Unix, this runs after Start, so a helper spawned in between
+// escapes the job. Closing that window needs CREATE_SUSPENDED and a resume that
+// os/exec gives no handle for; it is two syscalls wide and Chromium spawns
+// nothing that early, so it is accepted.
 func (g *procGuard) started(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -177,8 +171,8 @@ func (g *procGuard) started(cmd *exec.Cmd) {
 }
 
 // kill terminates the job, which takes Chromium and every helper it started.
-// Without a job that Chromium actually reached it falls back to killing the one
-// process, which leaves helpers to exit on their own IPC loss.
+// Without a job that Chromium reached it falls back to killing the one process,
+// which leaves helpers to exit on their own IPC loss.
 func (g *procGuard) kill(cmd *exec.Cmd) {
 	// The lock is held across TerminateJobObject, not just the read: releasing it
 	// first would let release close the handle before the call reached the kernel.
@@ -199,9 +193,8 @@ func (g *procGuard) kill(cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 }
 
-// release closes the job handle after Wait. Because of
-// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, this is also what guarantees that a parent
-// which exits without ever reaching kill still takes Chromium with it.
+// release closes the job handle after Wait, which kills anything left in the
+// job (see jobObjectLimitKillOnJobClose).
 func (g *procGuard) release() {
 	g.mu.Lock()
 	defer g.mu.Unlock()

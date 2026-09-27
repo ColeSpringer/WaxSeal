@@ -11,14 +11,13 @@ import (
 
 // Windows has no flock and does not need one: a file opened with no sharing
 // rights cannot be opened again while the handle lives, and the kernel drops it
-// on any exit, crash included. That is the same liveness signal flock gives, with
-// no PID to misread. Deletion is where the two differ, which is why
-// cleanupProfile does not use the Unix ordering.
+// on any exit, crash included. That is flock's liveness signal with no PID to
+// misread. Unlike a flock, the handle also blocks deletion, so cleanupProfile
+// cannot use the Unix order.
 
 const (
-	// errorSharingViolation is what CreateFile reports when another handle already
-	// has the file open without sharing. It is the signal that a live owner holds
-	// the profile.
+	// errorSharingViolation is CreateFile's error when another handle holds the
+	// file open without sharing, which means a live owner holds the profile.
 	errorSharingViolation = syscall.Errno(32)
 
 	// profileRemoveTimeout bounds the retry after the lock is released. Handles
@@ -68,12 +67,11 @@ func markerLockable(marker string) bool {
 
 // cleanupProfile removes the profile directory and releases the marker lock.
 //
-// The first pass runs with the lock held, so a concurrent reaper still reads a
-// live owner and leaves the tree alone. It cannot delete creator.pid or the
-// directory holding it, so the lock is released and the removal retried; from
-// there a concurrent reaper may join in, which only helps, since both are
-// removing the same abandoned tree. The retry loop is for Chromium's own
-// handles, which close asynchronously after the job kill.
+// The first pass runs with the lock held, so a concurrent reaper sees a live
+// owner and leaves the tree alone. That pass cannot delete creator.pid or its
+// directory, so the lock is released and the removal retried; a reaper that
+// joins in then only helps, since both remove the same tree. The retries wait
+// out Chromium's own handles, which close asynchronously after the job kill.
 func cleanupProfile(h profileHandle) {
 	if h.dir != "" && h.lock != nil {
 		// Expected to fail on creator.pid and on the directory itself; what it
@@ -101,11 +99,10 @@ func cleanupProfile(h profileHandle) {
 	}
 }
 
-// profileBase returns the base dir for the user-data-dir. The snap-confinement
-// rule that puts it under $HOME on Linux does not apply here, and .waxseal-*
-// directories under C:\Users\<name> would be an unwelcome surprise, so profiles
-// live under the temp directory. The reaper globs this same function, so it
-// sweeps wherever this points.
+// profileBase returns the base dir for the user-data-dir: the temp directory.
+// The snap rule that puts it under $HOME on Linux does not apply here, and
+// .waxseal-* directories under C:\Users\<name> would be an unwelcome surprise.
+// ReapStaleProfiles sweeps whatever this returns.
 func profileBase() string { return os.TempDir() }
 
 // isSharingViolation reports whether err is the exclusive-open refusal, so the

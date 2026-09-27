@@ -23,10 +23,10 @@ type fakeSession struct {
 	playerCtx       func(videoID string) (browser.PlayerContext, error)
 	ping            func() error // nil reports a healthy browser
 	establishErr    error
-	establishBlocks bool // EnsureEstablished blocks until ctx is done, honouring cancellation
+	establishBlocks bool // EnsureEstablished blocks until ctx is done, honoring cancellation
 	// onEstablish, when set, runs inside EnsureEstablished after the call is
-	// counted and its result is returned, so a test can act mid-proof (retire the
-	// session the way the crash watcher does) and then fail the proof.
+	// counted, and a non-nil error from it fails the proof. Tests use it to act
+	// mid-proof, such as retiring the session the way the crash watcher does.
 	onEstablish func() error
 	cookies     []*http.Cookie
 	cookiesErr  error
@@ -59,10 +59,10 @@ func (f *fakeSession) PlayerContext(ctx context.Context, videoID string) (browse
 	return f.playerCtx(videoID)
 }
 
-// EnsureEstablished mirrors the real session: it proves once and reports the
-// configured error every time when proving fails. establishBlocks simulates a
-// proof still in flight when the caller's context ends, matching the real
-// session's cancellation behavior.
+// EnsureEstablished fails with establishErr when it is set and otherwise marks
+// the session established. Unlike the real session it never short-circuits, so
+// proofCount catches a redundant proof. With establishBlocks it blocks until
+// ctx ends, as a proof still in flight would, and is not counted.
 func (f *fakeSession) EnsureEstablished(ctx context.Context) error {
 	if f.establishBlocks {
 		<-ctx.Done()
@@ -124,10 +124,9 @@ func (f *fakeSession) LastProof() (browser.FullLengthProbe, time.Time) {
 func (f *fakeSession) Close() { f.closed.Store(true) }
 
 // newBareMinter builds a browserless Minter with the mint-to-establishment
-// separation disabled, so tests that do not measure the spacing itself never
-// wait it out. The attestation pre-mint still runs, which is why several tests
-// below count one more mint than the request they make. A test that measures the
-// separation sets mintSeparation itself before its first call.
+// separation off; a test that measures it sets mintSeparation before its first
+// call. The attestation pre-mint still runs, so several tests count one more
+// mint than the requests they make.
 func newBareMinter(streamingMaxAge, reportDebounce time.Duration) *Minter {
 	m := NewMinter("v", browser.Options{}, streamingMaxAge, reportDebounce, 0)
 	m.mintSeparation = 0
@@ -135,14 +134,14 @@ func newBareMinter(streamingMaxAge, reportDebounce time.Duration) *Minter {
 }
 
 // newTestMinter returns a Minter whose launcher records each created session and
-// uses the supplied per-mint behaviour.
+// uses the supplied per-mint behavior.
 func newTestMinter(mint func(id string) (browser.MintResult, error)) (*Minter, *int64, *[]*fakeSession, *sync.Mutex) {
 	m, launches, sessions, smu := newTestMinterFull(mint, nil)
 	return m, launches, sessions, smu
 }
 
 // newTestMinterFull is newTestMinter with an explicit per-session PlayerContext
-// behaviour (nil uses the fakeSession default).
+// behavior (nil uses the fakeSession default).
 func newTestMinterFull(mint func(id string) (browser.MintResult, error), playerCtx func(videoID string) (browser.PlayerContext, error)) (*Minter, *int64, *[]*fakeSession, *sync.Mutex) {
 	var launches int64
 	var sessions []*fakeSession
@@ -207,10 +206,9 @@ func TestMinterCacheNoReattest(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	// The very first request asks for the session's own visitor_data, which the
-	// attestation pre-mint already minted and cached. Mint re-checks the cache
-	// after the launch it triggers, so this is served from the pre-mint instead
-	// of minting a second, redundant token.
+	// The first request asks for the session's own visitor_data, which the
+	// attestation pre-mint already cached. Mint rechecks the cache after the
+	// launch it triggers, so no second token is minted.
 	r1, c1, err := m.Mint(ctx, "gvs", "vd")
 	if err != nil || !c1 {
 		t.Fatalf("first mint: cached=%v err=%v, want cached=true (served by the pre-mint)", c1, err)
@@ -265,9 +263,7 @@ func TestMinterMaxAgeRecycle(t *testing.T) {
 }
 
 // TestMinterStreamingRecycleOnHandoff checks that a stale streaming session is
-// recycled on the next PlayerContext handoff. The call returns a fresh
-// generation, closes the old session, and bumps StreamingRecycles. The deadline
-// is forced into the past so the test does not sleep.
+// recycled on the next PlayerContext handoff.
 func TestMinterStreamingRecycleOnHandoff(t *testing.T) {
 	m, launches, sessions, smu := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
@@ -300,9 +296,8 @@ func TestMinterStreamingRecycleOnHandoff(t *testing.T) {
 	}
 }
 
-// TestMinterStreamingRecycleNotOnTokenOnly keeps token-only Mint from using the
-// streaming handoff recycle. A stale streaming deadline must not relaunch an
-// otherwise usable session for a bare token request.
+// TestMinterStreamingRecycleNotOnTokenOnly checks that a stale streaming
+// deadline does not relaunch a usable session for a token-only Mint.
 func TestMinterStreamingRecycleNotOnTokenOnly(t *testing.T) {
 	m, launches, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
 		return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
@@ -328,12 +323,11 @@ func TestMinterStreamingRecycleNotOnTokenOnly(t *testing.T) {
 // then a relaunch (re-attest) on a fresh session; the old session is closed.
 func TestMinterEscalationLadder(t *testing.T) {
 	var attempt int64
-	// Attempt 1 is the pre-mint at attestation; 2 and 3 are the request's mint and
-	// its in-place retry; 4 is the relaunch's own pre-mint. Mint does not recheck
-	// the cache after a relaunch, so attempt 4 failing or succeeding cannot change
-	// which attempt serves the request; it is still made to fail here so the
-	// sequence stays unambiguous, and the request's own post-relaunch mint (5) is
-	// visibly the one that produces the token this test asserts on.
+	// Attempt 1 is the attestation pre-mint, 2 and 3 are the request's mint and
+	// its in-place retry, 4 is the relaunch's pre-mint, and 5 is the request's
+	// mint on the replacement. Mint does not recheck the cache after a relaunch,
+	// so 4 cannot serve the request either way; it fails so that 5 is visibly the
+	// attempt that produces the token.
 	m, launches, sessions, smu := newTestMinter(func(string) (browser.MintResult, error) {
 		if n := atomic.AddInt64(&attempt, 1); n <= 4 {
 			return browser.MintResult{}, fmt.Errorf("transient failure %d", n)
@@ -371,11 +365,11 @@ func TestMinterEscalationLadder(t *testing.T) {
 	}
 }
 
-// TestMinterCrashKeepsCacheThenRelaunchInvalidates: retiring a session (the path
-// a crash takes) does not by itself force a re-attest; already-minted tokens
-// outlive the browser, so a cached binding is still served (the per-IP-scarce
-// attestation is preserved). A cache-missing request relaunches (bumping the
-// generation), which then invalidates the old generation's cached tokens.
+// TestMinterCrashKeepsCacheThenRelaunchInvalidates: a crash retire does not by
+// itself force a re-attest. Minted tokens outlive the browser, so a cached
+// binding is still served without spending an attestation, which is scarce per
+// IP. A cache-missing request relaunches, and the generation bump invalidates
+// the old generation's cached tokens.
 func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 	var mints int64
 	m, launches, sessions, smu := newTestMinter(func(id string) (browser.MintResult, error) {
@@ -416,10 +410,9 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("launches = %d, want 2 (cache miss after crash relaunches)", got)
 	}
 
-	// The generation bump clears older entries from the cache, so it holds only
-	// what generation 2 produced: the relaunch's pre-mint, cached under both the
-	// gvs and pot scopes, and the binding this request asked for. Three entries,
-	// not two: the pre-mint fix added the second scope.
+	// The generation bump clears older entries, so the cache holds only what
+	// generation 2 produced: the relaunch's pre-mint under both the gvs and pot
+	// scopes, and the binding this request asked for.
 	m.mu.Lock()
 	cacheLen := len(m.cache)
 	m.mu.Unlock()
@@ -427,9 +420,8 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("cache size after relaunch = %d, want 3 (old entries cleared; pre-mint under two scopes + new binding)", cacheLen)
 	}
 
-	// The generation-1 gvs/vd entry is stale after the relaunch. The relaunch's
-	// own pre-mint refilled that key, so the served token must be the new one
-	// (tok2, the generation-2 pre-mint), never the generation-1 token (tok1).
+	// The relaunch's pre-mint refilled gvs/vd, so the served token is tok2 from
+	// generation 2, never generation 1's tok1.
 	r, cached, _ := m.Mint(ctx, "gvs", "vd")
 	if !cached {
 		t.Errorf("gvs/vd should be served from the relaunch's pre-mint")
@@ -619,9 +611,117 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 			t.Errorf("log = %q, want a debug record %q", logs.String(), want)
 		}
 	}
+	// A private video is a recognized verdict: cached, not flagged.
+	if got := m.metrics.UnrecognizedLoginRefusals.Load(); got != 0 {
+		t.Errorf("unrecognized_login_refusals = %d, want 0", got)
+	}
+	if strings.Contains(logs.String(), "isBotCheck") {
+		t.Errorf("log = %q, want no rephrased-wall warning for a private video", logs.String())
+	}
 }
 
-// TestMinterPlayerContextCancelNoEscalation: a cancelled caller context fails without
+// unrecognizedLogin is the verdict the browser flags as a possible rephrased
+// bot wall.
+func unrecognizedLogin(reason string) error {
+	return &browser.UnplayableError{Status: "LOGIN_REQUIRED", Detail: reason, UnrecognizedLogin: true}
+}
+
+// A flagged verdict is answered as unavailable like any other, but it may be a
+// wall isBotCheck missed, so it is never negative-cached: a repeat reaches the
+// session again. Every one is counted; each distinct reason warns once.
+func TestPlayerContextUnrecognizedLoginIsNotCached(t *testing.T) {
+	var logs bytes.Buffer
+	var calls atomic.Int64
+	reasons := map[string]string{"vidA": "Sign in to continue", "vidB": "Sign in to continue", "vidC": "Log in to watch"}
+	m, launches, _, _ := newTestMinterFull(okMint, func(videoID string) (browser.PlayerContext, error) {
+		calls.Add(1)
+		return browser.PlayerContext{}, unrecognizedLogin(reasons[videoID])
+	})
+	m.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx := context.Background()
+
+	for _, vid := range []string{"vidA", "vidA", "vidB", "vidC"} {
+		_, _, err := m.PlayerContext(ctx, vid)
+		if ue, ok := errors.AsType[*browser.UnplayableError](err); !ok || !ue.UnrecognizedLogin || ue.Status != "LOGIN_REQUIRED" {
+			t.Fatalf("%s: err = %v, want the flagged UnplayableError unchanged", vid, err)
+		}
+	}
+	if got := calls.Load(); got != 4 {
+		t.Errorf("session PlayerContext calls = %d, want 4 (a flagged verdict is never cached)", got)
+	}
+	for _, vid := range []string{"vidA", "vidB", "vidC"} {
+		if err := m.negCacheGet(vid); err != nil {
+			t.Errorf("negative cache holds %v for %s", err, vid)
+		}
+	}
+	if got := m.metrics.UnrecognizedLoginRefusals.Load(); got != 4 {
+		t.Errorf("unrecognized_login_refusals = %d, want 4", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 4 {
+		t.Errorf("player_context_failures = %d, want 4 (one per attempt, as for any verdict)", got)
+	}
+	if got := m.metrics.PlayerContextNegativeCacheHits.Load(); got != 0 {
+		t.Errorf("player_context_negative_cache_hits = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a verdict never relaunches)", got)
+	}
+	if got := strings.Count(logs.String(), "isBotCheck"); got != 2 {
+		t.Errorf("rephrased-wall warnings = %d, want 2, one per distinct reason (log=%q)", got, logs.String())
+	}
+	for _, reason := range []string{"Sign in to continue", "Log in to watch"} {
+		if !strings.Contains(logs.String(), reason) {
+			t.Errorf("log = %q, want a warning naming %q", logs.String(), reason)
+		}
+	}
+}
+
+// The replacement's verdict is recorded the same way: a flagged refusal met
+// after a level-2 relaunch is counted and not cached.
+func TestPlayerContextUnrecognizedLoginOnReplacementIsNotCached(t *testing.T) {
+	var calls atomic.Int64
+	m, launches, _, _ := newTestMinterFull(okMint, func(string) (browser.PlayerContext, error) {
+		if calls.Add(1) <= 2 {
+			return browser.PlayerContext{}, errors.New("transient failure")
+		}
+		return browser.PlayerContext{}, unrecognizedLogin("Sign in to continue")
+	})
+
+	if _, _, err := m.PlayerContext(context.Background(), "vid"); !errors.Is(err, browser.ErrUnplayable) {
+		t.Fatalf("err = %v, want the flagged verdict", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the verdict came from the replacement)", got)
+	}
+	if err := m.negCacheGet("vid"); err != nil {
+		t.Errorf("negative cache holds %v; a flagged verdict is never cached", err)
+	}
+	if got := m.metrics.UnrecognizedLoginRefusals.Load(); got != 1 {
+		t.Errorf("unrecognized_login_refusals = %d, want 1", got)
+	}
+}
+
+// The warned-reason set is bounded: past unrecognizedLoginWarnMax distinct
+// reasons, a new one is still counted but no longer warned about or kept.
+func TestUnrecognizedLoginWarnSetIsBounded(t *testing.T) {
+	var logs bytes.Buffer
+	m := newBareMinter(0, 0)
+	m.log = slog.New(slog.NewTextHandler(&logs, nil))
+	for i := range unrecognizedLoginWarnMax + 3 {
+		m.recordUnplayable("vid", unrecognizedLogin(fmt.Sprintf("reason %d", i)))
+	}
+	if got := len(m.unrecognizedLoginWarned); got != unrecognizedLoginWarnMax {
+		t.Errorf("warned reasons kept = %d, want %d", got, unrecognizedLoginWarnMax)
+	}
+	if got := strings.Count(logs.String(), "isBotCheck"); got != unrecognizedLoginWarnMax {
+		t.Errorf("warnings = %d, want %d", got, unrecognizedLoginWarnMax)
+	}
+	if got := m.metrics.UnrecognizedLoginRefusals.Load(); got != unrecognizedLoginWarnMax+3 {
+		t.Errorf("unrecognized_login_refusals = %d, want %d", got, unrecognizedLoginWarnMax+3)
+	}
+}
+
+// TestMinterPlayerContextCancelNoEscalation: a canceled caller context fails without
 // escalating: the warm attested session is not retired and there is no relaunch.
 func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 	m, launches, sessions, smu := newTestMinterFull(
@@ -634,7 +734,7 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // client disconnected
 	if _, _, err := m.PlayerContext(ctx, "vid"); err == nil {
-		t.Fatal("want error on cancelled ctx")
+		t.Fatal("want error on canceled ctx")
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
 		t.Errorf("launches = %d, want 1 (a cancel must not relaunch)", got)
@@ -653,10 +753,9 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 	}
 }
 
-// TestMinterPlayerContextStatus2OneRetryNoRelaunch checks that status-2
-// confirmation failures get one in-place retry and then a refusal, with no
-// relaunch. The warm session remains live and the request-level rejection counter
-// advances once.
+// TestMinterPlayerContextStatus2OneRetryNoRelaunch checks that a status-2
+// confirmation failure gets one in-place retry and then a refusal, with no
+// relaunch, and that status2_rejections counts the request once.
 func TestMinterPlayerContextStatus2OneRetryNoRelaunch(t *testing.T) {
 	var calls int64
 	m, launches, sessions, smu := newTestMinterFull(
@@ -774,9 +873,9 @@ func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
 	}
 }
 
-// TestMinterNegCacheBoundedEvicts: at capacity with every entry live, a new terminal
-// result is still cached (evicting an older one) instead of dropped, so the map stays
-// bounded and the newest unplayable id is the one kept.
+// TestMinterNegCacheBoundedEvicts: at capacity with every entry live, a new
+// terminal result evicts another entry rather than being dropped, so the map
+// stays bounded and keeps the newest unplayable id.
 func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 	m := newBareMinter(0, 0)
 	for i := 0; i < minterNegCacheMax; i++ {
@@ -795,8 +894,7 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 }
 
 // Refreshing an existing neg-cache entry at capacity must not evict a live entry,
-// matching cachePut. The old code ran the eviction path on any insert, dropping an
-// unrelated entry on a refresh. Each refresh must leave the cache full.
+// matching cachePut: only a new key may force an eviction.
 func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
 	m := newBareMinter(0, 0)
 	for i := 0; i < minterNegCacheMax; i++ {
@@ -814,8 +912,7 @@ func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
 }
 
 // TestMinterCacheBoundedEvicts: at capacity, inserting a live token evicts one
-// existing token rather than dropping the new one. The positive cache stays
-// bounded and retains the latest insert.
+// existing token rather than dropping the new one, and counts one eviction.
 func TestMinterCacheBoundedEvicts(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.gen = 1 // production never caches at gen 0
@@ -840,10 +937,9 @@ func TestMinterCacheBoundedEvicts(t *testing.T) {
 	}
 }
 
-// TestMinterCacheEvictsNearestExpiry: at capacity with all entries live,
-// inserting a token evicts the entry with the earliest expiry. This keeps a
-// freshly minted token from replacing a longer-lived token by map iteration
-// order.
+// TestMinterCacheEvictsNearestExpiry: at capacity with all entries live, an
+// insert evicts the entry with the earliest expiry, not whichever one map
+// iteration reaches first.
 func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.gen = 1
@@ -867,9 +963,8 @@ func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
 	}
 }
 
-// TestMinterCachePutReclaimsExpired: when the cache is full of expired entries
-// from the current generation, a new insert reclaims them during pruning. It
-// should not count as a live-token eviction.
+// TestMinterCachePutReclaimsExpired: an insert into a cache full of expired
+// current-generation entries reclaims them without counting an eviction.
 func TestMinterCachePutReclaimsExpired(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.gen = 1
@@ -981,11 +1076,10 @@ func TestCacheHitsDoNotBypassMaxAge(t *testing.T) {
 	}
 }
 
-// TestSessionPastMaxAgeKeysOnAttestation pins the two behaviours that keep
-// sessionPastMaxAge separate from ensure's own teardown predicate. During a
-// relaunch m.sess is nil while the generation has not yet bumped, so the aged
-// generation's entries are still servable and an aged attestation must still
-// report past the bound. A Minter that has never attested is past no bound.
+// TestSessionPastMaxAgeKeysOnAttestation pins that sessionPastMaxAge keys on
+// attestedAt, not a live session: in the relaunch window m.sess is nil but the
+// aged generation's entries are still servable, so it must report past the
+// bound. A Minter that has never attested is past no bound.
 func TestSessionPastMaxAgeKeysOnAttestation(t *testing.T) {
 	m, launches, _, _ := newTestMinter(okMint)
 	if m.sessionPastMaxAge() {
@@ -1049,12 +1143,11 @@ func TestGrantExpiryRecyclesSession(t *testing.T) {
 	}
 }
 
-// TestShortGrantDoesNotRelaunchForever pins the floor under the grant recycle. An
-// attestation whose tokens are already inside the cache margin when it issues
-// them bounds nothing, because its replacement arrives just as exhausted. Without
-// the floor the first such attestation makes every later request tear down a
-// healthy session and re-attest, forever, and nothing but attestations moves to
-// show it.
+// TestShortGrantDoesNotRelaunchForever pins the floor under the grant recycle:
+// a grant already inside the cache margin when issued bounds nothing, because
+// its replacement arrives just as exhausted. Without the floor every later
+// request tears down a healthy session and re-attests, forever, and only the
+// attestations counter shows it.
 func TestShortGrantDoesNotRelaunchForever(t *testing.T) {
 	m, launches, _, _ := newTestMinter(agedMint(minterCacheMargin - time.Minute))
 	for i := 0; i < 5; i++ {
@@ -1104,9 +1197,8 @@ func TestMinterCloseClearsCaches(t *testing.T) {
 }
 
 // TestMinterNegCacheSurvivesRecycle: a generation bump clears only the positive
-// cache. The negative cache is keyed by generation-independent unplayability, so
-// a recycle must not probe the same unplayable video again. This guards the
-// choice to leave m.negCache intact in ensure.
+// cache. Unplayability does not depend on the session, so a recycle must not
+// probe the same unplayable video again.
 func TestMinterNegCacheSurvivesRecycle(t *testing.T) {
 	m, _, _, _ := newTestMinter(okMint)
 	ctx := context.Background()
@@ -1278,9 +1370,8 @@ func TestMinterHealthNoSessionCarriesGeneration(t *testing.T) {
 	}
 }
 
-// The probe-fail path is the most regression-prone one. It returns an error and
-// retires the session, but the snapshot must still carry the just-failed
-// generation so /ping reports N, not 0.
+// The probe-fail path returns an error and retires the session, but its
+// snapshot still carries the failed generation so /ping reports N, not 0.
 func TestMinterHealthDeadPingCarriesGeneration(t *testing.T) {
 	m, _, _ := newPingMinter(func() error { return errors.New("cdp connection closed") })
 	if err := m.Warm(context.Background()); err != nil {
@@ -1486,9 +1577,9 @@ func TestMinterHealthPersistentSupersedeReportsNoSession(t *testing.T) {
 	}
 }
 
-// SelfTest caches its GVS token under the regular mint key, and says in the log
-// that its streaming proof passed: a failing one already logs, so without this
-// a reader cannot tell a passing proof from one that never ran.
+// After SelfTest the identity's GVS token is cached under the regular mint key,
+// and the log says the streaming proof passed: a failing proof already logs, so
+// without this a reader cannot tell a passing proof from one that never ran.
 func TestMinterSelfTestCachesGVSMint(t *testing.T) {
 	var mints int64
 	var logs bytes.Buffer
@@ -1828,9 +1919,8 @@ func TestMinterReportDegradedStaleGen(t *testing.T) {
 }
 
 // A report for the current generation whose session was already retired is a
-// benign no-op counted as already_retired, distinct from a stale-generation
-// report. retire() clears the suspect mark, so the re-report lands in the
-// no-live-session case rather than the pending or debounce branches.
+// benign no-op counted as already_retired: not stale, and not rate-limited even
+// when the budget is spent.
 func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	m, _, _, _ := newStreamingMinter(0, nil)
 	ctx := context.Background()
@@ -1856,9 +1946,8 @@ func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	if got := m.metrics.DegradationReportsRejectedStale.Load(); got != 0 {
 		t.Errorf("degradation_reports_rejected_stale = %d, want 0 (current gen, not stale)", got)
 	}
-	// The sess==nil case must precede the rate-limit case: with the budget drained
-	// above, this re-report also satisfies the rate-limit predicate. A miscount
-	// here (rate_limited == 1) would mean the switch was reordered.
+	// The sess==nil case must precede the rate-limit case; rate_limited == 1
+	// means the switch was reordered.
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 0 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 0 (already-retired must not route to debounce)", got)
 	}
@@ -2006,9 +2095,9 @@ func TestReportDuplicatePendingIsCounted(t *testing.T) {
 	}
 }
 
-// A deferred report-driven retirement spends report budget just like an
-// immediate one. With a single token left, the handoff's deferred retire
-// consumes it, so the next report is rate-limited.
+// A deferred report-driven retirement spends report budget like an immediate
+// one: with one token left, the handoff's deferred retire consumes it and the
+// next report is rate-limited.
 func TestMinterReportDeferredConsumesBudget(t *testing.T) {
 	m, _, _, release, done := startBlockingPlayerContext(t)
 
@@ -2072,9 +2161,7 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 }
 
 // A report that loses the retire race to another goroutine must not spend
-// report budget. A token is consumed only when this report actually recycled
-// the session. Running several rounds makes the race show up without relying on
-// timing.
+// report budget. Many rounds make the race show up without relying on timing.
 func TestMinterReportNoopRetireDoesNotSpendBudget(t *testing.T) {
 	for round := 0; round < 200; round++ {
 		m, _, _, _ := newStreamingMinter(0, nil)
@@ -2509,10 +2596,10 @@ func TestMinterReportDebounceDefaultsWhenUnset(t *testing.T) {
 	}
 }
 
-// TestMinterMintCancelNoEscalationNoRetire covers cancellation during Mint. The
-// guard returns ctx.Err() before updating failure metrics, warning, retiring the
-// session, or relaunching. The fake session fails unconditionally and ignores its
-// ctx, so the pre-canceled context is the only signal the guard can use.
+// TestMinterMintCancelNoEscalationNoRetire checks that a canceled Mint returns
+// ctx.Err() without counting a failure, retiring the session, or relaunching.
+// The fake fails every mint and ignores its ctx, so the canceled context is the
+// only signal the guard has.
 func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
 	m, launches, sessions, smu := newTestMinter(func(string) (browser.MintResult, error) {
 		return browser.MintResult{}, errors.New("mint always fails")
@@ -2546,14 +2633,12 @@ func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
 	}
 }
 
-// The attestation mints the visitor's GVS token before publishing the session,
-// so the token a consumer streams with is already old when the first context is
-// established. PlayerContext is what launches here because it never mints on its
-// own, so every mint the fake records comes from the pre-mint.
-// TestEnsurePremintsGVSToken checks the attestation pre-mint under both
-// launchers a cold request can take: a player-context call, and a /get_pot mint
-// whose own binding happens to be the pre-minted one. Either way, exactly one
-// fake mint runs, and both the gvs and pot scopes hit it.
+// TestEnsurePremintsGVSToken checks that attestation mints the visitor's GVS
+// token before publishing the session, so the token a consumer streams with is
+// already old when the first context is established. It covers both launchers a
+// cold request can take: a player-context call, which never mints on its own,
+// and a /get_pot mint for the pre-minted binding. Either way exactly one mint
+// runs and both the gvs and pot scopes hit it.
 func TestEnsurePremintsGVSToken(t *testing.T) {
 	newPremintMinter := func() (m *Minter, launches, mints *int64, bindings *[]string, bmu *sync.Mutex) {
 		mints = new(int64)
@@ -2621,10 +2706,9 @@ func TestEnsurePremintsGVSToken(t *testing.T) {
 	t.Run("mint launcher", func(t *testing.T) {
 		m, launches, mints, bindings, bmu := newPremintMinter()
 		ctx := context.Background()
-		// A cold /get_pot for the session's own visitor_data is what triggers the
-		// launch here. Mint re-checks the cache after ensure returns, so it must
-		// serve the pre-mint's entry rather than minting a second, redundant token
-		// and overwriting it.
+		// A cold /get_pot for the session's own visitor_data triggers the launch.
+		// Mint rechecks the cache after ensure returns, so it must serve the
+		// pre-mint's entry rather than mint again and overwrite it.
 		r, cached, err := m.Mint(ctx, "gvs", "vd")
 		if err != nil {
 			t.Fatalf("mint: %v", err)
@@ -2670,11 +2754,10 @@ func TestEnsurePremintFailureStillPublishes(t *testing.T) {
 		t.Errorf("gvs/vd after a failed pre-mint = (%q, cached=%v, %v), want a fresh mint", r.Token, cached, err)
 	}
 
-	// SelfTest's own fallback mint, taken when a failed pre-mint left the gvs
-	// entry missing, caches under both scopes too, matching the pre-mint's dual
-	// write. A fresh minter here isolates the scenario: SelfTest itself must be
-	// what triggers the launch, or the gvs entry would already be filled by the
-	// time SelfTest checks for it.
+	// SelfTest's fallback mint, taken when a failed pre-mint left the gvs entry
+	// missing, also caches under both scopes. It needs a fresh minter: SelfTest
+	// must trigger the launch itself, or the gvs entry is already filled when it
+	// checks.
 	var attempt2 int64
 	m2, _, _, _ := newTestMinterFull(func(string) (browser.MintResult, error) {
 		if atomic.AddInt64(&attempt2, 1) == 1 {
@@ -2693,9 +2776,9 @@ func TestEnsurePremintFailureStillPublishes(t *testing.T) {
 	}
 }
 
-// A cache miss is counted only for a request that actually pays for an in-page
-// mint. A request served by the pre-mint counts as a hit only, and a request
-// whose launch fails is counted by launch_failures alone, not also as a miss.
+// A cache miss is counted only for a request that pays for an in-page mint. A
+// request served by the pre-mint counts as a hit only, and a request whose
+// launch fails is counted by launch_failures alone, not also as a miss.
 func TestMintCacheMissCountedOnlyOnGenuineMiss(t *testing.T) {
 	// Served by the pre-mint: no miss, one hit.
 	m, _, _, _ := newTestMinter(okMint)
@@ -2724,9 +2807,8 @@ func TestMintCacheMissCountedOnlyOnGenuineMiss(t *testing.T) {
 		t.Errorf("launch_failures = %d, want 1", got)
 	}
 
-	// A genuine miss: the pre-mint's binding differs from the request's, so the
-	// request pays for its own in-page mint and this is the only case that counts
-	// a cache miss.
+	// A real miss: the request's binding differs from the pre-mint's, so it pays
+	// for its own in-page mint.
 	m2, _, _, _ := newTestMinter(okMint)
 	if _, cached, err := m2.Mint(context.Background(), "player", "vid2"); err != nil || cached {
 		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
@@ -2746,10 +2828,9 @@ func TestPlayerContextWaitsForMintSeparation(t *testing.T) {
 		t.Fatalf("warm: %v", err)
 	}
 	held.mintSeparation = 50 * time.Millisecond
-	// The wait is measured from the anchor the gate reads, never from a stopwatch
-	// started afterwards: the gate waits exactly the window from its anchor, so
-	// whatever runs between the two starts reads as a short wait, and on a slow
-	// runner under the race detector that was enough to fail.
+	// Measure from the anchor the gate reads, not from a stopwatch started later:
+	// the gate waits exactly the window from its anchor, so a later start reads
+	// as a short wait and flakes on a slow runner under the race detector.
 	anchor := time.Now()
 	held.mu.Lock()
 	held.lastMintAt = anchor
@@ -2839,19 +2920,17 @@ func TestMintWaitsAfterEstablishment(t *testing.T) {
 	}
 }
 
-// A failed sess.PlayerContext attempt still arms the mint gate: the page was
-// touched even though the attempt never succeeded, so a following cache-miss
-// mint waits out the separation window just as it would after a successful
-// context.
+// A failed sess.PlayerContext attempt still arms the mint gate: it touched the
+// page, so a following cache-miss mint waits out the separation window as it
+// would after a successful context.
 func TestFailedPlayerContextArmsMintGate(t *testing.T) {
 	ctx := context.Background()
 	failing := errors.New("player-context failed")
 	m, _, _, _ := newTestMinterFull(okMint, func(string) (browser.PlayerContext, error) {
 		return browser.PlayerContext{}, failing
 	})
-	// mintSeparation stays 0 (newBareMinter's default) through the failing call,
-	// so its own internal waits do not slow this test down; only the effect on a
-	// later mint is under test.
+	// mintSeparation stays 0 through the failing call so its own waits do not
+	// slow the test; only the effect on a later mint is under test.
 	if _, _, err := m.PlayerContext(ctx, "vid"); err == nil {
 		t.Fatal("player-context = nil error, want the configured failure")
 	}
@@ -3006,19 +3085,17 @@ func TestSelfTestPrewarmsBothVisitorDataScopes(t *testing.T) {
 }
 
 // resetMintSeparationWarnOnces clears the process-wide once-guards on
-// mintSeparationFromEnv's warnings, so a test can observe a warning fire again
-// regardless of which subtest, or which other test in the package, already
-// triggered it first.
+// mintSeparationFromEnv's warnings, so a test sees a warning fire even when an
+// earlier test already triggered it.
 func resetMintSeparationWarnOnces() {
 	mintSeparationUnparseableOnce = sync.Once{}
 	mintSeparationLargeOnce = sync.Once{}
 }
 
 // WAXSEAL_MINT_SEPARATION overrides the default; anything but a positive
-// duration keeps it. A value past MintSeparationWarn is still accepted, but logs
-// a warning, since a wait that long risks the per-request budget. Each subtest
-// resets the warning once-guards first so it observes its own first call, the
-// same way a process's very first tenant would.
+// duration keeps it. A value past MintSeparationWarn is accepted with a
+// warning, since a wait that long risks the per-request budget. Each subtest
+// resets the once-guards so it sees what a process's first tenant would.
 func TestMintSeparationOverride(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -3070,24 +3147,39 @@ func TestMintSeparationWarnOncePerProcess(t *testing.T) {
 }
 
 // A positive mintSeparation passed to NewMinter (as server.Config.MintSeparation
-// reaches it) overrides WAXSEAL_MINT_SEPARATION outright: the env value is never
-// consulted, so no env-parsing warning fires either. A non-positive constructor
-// value keeps the env-derived fallback, matching every existing caller that
-// passes 0.
+// reaches it) overrides WAXSEAL_MINT_SEPARATION without reading it, so a value
+// the server command already parsed and warned about draws no second warning
+// per tenant; a non-positive one keeps the env-derived value and its warnings.
 func TestMintSeparationConstructorOverride(t *testing.T) {
 	t.Setenv(MintSeparationEnv, "3s")
 	resetMintSeparationWarnOnces()
-	var logs bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&logs, nil))
 
-	overridden := NewMinter("v", browser.Options{Logger: log}, 0, 0, 20*time.Second)
+	overridden := NewMinter("v", browser.Options{}, 0, 0, 20*time.Second)
 	if overridden.mintSeparation != 20*time.Second {
 		t.Errorf("mintSeparation = %v, want the constructor override 20s", overridden.mintSeparation)
 	}
 
-	fallback := NewMinter("v", browser.Options{Logger: log}, 0, 0, 0)
+	fallback := NewMinter("v", browser.Options{}, 0, 0, 0)
 	if fallback.mintSeparation != 3*time.Second {
 		t.Errorf("mintSeparation = %v, want the env-derived 3s when the constructor value is non-positive", fallback.mintSeparation)
+	}
+
+	// Each value draws a warning on the env path, which proves the buffer would
+	// catch one from the override.
+	for _, env := range []string{"soon", "90s"} {
+		t.Setenv(MintSeparationEnv, env)
+		resetMintSeparationWarnOnces()
+		var logs bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&logs, nil))
+
+		NewMinter("v", browser.Options{Logger: log}, 0, 0, 20*time.Second)
+		if logs.Len() != 0 {
+			t.Errorf("%s=%q with a constructor override logged %q, want nothing", MintSeparationEnv, env, logs.String())
+		}
+		NewMinter("v", browser.Options{Logger: log}, 0, 0, 0)
+		if !strings.Contains(logs.String(), MintSeparationEnv) {
+			t.Errorf("%s=%q without an override logged %q, want its warning", MintSeparationEnv, env, logs.String())
+		}
 	}
 }
 
@@ -3254,10 +3346,9 @@ func TestPlayerContextWaitsAfterProof(t *testing.T) {
 }
 
 // A second SessionSnapshot call on an already-proved session neither waits nor
-// moves lastProofAt. The real EnsureEstablished short-circuits on an
-// already-proved session without playing anything, so treating that as a fresh
-// proof would move the separation anchor for free and force every later call to
-// wait for no reason.
+// moves lastProofAt. The real EnsureEstablished short-circuits there without
+// playing anything, so marking a proof would move the separation anchor and
+// make every later call wait for nothing.
 func TestSecondSessionSnapshotSkipsPhantomProof(t *testing.T) {
 	ctx := context.Background()
 	m, _, sessions, smu := newTestMinter(okMint)
@@ -3278,9 +3369,8 @@ func TestSecondSessionSnapshotSkipsPhantomProof(t *testing.T) {
 		t.Fatalf("EnsureEstablished calls after the first snapshot = %d, want 1", got)
 	}
 
-	// A window well clear of the immediately preceding call makes the timing
-	// unambiguous: a phantom re-proof would wait almost the whole window because
-	// the first call's mark is still fresh.
+	// A window much longer than the gap since the first call, whose marks are
+	// still fresh, makes any wait anchored on them unmistakable.
 	m.mintSeparation = 300 * time.Millisecond
 
 	start := time.Now()
@@ -3453,11 +3543,9 @@ func TestPlayerContextProofSecondFailureRelaunchesAfterCooldown(t *testing.T) {
 	if got := m.metrics.Escalations.Load(); got != 1 {
 		t.Errorf("escalations = %d, want 1", got)
 	}
-	// The second request is served, not refused: its retry against generation 1
-	// fails and triggers the relaunch, but that failure is never itself returned
-	// to a caller, and the relaunched session's own proof succeeds.
-	// unproven_rejections counts refused requests, not proof attempts, so it
-	// stays exactly where the first request's refusal left it.
+	// The second request is served: its failed retry on generation 1 only
+	// triggers the relaunch, and the replacement proves. unproven_rejections
+	// counts refused requests, not proof attempts, so it does not move.
 	if got := m.metrics.UnprovenRejections.Load(); got != preSecond {
 		t.Errorf("unproven_rejections = %d, want %d (unchanged: the second request was served)", got, preSecond)
 	}
@@ -3539,9 +3627,8 @@ func TestEnsureProvenHonoursContextDuringProof(t *testing.T) {
 }
 
 // A self-test whose proof fails starts the same cool-down a first
-// player-context failure would, so the very next player-context request is
-// refused on sight instead of paying for another proof attempt against a
-// session that just failed one.
+// player-context failure would, so the next player-context request is refused
+// on sight instead of paying for another proof.
 func TestSelfTestFailureStartsCooldown(t *testing.T) {
 	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
 	m := newBareMinter(0, 0)
@@ -3566,12 +3653,10 @@ func TestSelfTestFailureStartsCooldown(t *testing.T) {
 	}
 }
 
-// A self-test failure never claims the failure streak's relaunch (it records
-// through recordProofFailure with claimRelaunch=false), so it counts only as the
-// generation's first failure. Once the cool-down has passed, the next
-// PlayerContext failure on that same generation is graded as the second failure
-// and relaunches exactly once, the same ladder a PlayerContext-only failure
-// streak follows.
+// A self-test failure counts as the generation's first failure but never claims
+// the streak's relaunch (claimRelaunch=false). Past the cool-down, the next
+// PlayerContext failure on that generation is the second and relaunches exactly
+// once, as in a PlayerContext-only streak.
 func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
 	var launches int64
 	m := newBareMinter(0, 0)
@@ -3621,8 +3706,8 @@ func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
 
 // Publishing a new generation clears the previous session's mint, proof, and
 // establishment marks, and any pending proof-failure cool-down: none of that
-// history describes the fresh page. The relaunch's own pre-mint then sets
-// lastMintAt again, so that mark alone is not left zero along with the rest.
+// history describes the fresh page. The relaunch's pre-mint then sets
+// lastMintAt again.
 func TestEnsureResetsMarksOnNewGeneration(t *testing.T) {
 	m, launches, _, _ := newTestMinter(okMint)
 	ctx := context.Background()
@@ -3711,11 +3796,9 @@ func TestPlayerContextProofSecondFailureRelaunchAlsoFails(t *testing.T) {
 	if got := m.metrics.Escalations.Load(); got != 1 {
 		t.Errorf("escalations = %d, want 1 (the relaunch ladder fires exactly once)", got)
 	}
-	// Two refusals, not three: the first request's failure (starts the
-	// cool-down), and the second request's ultimate failure once the relaunched
-	// generation's own proof also fails. The second request's initial retry
-	// against generation 1 triggers the relaunch but is never itself returned to
-	// a caller, so only a return that hands an error back to the caller counts.
+	// Two refusals, not three: the first request, and the second once the
+	// replacement's proof also fails. The second request's failed retry on
+	// generation 1 only triggers the relaunch and is never returned to a caller.
 	if got := m.metrics.UnprovenRejections.Load(); got != 2 {
 		t.Errorf("unproven_rejections = %d, want 2", got)
 	}
@@ -3730,11 +3813,10 @@ func TestPlayerContextProofSecondFailureRelaunchAlsoFails(t *testing.T) {
 	}
 }
 
-// A proof that runs out the request's own deadline is recorded as a failure
-// rather than treated as an abandoned caller: the environment failed to prove
-// within the budget the handler gave it, so the cool-down applies to the next
-// request. The function still reports context.DeadlineExceeded, so the server's
-// timeout mapping is unchanged.
+// A proof that runs out the request's own deadline is recorded as a failure,
+// not an abandoned caller: the environment failed to prove within the handler's
+// budget, so the cool-down applies to the next request. The error is still
+// context.DeadlineExceeded, so the server's timeout mapping is unchanged.
 func TestPlayerContextProofDeadlineExceededRecordsFailure(t *testing.T) {
 	fs := &fakeSession{mint: okMint, establishBlocks: true}
 	m := newBareMinter(0, 0)
@@ -3761,12 +3843,9 @@ func TestPlayerContextProofDeadlineExceededRecordsFailure(t *testing.T) {
 }
 
 // The proof-driven relaunch is spent once per failure streak, not once per
-// generation: while it is unspent, a generation's second proof failure
-// relaunches once; once spent, a second failure on any later generation
-// (whether that generation came from the proof ladder itself or from some other
-// relaunch entirely, such as a crash) records the failure and refuses without
-// relaunching again. Only a successful proof frees the streak's relaunch for
-// reuse.
+// generation. Once spent, a second failure on any later generation, whether the
+// proof ladder or another relaunch produced it, is recorded and refused without
+// relaunching. Only a successful proof frees the relaunch.
 func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	var launches int64
 	var gen3Session *fakeSession
@@ -3820,10 +3899,9 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 		t.Errorf("launches = %d, want 2 (the streak's relaunch is already spent)", got)
 	}
 
-	// Something other than the proof ladder relaunches the browser again (a
-	// crash, a mint failure, or a degradation report all retire the session and
-	// let the next ensure relaunch it). Generation 3's own failures must still
-	// honour the already-spent streak.
+	// Something other than the proof ladder relaunches the browser (a crash, a
+	// mint failure, or a report). Generation 3's failures must still honor the
+	// spent streak.
 	if !m.retire(gen2, "test: simulated out-of-band relaunch", false) {
 		t.Fatal("retire(gen2) returned false, want true")
 	}
@@ -3909,13 +3987,11 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	}
 }
 
-// The tests below cover a browser that dies while a request already holds its
-// session. Only the crash watcher retires a session without mintMu, so a session
-// superseded under a request means exactly that, and the request must take the
-// replacement and finish rather than feed the dead page's failure to the ladders
-// that grade live sessions. It is the SIGKILL-then-request race the provider
-// self-heal e2e test exercises. Each hook retires the way watchCrash does, so the
-// crash is counted once, by the retirement, and by nothing else.
+// The tests below cover a browser that dies while a request holds its session,
+// the SIGKILL race provider's TestBrowserProcessSelfHealHTTP drives end to end.
+// The request must take the replacement and finish without feeding the dead
+// page's failure to the ladders (see sessionDied). Hooks retire as watchCrash
+// does, so the retirement alone counts the crash.
 
 // errDeadPage is the shape of error a dead CDP connection produces.
 var errDeadPage = errors.New("cdp: connection closed: EOF")
@@ -4042,7 +4118,7 @@ func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
 
 // A caller that has already gone away is not owed a replacement: a crash during
 // its proof returns the context error and launches nothing.
-func TestPlayerContextCrashDuringProofOfCancelledCaller(t *testing.T) {
+func TestPlayerContextCrashDuringProofOfCanceledCaller(t *testing.T) {
 	m := newBareMinter(0, 0)
 	var launches int64
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4172,8 +4248,8 @@ func TestMintSurvivesCrashDuringMint(t *testing.T) {
 				t.Errorf("mint_failures = %d, want %d", got, tc.wantFailures)
 			}
 			requireCrashOnlyMetrics(t, m)
-			// The token is cached under the replacement generation, so the next call
-			// is a hit that survives, as any token of the current generation does.
+			// The token is cached under the replacement's generation, so the next
+			// call is a hit.
 			if _, cached, err := m.Mint(ctx, "player", "vid2"); err != nil || !cached {
 				t.Errorf("repeat mint = (cached=%v, %v), want a cache hit", cached, err)
 			}
@@ -4211,10 +4287,8 @@ func TestSessionSnapshotSurvivesCrashDuringCookies(t *testing.T) {
 	requireCrashOnlyMetrics(t, m)
 }
 
-// Warm serializes with requests. The rule the mid-request crash handling rests
-// on is that nothing but the crash watcher retires a session without mintMu, and
-// ensure's own recycle closes an aged session, so Warm must not be able to run
-// it concurrently with a request that holds one.
+// Warm serializes with requests: ensure's recycle closes an aged session, so
+// Warm must not run it while a request holds that session.
 func TestWarmSerializesWithRequests(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) { return &fakeSession{mint: okMint}, nil }
@@ -4244,11 +4318,9 @@ func TestWarmSerializesWithRequests(t *testing.T) {
 // expires. Without the closed flag its ladder calls ensure again and launches,
 // attests, and publishes a fresh session on a Minter nothing will tear down.
 
-// The mechanism item 2 exists for: a request already past ensure, holding a live
-// session, when Close lands. Its operation then fails, it walks its ladder back
-// into ensure, and ensure must refuse instead of launching a second browser onto
-// a Minter nothing will tear down again. Close deliberately does not take mintMu,
-// which is what lets it land in this window.
+// A request past ensure, holding a live session, when Close lands: its
+// operation fails, its ladder calls ensure again, and ensure must refuse rather
+// than launch a browser nothing will tear down.
 func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
 	var launches int64
 	var sessions []*fakeSession
@@ -4382,13 +4454,12 @@ func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
 
 // The tests below cover a generation retired out from under a request by
 // something that is neither a crash nor the request's own ladder. The request
-// must take the replacement without counting an escalation: only one attempt
-// against that generation ever failed, and abandoning it was somebody else's
-// decision. Compare crashUnder above, which retires as a crash and is graded
-// nowhere at all.
+// takes the replacement without counting an escalation: only one attempt
+// against that generation failed, and abandoning it was not its decision.
+// Compare crashUnder, which retires as a crash and is graded nowhere.
 
 // retireUnder retires the current generation the way a non-crash retirer that
-// skips mintMu does. After item 2, Minter.Close is the only one in the tree.
+// skips mintMu does; Minter.Close is the only one in the tree.
 func retireUnder(m *Minter) { m.retire(m.Generation(), "retired out from under the request", false) }
 
 func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
@@ -4470,10 +4541,9 @@ func cacheEntries(t *testing.T, m *Minter) int {
 	return v
 }
 
-// cache_entries reports what cacheGet would serve, not the size of the map: an
-// expired entry no sweep has reached yet, and a stale-generation one, are both
-// unservable. Counting them told an operator the daemon held tokens it would
-// have refused.
+// cache_entries reports what cacheGet would serve, not the size of the map, so
+// an expired entry no sweep has reached and a stale-generation one are not
+// counted: they are tokens the daemon would refuse.
 func TestCacheEntriesCountsOnlyServableEntries(t *testing.T) {
 	m, _, _, _ := newTestMinter(okMint)
 	if err := m.Warm(context.Background()); err != nil {
@@ -4538,16 +4608,16 @@ func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 		t.Errorf("cache_entries = %d after the report, want 0", got)
 	}
 
-	// The named tradeoff: with the relaunch failing, this request is refused
-	// rather than served the token the consumer just reported as degraded. Before
-	// the drop, Mint's aged-generation fallback would have handed it over.
+	// The fail-closed tradeoff Mint documents: with the relaunch failing, this
+	// request is refused rather than served the token the consumer just reported.
+	// Without the drop, Mint's aged-generation fallback would hand it over.
 	failLaunch = true
 	if _, cached, err := m.Mint(ctx, "gvs", "b"); err == nil {
 		t.Errorf("mint after a report with a failing relaunch: cached=%v, want a refusal, not the degraded generation's token", cached)
 	}
-	// Two attempts: the warm, and the relaunch this request reached only because
-	// the cache lookup before it missed. Had the report left the tokens in place,
-	// the lookup would have been a hit and ensure would never have been called.
+	// Two attempts: the warm, and the relaunch this request reached because the
+	// cache lookup missed. Had the report kept the tokens, the lookup would hit
+	// and ensure would never run.
 	if got := atomic.LoadInt64(&attempts); got != 2 {
 		t.Errorf("launch attempts = %d, want 2 (the warm, plus the relaunch the miss forced)", got)
 	}
@@ -4558,9 +4628,8 @@ func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 // where refreshStreamingSession retires the suspect generation.
 func TestDeferredReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 	m, _, _, release, done := startBlockingPlayerContext(t)
-	// Released with a defer, matching the other tests on this fixture: a t.Fatalf
-	// below would otherwise strand the parked call inside sess.PlayerContext,
-	// holding this Minter's mintMu for the rest of the run.
+	// Release on every exit: a t.Fatalf below would otherwise strand the parked
+	// call inside sess.PlayerContext, holding mintMu for the rest of the run.
 	released := false
 	defer func() {
 		if !released {
@@ -4699,10 +4768,9 @@ func TestPendingReportThenCrashIsNotChargedTwice(t *testing.T) {
 // A browser that dies during status-1 confirmation surfaces as
 // ErrStatus2Unconfirmed: the confirm loop's eval errors run out its budget and
 // grade it target-not-buffered. The request must still take the replacement.
-// playerContextDied refuses to consult sessionDied for a status-2 error, so that
-// a status-2 failure on a live session cannot buy a relaunch; when the session is
-// gone there is nothing left to protect, and refusing here would both fail a
-// recoverable request and file a crash under status2_rejections.
+// playerContextDied keeps a status-2 failure on a live session from buying a
+// relaunch, but once the session is gone, refusing would fail a recoverable
+// request and file a crash under status2_rejections.
 func TestPlayerContextCrashDuringConfirmTakesTheReplacement(t *testing.T) {
 	var launches int64
 	m := newBareMinter(0, 0)
@@ -5119,11 +5187,10 @@ func TestProofBotCheckOnReplacementIsCountedAndNamed(t *testing.T) {
 	}
 }
 
-// A request already on its replacement launches nothing more. The QA round
-// showed one request retiring A, taking B, and buying C when B's proof met a
-// bot check: three Chromiums under one mintMu hold. B's bot check is refused
-// with the cool-down instead, the way a walled replacement is refused
-// elsewhere.
+// A request already on its replacement launches nothing more. Otherwise one
+// request retires A, takes B, and buys C when B's proof meets a bot check:
+// three Chromiums under one mintMu hold. B's bot check is refused with the
+// cool-down, as a walled replacement is elsewhere.
 func TestOneRequestTakesAtMostOneReplacement(t *testing.T) {
 	var launches int64
 	m := newBareMinter(0, 0)

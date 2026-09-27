@@ -19,10 +19,10 @@ func (t *Tenants) InjectSessionForTest(ctx context.Context, apiKey string, sess 
 		return nil, err
 	}
 	m.launch = func(context.Context) (minterSession, error) { return sess, nil }
-	// Dependent-package tests exercise handler plumbing, not the spacing between a
-	// mint and a context establishment: turn the separation gates off so no
-	// handler waits out the window, and skip the attestation-time mint so the
-	// injected session records only the calls the test's own request drives.
+	// Dependent-package tests exercise handler plumbing, not mint spacing: turn
+	// the separation gates off so no handler waits out the window, and skip the
+	// attestation pre-mint so the injected session records only the calls the
+	// test's own request drives.
 	m.mintSeparation = 0
 	m.skipPremint = true
 	if err := m.Warm(ctx); err != nil {
@@ -76,9 +76,9 @@ func (t *Tenants) FailLaunchForTest(apiKey string, err error) (*Minter, error) {
 }
 
 // RewindProofCooldownForTest moves the open cool-down record d further into the
-// past, so a dependent package's test can see a refusal state what is left of a
-// window rather than the whole of it, without sleeping through one. It does
-// nothing when no cool-down is open. Production code must not call it.
+// past, so a dependent package's test can check that a refusal states the
+// remaining wait without sleeping. It does nothing when no cool-down is open.
+// Production code must not call it.
 func (m *Minter) RewindProofCooldownForTest(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

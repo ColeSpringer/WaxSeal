@@ -9,10 +9,9 @@ import (
 	"strings"
 )
 
-// helperTransport opens the inherited transport the way Chromium does on Windows:
-// there is no fd convention, so the two handle values arrive in the argv and are
-// adopted from there. Parsing the real ioPipesFlagPrefix is what makes this test
-// binary a faithful stand-in for the browser on this platform.
+// helperTransport opens the inherited transport the way Chromium does on
+// Windows, adopting the two handle values from the ioPipesFlagPrefix flag the
+// spawn path writes into the argv.
 func helperTransport() (in, out *os.File, err error) {
 	raw := ""
 	for _, a := range os.Args {

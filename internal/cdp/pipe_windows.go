@@ -15,7 +15,7 @@ import (
 )
 
 // CreatePipe's handles are synchronous: a parked read takes no deadline and
-// cannot be cancelled by closing from another goroutine. An overlapped named pipe
+// cannot be canceled by closing from another goroutine. An overlapped named pipe
 // can, so that is what the parent holds; the child gets a synchronous end, which
 // is what Chromium expects. syscall exports none of these calls, so they come
 // from kernel32 and the module stays standard-library only.
@@ -44,7 +44,7 @@ const (
 	// this is generous so a burst of events cannot stall Chromium's writer.
 	pipeBufferBytes = 64 << 10
 
-	// overlappedDrainTimeout bounds the wait for a cancelled ConnectNamedPipe to
+	// overlappedDrainTimeout bounds the wait for a canceled ConnectNamedPipe to
 	// report completion, after which its Overlapped is pinned rather than freed.
 	overlappedDrainTimeout = 5 * time.Second
 )
@@ -142,9 +142,9 @@ func newPlatformPipePair(dir pipeDir, childPollable bool) (_ *pipePair, err erro
 			_ = parent.Close()
 		}
 	}()
-	// os.NewFile swallows a failed poller association, leaving a file whose
-	// deadlines silently do nothing. Prove it here rather than discover it during
-	// a stall; a zero time clears the deadline, so the probe leaves no trace.
+	// os.NewFile swallows a failed poller association, leaving a file with no
+	// deadlines or cancel-on-close. Prove it here rather than discover it in a
+	// stall; a zero time clears the deadline, so the probe leaves no trace.
 	if derr := parent.SetReadDeadline(time.Time{}); derr != nil {
 		err = fmt.Errorf("cdp: pipe server end is not pollable (deadlines and cancel-on-close would not work): %w", derr)
 		return nil, err
@@ -164,7 +164,7 @@ func newPlatformPipePair(dir pipeDir, childPollable bool) (_ *pipePair, err erro
 // overlapped end needs a real event or the kernel has nowhere to signal
 // completion. ERROR_IO_PENDING is still an error here, but it cannot just return:
 // the kernel owns ov, which is Go heap the collector may reuse, so the operation
-// is cancelled and drained first, and pinned if the drain does not complete.
+// is canceled and drained first, and pinned if the drain does not complete.
 func connectServerEnd(server syscall.Handle) error {
 	event, _, eerr := procCreateEventW.Call(0, 1, 0, 0) // manual reset, initially unsignaled
 	if event == 0 {
@@ -178,12 +178,10 @@ func connectServerEnd(server syscall.Handle) error {
 		return nil
 	}
 	if cerr == syscall.ERROR_IO_PENDING {
-		// A cancelled ConnectNamedPipe completes at once, and CancelIoEx failing
-		// with ERROR_NOT_FOUND means the operation already finished and the event
-		// is already signaled. The wait is bounded all the same: should the
-		// completion never arrive, or the wait itself fail, ov is pinned for the
-		// life of the process rather than returned to a collector that would hand
-		// the kernel's target to something else.
+		// A canceled ConnectNamedPipe completes at once, and CancelIoEx
+		// failing with ERROR_NOT_FOUND means the operation already finished and
+		// signaled the event. The wait is bounded anyway; if it times out or
+		// fails, ov is pinned for the life of the process.
 		_ = syscall.CancelIoEx(server, ov)
 		ev, werr := syscall.WaitForSingleObject(syscall.Handle(event), uint32(overlappedDrainTimeout/time.Millisecond))
 		if ev != syscall.WAIT_OBJECT_0 {

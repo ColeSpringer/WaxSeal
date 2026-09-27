@@ -11,25 +11,20 @@ import (
 
 // procGuard carries the platform-specific work of spawning Chromium and making
 // sure it dies with, or before, this process. On Unix that is a process group
-// plus SIGKILL; on Windows it is a Job Object.
-// Nothing here can fail in a way worth reporting: Setpgid is applied by the
-// kernel at fork and SIGKILL to a group either lands or the group is already
-// gone, so this guard holds no state and keeps no logger. The Windows one does,
-// because its job object can fail to be created or assigned.
+// plus SIGKILL, neither of which can fail in a way worth reporting (Setpgid
+// applies at fork; a group SIGKILL lands or the group is gone), so unlike the
+// Windows guard this one holds no state and no logger.
 type procGuard struct{}
 
 // newProcGuard returns a guard. The logger is accepted for signature parity with
 // the Windows constructor, which does report its failures.
 func newProcGuard(*slog.Logger) *procGuard { return &procGuard{} }
 
-// attach prepares cmd to inherit the two pipe ends, before Start. The child sees
-// the command pipe on fd 3 and the event pipe on fd 4, which is where
-// --remote-debugging-pipe looks for them, so the argv needs no addition.
-//
-// Setpgid puts Chromium in its own process group so teardown can signal the whole
-// group. Helpers that leave the group are expected to exit when Chromium closes
-// its own IPC. Parent death is handled by the command pipe closing: the OS closes
-// fd 3, and Chromium exits after reading EOF.
+// attach sets up cmd before Start. The child inherits the command pipe as fd 3
+// and the event pipe as fd 4, where --remote-debugging-pipe looks. Setpgid lets
+// teardown signal Chromium's whole group; helpers that leave it should exit
+// when Chromium closes its IPC. Parent death needs no Pdeathsig: the OS closes
+// this process's pipe ends, and Chromium exits on the EOF at fd 3.
 func (g *procGuard) attach(cmd *exec.Cmd, cmdPipe, evtPipe *pipePair) {
 	cmd.ExtraFiles = []*os.File{cmdPipe.child, evtPipe.child}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -45,8 +40,8 @@ func (g *procGuard) kill(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	// A non-positive pid would make syscall.Kill(-pid) target the caller's own
-	// process group. A started process always has pid > 0; guard defensively.
+	// syscall.Kill(-pid) with pid 0 would signal the caller's own process group,
+	// and with -1 (the Pid Release leaves) pid 1. A started process has pid > 0.
 	if cmd.Process.Pid <= 0 {
 		return
 	}

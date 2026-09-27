@@ -6,9 +6,9 @@ package chromepath
 
 import "os"
 
-// Candidates returns this platform's install locations, in the order to try them.
-// Edge is deliberately absent: it reports a different brand list and user agent,
-// so picking it up would silently change the identity a token binds to.
+// Candidates returns this platform's install locations, in the order to try
+// them. Edge is left out: it reports a different brand list and user agent, so
+// picking it up would silently change the identity a token binds to.
 func Candidates() []string { return platformCandidates() }
 
 // Detect returns the browser to launch: WAXSEAL_CHROME_BIN when set, which is the

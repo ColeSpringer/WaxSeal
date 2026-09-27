@@ -61,7 +61,7 @@ func TestJobObjectExtendedLimitInfoSize(t *testing.T) {
 	}
 }
 
-// attach must name the handles it actually created and mark them inherited, since
+// attach must name the handles it created and mark them inherited, since
 // nothing else connects the argv values to the pipes.
 func TestProcGuardAttachNamesTheChildHandles(t *testing.T) {
 	cmdPipe, err := newPipePair(pipeParentWrites, false)

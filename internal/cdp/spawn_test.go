@@ -23,8 +23,8 @@ func spawnHelper(t *testing.T, mode string, timeout time.Duration) (_ *Browser, 
 		t.Fatalf("os.Executable: %v", err)
 	}
 	pidFile = filepath.Join(t.TempDir(), "helper.pid")
-	// Spawn inherits this process's environment, so setting it here is what selects
-	// the child's mode. t.Setenv restores it and refuses to run under t.Parallel.
+	// The child inherits this process's environment, so this selects its mode.
+	// t.Setenv restores it and refuses to run under t.Parallel.
 	t.Setenv(waxsealTestHelperEnv, mode)
 	t.Setenv(waxsealTestPIDFileEnv, pidFile)
 	b, err := Spawn(context.Background(), self, nil, SpawnOptions{LaunchTimeout: timeout})
@@ -49,9 +49,8 @@ func waitHelperPID(t *testing.T, pidFile string) int {
 }
 
 // A spawned child must inherit both transport ends and be reachable over them,
-// with no browser involved. This is the platform-specific half of the package:
-// on Unix the ends arrive as fd 3 and fd 4, on Windows as two handle values in
-// the argv, and the helper adopts whichever this platform uses.
+// with no browser involved. The helper adopts the ends the way this platform's
+// Chromium would.
 func TestSpawnAgainstHelper(t *testing.T) {
 	b, _, err := spawnHelper(t, "cdp-echo", 30*time.Second)
 	if err != nil {
@@ -88,9 +87,7 @@ func TestSpawnHandshakeTimeoutKillsChild(t *testing.T) {
 		t.Errorf("error = %v, want it to name the handshake", err)
 	}
 	pid := waitHelperPID(t, pidFile)
-	// Spawn force-closes on a failed handshake, which is what must leave no
-	// process behind. Poll rather than checking once: the kill and the reap are
-	// asynchronous.
+	// Poll rather than checking once: the kill and the reap are asynchronous.
 	deadline := time.Now().Add(10 * time.Second)
 	for processAlive(pid) {
 		if time.Now().After(deadline) {
@@ -101,9 +98,8 @@ func TestSpawnHandshakeTimeoutKillsChild(t *testing.T) {
 }
 
 // A Chromium that dies during the handshake is named by its exit, whichever of
-// the three losses got there first: the read loop's EOF, the reaper, or the
-// parent's write into a closed pipe. Without that, the same failure reported
-// three different wordings run to run.
+// three losses got there first (the read loop's EOF, the reaper, or the
+// parent's write into a closed pipe), so one failure always reads the same.
 func TestSpawnChildExitDuringHandshakeIsNamedByItsExit(t *testing.T) {
 	for _, mode := range []string{"exit", "exit-late"} {
 		t.Run(mode, func(t *testing.T) {
@@ -125,9 +121,9 @@ func TestSpawnChildExitDuringHandshakeIsNamedByItsExit(t *testing.T) {
 	}
 }
 
-// A browser that is alive and simply refuses the handshake keeps its own error.
-// Spawn kills the child on the way out, so the exit-status rewrite above cannot
-// key on "the process has exited" alone: every failure looks like that by then.
+// A browser that is alive and refuses the handshake keeps its own error. Spawn
+// kills the child on the way out, so its exit-status rewrite cannot key on "the
+// process has exited" alone: every failure looks like that by then.
 func TestSpawnLiveBrowserProtocolErrorIsNotReportedAsAnExit(t *testing.T) {
 	b, _, err := spawnHelper(t, "cdp-error", 30*time.Second)
 	if err == nil {
@@ -180,9 +176,8 @@ func TestPipePairParentIsPollable(t *testing.T) {
 	}
 }
 
-// closeChild releases only the parent's copy of the child end, which is what lets
-// the response pipe reach EOF when the child exits. Closing the pair afterwards
-// must still be safe.
+// closeChild must drop the child end and be safe to repeat, and closing the
+// pair afterwards must still work.
 func TestPipePairCloseChildIsIdempotent(t *testing.T) {
 	p, err := newPipePair(pipeParentReads, false)
 	if err != nil {

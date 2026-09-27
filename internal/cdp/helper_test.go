@@ -10,14 +10,11 @@ import (
 	"time"
 )
 
-// The spawn path is the one part of this package that differs per platform, and
-// it used to be covered only by the -tags live tests against a real Chromium.
+// The spawn path is the one part of this package that differs per platform.
 // These tests replace the browser with this test binary, re-executed as a helper,
 // so the inheritance, the handle numbering, and the handshake are exercised
-// offline on whatever platform is running.
-//
-// TestMain dispatches on WAXSEAL_TEST_HELPER before m.Run, the standard way to
-// make a test binary re-executable as a child process.
+// offline on whatever platform is running. TestMain dispatches on
+// WAXSEAL_TEST_HELPER before m.Run.
 
 // waxsealTestHelperEnv selects a helper mode instead of running the test suite,
 // and waxsealTestPIDFileEnv names a file the helper writes its own pid into, so a
@@ -34,23 +31,20 @@ func TestMain(m *testing.M) {
 	}
 	switch mode {
 	case "stall":
-		// A child that starts, inherits the pipes, and then says nothing. It is how
-		// a test drives the handshake timeout.
+		// Inherits the pipes and never answers, to drive the handshake timeout.
 		time.Sleep(60 * time.Second)
 		os.Exit(0)
 	case "cdp-echo":
 		helperCDPEcho()
 		os.Exit(0)
 	case "cdp-error":
-		// A live browser that answers the handshake with a CDP protocol error.
-		// Spawn kills it on the way out, so this is what separates "the browser
-		// died" from "the browser said no".
+		// A live browser that answers the handshake with a CDP protocol error,
+		// so a test can tell "said no" from "died" (Spawn kills it either way).
 		helperCDPError()
 		os.Exit(0)
 	case "exit":
-		// A child that dies without ever reading its pipes. The parent's handshake
-		// write then races the reap, so the loss can be recorded as EOF, as a
-		// process exit, or as a broken pipe.
+		// Dies without reading its pipes, so the handshake write races the reap
+		// and the loss can surface as EOF, a process exit, or a broken pipe.
 		os.Exit(3)
 	case "exit-late":
 		// The same death, ordered the other way: the parent's write lands first
@@ -101,11 +95,10 @@ func helperCDPError() {
 	}
 }
 
-// helperCDPEcho stands in for Chromium: it opens the inherited transport, reads
-// NUL-delimited request frames, and answers each one with a Browser.getVersion
-// shaped result that also echoes its own argv, so the caller can assert what it
-// was launched with. It returns at EOF, which is what a parent's death looks like
-// from here.
+// helperCDPEcho stands in for Chromium: it answers each request on the
+// inherited transport with a Browser.getVersion shaped result that also echoes
+// its argv, so the caller can assert what it was launched with. It returns at
+// EOF, which is how a parent's death looks from here.
 func helperCDPEcho() {
 	in, out, err := helperTransport()
 	if err != nil {

@@ -11,15 +11,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// usageError marks invalid command-line input. It maps to exit code 2, matching
-// WaxTap and allowing scripts to distinguish usage errors from runtime failures.
+// usageError marks invalid command-line input. It maps to exit code 2, as in
+// WaxTap, so scripts can tell usage errors from runtime failures.
 type usageError struct{ msg string }
 
 func (e *usageError) Error() string { return e.msg }
 
-// renderError writes one error line with a single "waxseal: " prefix. Some
-// internal errors already include the prefix, so embedded copies are removed
-// before the CLI prefix is added.
+// renderError writes err on one line with a single "waxseal: " prefix, removing
+// the copies that internal errors already carry.
 func renderError(w io.Writer, err error) {
 	if err == nil {
 		return
@@ -28,9 +27,8 @@ func renderError(w io.Writer, err error) {
 }
 
 // exitCodeFor maps usage errors to 2, unavailable videos to 3, interrupts to 130,
-// and all other failures to 1. A bot check is one of those others on purpose: it
-// describes the browser session, not the video, so exit 3 would tell a script the
-// wrong thing about a video that is fine.
+// and all other failures to 1. A bot check exits 1: it describes the browser
+// session, not the video, so exit 3 would misreport a video that is fine.
 func exitCodeFor(err error) int {
 	switch {
 	case err == nil:

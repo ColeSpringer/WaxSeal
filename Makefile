@@ -1,7 +1,5 @@
 # WaxSeal build orchestration.
 #
-# WaxSeal mints YouTube PO tokens from a real headless Chromium, driven through
-# the Chrome DevTools Protocol by internal/cdp.
 # Node and esbuild produce the browser bundle embedded in internal/browser. The
 # bundle is committed, so `go build` and `go test` do not need Node. The CLI and
 # daemon still require Chromium at runtime.
@@ -20,24 +18,19 @@ REGISTRY    ?= ghcr.io
 IMAGE_OWNER ?= colespringer
 IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 
-# ARCH names the platform docker-build tags for. dpkg prints Docker's own arch
-# names (amd64, arm64) on Debian and Ubuntu, which is where the release job
-# builds; a dev box without dpkg falls through to Go, whose GOARCH values agree
-# for the two architectures this project publishes. The release image job has no
-# setup-go step, so it works today only because the Ubuntu runners happen to ship
-# Go: dpkg is what makes that incidental dependency unnecessary.
+# ARCH names the platform docker-build tags for. dpkg prints Docker's arch names
+# (amd64, arm64) on Debian and Ubuntu, so the release image job, which has no
+# setup-go step, does not depend on Go; a dev box without dpkg falls back to
+# GOARCH, which agrees for both published architectures.
 ARCH ?= $(shell dpkg --print-architecture 2>/dev/null || go env GOARCH)
 
 # ARCHES lists the platforms docker-manifest assembles the multi-arch tag from.
-# Each one is built and smoke-tested on its own native runner first; no QEMU is
-# involved.
+# Each is built and smoke-tested on its own native runner first, without QEMU.
 ARCHES ?= amd64 arm64
 
-# PUSH_LATEST controls whether docker-manifest moves the :latest tag. It is the
-# manifest that owns :latest, because the plain tag must resolve to every
-# architecture; docker-push handles one arch and never touches it. The default
-# publishes only VERSION. Set PUSH_LATEST=1 for a release that should also become
-# :latest.
+# PUSH_LATEST=1 makes docker-manifest also move :latest; the default publishes
+# only VERSION. Only the manifest pushes :latest, since that tag must resolve
+# to every architecture and docker-push handles one.
 PUSH_LATEST ?= 0
 
 # GOVULNCHECK_VERSION pins the scanner vulncheck runs, so a run reads the same
@@ -56,7 +49,7 @@ GOVULNCHECK_VERSION ?= v1.8.0
 
 all: jsbundle-browser
 
-# help lists the common targets; run `make help` to print it.
+# help lists the common targets.
 help:
 	@echo "WaxSeal make targets:"
 	@echo "  fmt-check         fail if any file needs gofmt (covers provider/ too)"
@@ -90,30 +83,25 @@ tidy-check:
 	cd provider && go mod tidy -diff
 
 # vulncheck runs govulncheck over both modules. It reports only vulnerabilities
-# in functions the code actually calls, which keeps a finding actionable.
+# in functions the code calls, so every finding is actionable.
 vulncheck:
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 	cd provider && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
-# vet runs what CI vets, in one target: the root module, the nested provider/
-# module including its e2e-tagged files, and a windows cross-vet. The Windows job
-# in CI compiles and runs those files for real; the cross-vet here is the cheap
-# local check that catches a break before a push.
+# vet runs what CI vets: the root module, the nested provider/ module including
+# its e2e-tagged files, and a windows cross-vet. The cross-vet is the cheap
+# local stand-in for CI's Windows job, which builds and tests on Windows.
 vet:
 	go vet ./...
 	GOOS=windows go vet ./...
 	cd provider && go vet ./... && go vet -tags e2e ./...
 
-# consumer-check builds provider/ the way anyone outside this checkout sees it:
-# the replace is dropped in a throwaway copy, so the module compiles against the
-# root version its require pins instead of these working-tree files. That pin has
-# to be fetched, so this one needs network. The release gate runs it, which is
-# where a pin that has fallen behind the root has to stop things.
-#
-# `go mod download` fills the copy's go.sum, which carries no root entries
-# because the replace is honoured in this checkout. The build and vet then run
-# under the default -mod=readonly, so the go command cannot quietly add or raise
-# a requirement and repair the stale pin this gate exists to catch.
+# consumer-check builds provider/ as an outside consumer sees it: a throwaway
+# copy drops the replace, so the module compiles against the root version its
+# require pins (fetched, so this needs network). The release gate runs it to
+# stop a pin that has fallen behind the root. `go mod download` adds the root
+# entries the replace kept out of go.sum, and the default -mod=readonly stops
+# the build from quietly raising the stale pin this gate exists to catch.
 consumer-check:
 	@tmp=$$(mktemp -d) || exit 1; \
 	  trap 'rm -rf "$$tmp"' EXIT; \
@@ -125,10 +113,10 @@ consumer-check:
 	    || exit 1; \
 	  echo "OK: provider/ compiles against its pinned root with no replace"
 
-# test runs the offline suite: the root module with the race detector (matching
-# CI), then the nested provider/ module. The committed bundle means it does not
-# need Node. The -tags e2e suite needs network and a warm daemon; the README
-# documents running it separately.
+# test runs the offline suite with the race detector, as CI does: the root
+# module, then provider/. The committed bundle means it needs no Node. The
+# -tags e2e suite needs network and Chromium, and each test starts its own
+# daemon unless WAXSEAL_URL names one; the README covers it.
 test: fmt-check
 	go test -race ./...
 	cd provider && go test -race ./...
@@ -152,20 +140,12 @@ $(BROWSER_BUNDLE_OUT): build/js/build-browser.mjs build/js/browser_entrypoint.js
 	  && WAXSEAL_BUNDLE_OUT="$(CURDIR)/$@" node build-browser.mjs
 	@echo "built $@ ($$(wc -c < $@) bytes)"
 
-# verify-assets rebuilds the embedded bundle into a scratch directory and fails if
-# it differs from the checked-in file (reproducibility check for CI). It never
-# touches that file, so a failed `npm ci` leaves a working tree behind rather than
-# one `go build` cannot compile.
-#
-# It compares against the working tree, not the git index, so it also runs from a
-# source tarball and checks the bytes go:embed actually reads. On a clean checkout
-# those are the committed bytes, which is the case CI runs; locally it reports
-# whether the file you are about to build with reproduces from source.
-#
-# It cannot delegate to jsbundle-browser: that rule writes to the committed path,
-# so the npm line is spelled out here with its own output. Building and comparing
-# are separate steps on purpose, so a build failure reports itself instead of
-# being misreported as a bundle that differs.
+# verify-assets rebuilds the bundle in a scratch directory and fails if it
+# differs from the working-tree copy (the bytes go:embed reads; this also works
+# from a source tarball). It never writes the committed file, so a failed
+# `npm ci` cannot break go build; that is also why it does not reuse
+# jsbundle-browser. Build and compare are separate steps so a build failure is
+# not misreported as a differing bundle.
 verify-assets:
 	@tmp=$$(mktemp -d) || exit 1; \
 	  trap 'rm -rf "$$tmp"' EXIT; \
@@ -193,33 +173,28 @@ release:
 	done
 	@echo "release binaries in $(DIST)/ (each requires a system Chromium at runtime)"
 
-# Publish the runtime image to GitHub Container Registry. The image is published
-# for linux/amd64 and linux/arm64, one native build per architecture with no
-# QEMU: each platform builds, smoke-tests, and pushes its own $(IMAGE):VERSION-ARCH
-# tag, then one docker-manifest run assembles the plain $(IMAGE):VERSION tag from
-# them. Authentication reuses the gh login and pipes the token to docker on
-# stdin. A full release from two machines, or from the release workflow's matrix,
-# is:
+# Publishing to GHCR: each architecture builds, smoke-tests, and pushes its own
+# $(IMAGE):VERSION-ARCH tag on a native host, then one docker-manifest run
+# assembles the plain $(IMAGE):VERSION tag from them. docker-login pipes the gh
+# token to docker on stdin. A full release from two machines is:
 #   make docker-push VERSION=1.0.0          # on an amd64 host
 #   make docker-push VERSION=1.0.0          # on an arm64 host
 #   PUSH_LATEST=1 make docker-manifest VERSION=1.0.0
 
-# docker-build builds the runtime image for this host's architecture. It tags the
-# per-arch name the manifest is assembled from, and also the plain VERSION and
-# latest tags locally, so the "build instead of pull" flow in docs/deployment.md keeps
-# working on the machine that built it. BuildKit is required: the Dockerfile
-# carries a syntax directive and mounts build caches.
+# docker-build builds the image for this host's arch. Besides the per-arch tag
+# the manifest uses, it tags VERSION and latest locally, so compose on this
+# machine runs the local build (docs/deployment.md, "Build the image yourself").
+# BuildKit is required: the Dockerfile has a syntax directive and cache mounts.
 docker-build:
 	DOCKER_BUILDKIT=1 docker build --build-arg VERSION=$(VERSION) \
 	  -t $(IMAGE):$(VERSION)-$(ARCH) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
-# docker-smoke builds the image (docker-build) and proves it can start Chromium,
-# fetch a page over HTTP, render it, and run JavaScript in it: `doctor
-# --stop-after-load` navigates to a page the command serves itself on loopback,
-# since a data: page never goes through the network service. --network none
-# keeps how YouTube answers a datacenter IP out of the verdict, so a red run
-# means the image is broken. --pull=never keeps the probe on the local build even
-# when this host is logged in to the registry.
+# docker-smoke builds the image and proves it can start Chromium, fetch a page
+# over HTTP, render it, and run JavaScript: `doctor --stop-after-load` loads a
+# page it serves itself on loopback (a data: page would skip the network
+# service). --network none keeps YouTube's view of a datacenter IP out of the
+# verdict, so a red run means the image is broken. --pull=never keeps the probe
+# on the local build even when this host is logged in to the registry.
 docker-smoke: docker-build
 	docker run --rm --network none --shm-size=1gb --pull=never \
 	  --entrypoint waxseal $(IMAGE):$(VERSION)-$(ARCH) doctor --stop-after-load
@@ -231,11 +206,10 @@ docker-smoke: docker-build
 	  done; \
 	  echo "OK: the image carries LICENSE and THIRD-PARTY-NOTICES.md"
 
-# compose-check validates the plug-and-play compose file and checks that the
-# image it resolves to is the one this Makefile publishes, so a rename here
-# cannot leave the file pulling the old name. It reads the resolved model, not
-# the file's text, so a comment naming the image or a quoted value cannot fool
-# it. TestREADMEEmbedsComposeFile holds the README's copy of the file to it.
+# compose-check validates compose.yaml and checks that it resolves to the image
+# this Makefile publishes, so a rename here cannot leave it pulling the old
+# name. It reads the resolved model, not the text, so a comment or quoted value
+# cannot fool it. TestREADMEEmbedsComposeFile checks the README's copy.
 compose-check:
 	docker compose -f compose.yaml config --quiet
 	@images=$$(docker compose -f compose.yaml config --images) || exit 1; \
@@ -276,19 +250,15 @@ docker-push-authed: release-guard docker-smoke
 	@echo "pushed $(IMAGE):$(VERSION)-$(ARCH); run docker-manifest once every arch is pushed"
 
 # docker-manifest assembles the plain VERSION tag from the per-arch tags already
-# in the registry. It signs in the way docker-push does, for a human running it
-# by hand after each architecture has been pushed.
-#
-# A caller that is already authenticated some other way runs
-# docker-manifest-authed instead. The release workflow is one: it logs in with
-# the Actions token, which is not a gh OAuth token and so cannot pass
-# docker-login's scope check.
+# in the registry, signing in the way docker-push does. A caller authenticated
+# some other way runs docker-manifest-authed, as the release workflow does: its
+# Actions token is not a gh OAuth token, so it fails docker-login's scope check.
 docker-manifest: docker-login docker-manifest-authed
 
 # docker-manifest-authed does the assembly itself, assuming a registry login is
 # already in place. It moves :latest too when PUSH_LATEST=1, then inspects what
 # it published and fails unless every arch in ARCHES appears, so the multi-arch
-# claim is proved at release time rather than by hand.
+# claim is proved at release time.
 docker-manifest-authed: release-guard
 	docker buildx imagetools create -t $(IMAGE):$(VERSION) \
 	  $(foreach a,$(ARCHES),$(IMAGE):$(VERSION)-$(a))

@@ -2,13 +2,13 @@
 // interface. It lives in a separate Go module so the rest of WaxSeal does not
 // depend on WaxTap.
 //
-// Failures are reported as WaxTap's own sidecar error types, and a transient one
-// is retried once after a wait, on the rule WaxTap's own HTTP sidecar retries
-// and pauses by. A consumer therefore classifies refusals and waits the same
-// way whichever of the two adapters it wires. The daemon's own error rides
-// in the sidecar error's Cause for a caller that knows this adapter; nothing
-// unwraps it, so classification is unchanged, and a body that was not the
-// daemon's envelope travels no further than this package.
+// Failures are reported as WaxTap's own sidecar error types, and a transient
+// one is retried once after a wait under the rules WaxTap's HTTP sidecar uses,
+// so a consumer classifies refusals and waits the same way whether it wires
+// this adapter or that sidecar. The daemon's own error rides in the sidecar
+// error's Cause for a caller that knows this adapter; nothing unwraps it, so
+// classification is unchanged. A body that was not the daemon's error
+// envelope never leaves this package.
 package provider
 
 import (
@@ -87,9 +87,8 @@ type Option func(*Provider)
 func WithLogger(l *slog.Logger) Option { return func(p *Provider) { p.log = l } }
 
 // New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure
-// authentication and HTTP behavior on the client before calling New. Pass
-// WithLogger to surface daemon warnings to WaxTap-mediated callers; without it,
-// logs are discarded.
+// authentication and HTTP behavior on the client before calling New. Without
+// WithLogger, logs (daemon warnings included) are discarded.
 func New(c *client.Client, opts ...Option) *Provider {
 	p := &Provider{c: c}
 	for _, o := range opts {
@@ -103,13 +102,13 @@ func New(c *client.Client, opts ...Option) *Provider {
 
 // sidecarErr translates a client failure into the error type WaxTap's own HTTP
 // sidecar would have produced, so its classifier, WEB-context skip window, CLI
-// hints, and doctor output all work for this adapter unchanged. A nil error
-// stays nil.
+// hints, and doctor output work for this adapter unchanged. A nil error stays
+// nil.
 //
-// Only a caller that actually went away gets its error back untranslated, which
-// is why this reads ctx rather than the error: net/http reports its own client
-// timeout as context.DeadlineExceeded too, and a daemon that is merely slow is a
-// transport failure worth one retry, not a caller giving up.
+// Only a caller whose ctx has ended gets its error back untranslated. This
+// reads ctx rather than the error because net/http also reports its own client
+// timeout as context.DeadlineExceeded, and a merely slow daemon is a transport
+// failure worth one retry, not a caller giving up.
 func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error) error {
 	if err == nil {
 		return nil
@@ -120,10 +119,9 @@ func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error
 	endpoint := p.c.BaseURL() + path
 	if apiErr, ok := errors.AsType[*client.APIError](err); ok {
 		// Only a recognized envelope's text is forwarded, and only its error rides
-		// in Cause. Anything else in Message is raw bytes from whatever answered
-		// instead, which the client's own documentation says to keep for local
-		// diagnosis and not forward; Cause happens not to be printed today, but
-		// that is WaxTap's promise rather than something this side can rely on.
+		// in Cause. Otherwise Message holds raw bytes from whatever answered, which
+		// APIError.Envelope says to keep for local diagnosis and never forward.
+		// WaxTap does not print Cause today, but this side must not depend on that.
 		reason := "unrecognized response body"
 		var cause error
 		if apiErr.Envelope {
@@ -145,9 +143,9 @@ func (p *Provider) sidecarErr(ctx context.Context, label, path string, err error
 	if _, ok := errors.AsType[net.Error](err); ok {
 		return &waxtap.SidecarError{Label: label, Endpoint: endpoint, Err: err}
 	}
-	// The daemon answered, but not with something usable: a decode failure, or one
-	// of the shape checks below. A zero status marks a contract mismatch, which is
-	// never retried.
+	// The daemon's answer was unusable (a decode failure or a failed shape check)
+	// or the client refused to send the request. A zero status marks a contract
+	// mismatch, which is never retried.
 	return &waxtap.SidecarResponseError{
 		Label:    label,
 		Endpoint: endpoint,
@@ -167,11 +165,11 @@ func capRunes(s string, n int) string {
 	return string(r[:n]) + "\u2026"
 }
 
-// call runs fn and retries it once when WaxTap's own sidecar rule says the
-// translated failure earns it, pausing under WaxTap's own policy too: a caller
-// that has gone away gets its cancellation, a budget that cannot fit the wait
-// gets the refusal now, and a deadline that expires mid-wait gets the refusal
-// rather than a bare timeout, since it is what explains the run.
+// call runs fn and retries it once when WaxTap's sidecar rule says the
+// translated failure earns it, pausing under WaxTap's policy too: a departed
+// caller gets its cancellation, a budget that cannot fit the wait gets the
+// refusal now, and a deadline that expires mid-wait gets the refusal rather
+// than a bare timeout, since the refusal is what explains the run.
 func (p *Provider) call(ctx context.Context, label string, fn func() error) error {
 	err := fn()
 	if err == nil {
@@ -201,8 +199,9 @@ func sidecarCode(err error) string {
 }
 
 // ProvidePOToken maps a WaxTap scope to a WaxSeal content_binding and mints the
-// token. ScopeGVS binds visitor_data, ScopePlayer binds video_id, ScopeNone does
-// nothing, and ScopeSubtitles returns ErrUnsupportedScope.
+// token. ScopeGVS binds visitor_data and ScopePlayer binds video_id. ScopeNone
+// returns an empty Response without calling the daemon; ScopeSubtitles and any
+// unknown scope return an error wrapping ErrUnsupportedScope.
 func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (potoken.Response, error) {
 	var binding, scope string
 	switch req.Scope {
@@ -235,10 +234,9 @@ func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (pot
 // Session fetches WaxSeal's coherent guest session as a *potoken.Session, ready
 // for WaxTap's Options.Session.
 //
-// Prefer ProvideSession and Options.SessionProvider. WaxTap reaches
-// InvalidateSession through the configured SessionProvider, so a session adopted
-// by value here is the one arm a delivery cap cannot rotate: WaxTap holds it for
-// the Client's lifetime with nowhere to report it.
+// Prefer ProvideSession and Options.SessionProvider: WaxTap keeps a session
+// adopted by value for the Client's lifetime, with no way to report a delivery
+// cap on it.
 func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
 	var s *client.Session
 	err := p.call(ctx, labelSession, func() error {
@@ -262,10 +260,10 @@ func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
 }
 
 // ProvideSession is the pull-based form of Session, for WaxTap's
-// Options.SessionProvider. It is what makes the session arm's delivery-cap
-// escape work: WaxTap type-asserts SessionInvalidator on the SessionProvider it
-// was given, so only a session adopted through here can be reported and
-// replaced. The generation travels with the session to name it in that report.
+// Options.SessionProvider. WaxTap type-asserts SessionInvalidator on the
+// SessionProvider it was given, so only a session adopted through here can be
+// reported and replaced after a delivery cap. Its Generation names it in that
+// report.
 func (p *Provider) ProvideSession(ctx context.Context) (potoken.Session, error) {
 	s, err := p.Session(ctx)
 	if err != nil {
@@ -277,13 +275,11 @@ func (p *Provider) ProvideSession(ctx context.Context) (potoken.Session, error) 
 // previewMax bounds a rejected field echoed into a log line.
 const previewMax = 64
 
-// preview renders a rejected field for diagnosis. What made it unreportable is
-// usually invisible in a length (a stray space, a colon, a newline), so the text
-// itself has to appear. It is bounded rather than escaped: slog's handlers
-// already quote a value carrying spaces or control characters, so the log stays
-// one line without this adding a second layer of quoting over the string a
-// reader is trying to look at. The cut is by rune, so it cannot leave a mangled
-// one behind.
+// preview renders a rejected field for diagnosis. What made it unreportable (a
+// stray space, a colon, a newline) does not show in a length, so the text must
+// appear. It is bounded but not escaped: slog's handlers already quote a value
+// with spaces or control characters, so the log stays on one line without a
+// second layer of quoting. The cut is by rune, so it never splits a character.
 func preview(s string) string {
 	r := []rune(s)
 	if len(r) > previewMax {
@@ -297,26 +293,24 @@ func preview(s string) string {
 // one. WaxTap calls this when googlevideo caps delivery on a session, which no
 // re-resolve under the same identity escapes.
 //
-// A nil error means the named session is gone. That covers a report the daemon
-// rejects as stale or already retired, because the session it named is exactly
-// what the caller wanted removed, and a retirement deferred to the next handoff,
-// because the handoff is the next Session or ProvidePlayerContext call. Only a
-// rate-limited report is an error: the daemon is asking for backoff and the
-// current session survives it, so reporting success would hand WaxTap the same
-// session back.
+// A nil error means the named session is gone: retired now, queued to retire
+// no later than the next Session or ProvidePlayerContext call, or rejected by
+// the daemon as stale or already retired. A rate-limited report is an error
+// carrying the daemon's wait in RetryAfter: the current session survives it,
+// so reporting success would hand WaxTap the same session back. A zero
+// Generation and a failed request are errors too.
 //
-// video_id and reason are diagnostics, and the daemon constrains the shape of
-// both. Neither is allowed to decide whether a capped session gets retired, so a
-// report the daemon rejects as malformed is retried naming only the generation.
-// Asking the daemon rather than pre-screening against a copy of its rules is
-// what keeps the two from drifting apart.
+// video_id and reason are diagnostics whose shape the daemon constrains. They
+// must not decide whether a capped session is retired, so a report the daemon
+// rejects as malformed is retried once naming only the generation. Letting the
+// daemon judge them, rather than pre-screening against a copy of its rules,
+// keeps the two from drifting apart.
 func (p *Provider) InvalidateSession(ctx context.Context, inv potoken.SessionInvalidation) error {
 	if inv.Generation == 0 {
 		return errors.New("waxseal/provider: no session generation to report; the session or player-context response carried none")
 	}
-	// A report is sent once, so it is deliberately not routed through call: the
-	// one resend below is about dropping a rejected diagnostic, not about waiting
-	// out a transient failure.
+	// A report is sent once, so it does not go through call. The one resend
+	// below drops a rejected diagnostic; it does not wait out a transient failure.
 	res, err := p.c.Report(ctx, inv.Generation, inv.VideoID, inv.Reason)
 	if err != nil {
 		if !rejectedDiagnostics(err, inv) {
@@ -343,9 +337,8 @@ func (p *Provider) InvalidateSession(ctx context.Context, inv potoken.SessionInv
 
 // rejectedDiagnostics reports whether err is the daemon refusing the report over
 // a diagnostic field, which a second attempt can drop and still get the session
-// retired. It requires that there was a diagnostic to blame: with neither field
-// set, the bare report is all that was sent and a 400 means something a retry
-// cannot fix, so resending it would only cost a round trip.
+// retired. With neither field set there is nothing to drop, so a 400 on a bare
+// report is final.
 func rejectedDiagnostics(err error, inv potoken.SessionInvalidation) bool {
 	if inv.VideoID == "" && inv.Reason == "" {
 		return false
@@ -355,8 +348,9 @@ func rejectedDiagnostics(err error, inv potoken.SessionInvalidation) bool {
 }
 
 // ProvidePlayerContext fetches the attested WEB player context for videoID and
-// maps it to WaxTap's SABR audio context. It rejects incomplete responses before
-// WaxTap begins SABR setup.
+// maps it to WaxTap's SABR audio context. A non-OK playability status fails as
+// the video-unavailable refusal the daemon's 422 carries, and an incomplete
+// response fails before WaxTap begins SABR setup.
 func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (potoken.PlayerContext, error) {
 	var pc *client.PlayerContext
 	err := p.call(ctx, labelPlayerContext, func() error {
@@ -368,9 +362,8 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 		return potoken.PlayerContext{}, err
 	}
 	if pc.PlayabilityStatus != "" && !strings.EqualFold(pc.PlayabilityStatus, "OK") {
-		// A 200 that names a non-OK status is the same verdict a 422
-		// video-unavailable carries, so code it the same way and let WaxTap unwrap
-		// both to the playability verdict.
+		// Coded like the daemon's 422 video-unavailable, so WaxTap unwraps this to
+		// a playability verdict too.
 		return potoken.PlayerContext{}, &waxtap.SidecarResponseError{
 			Label:    labelPlayerContext,
 			Endpoint: p.c.BaseURL() + pathPlayerContext,
@@ -402,10 +395,9 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 			AudioIsDefault:   f.AudioIsDefault,
 		})
 	}
-	// Allocate the ladder only when the response carried rungs, so an absent or
-	// empty thumbnails key leaves Thumbnails nil. A rung without a URL is dropped,
-	// matching WaxTap's own sidecar. The order is the response's own, smallest
-	// first; WaxTap sorts it itself.
+	// Thumbnails stays nil unless a rung carries a URL; a rung without one is
+	// dropped, as WaxTap's own sidecar does. The order is the response's
+	// (smallest first); WaxTap sorts it itself.
 	var thumbs []potoken.PlayerContextThumbnail
 	for _, t := range pc.Thumbnails {
 		if t.URL == "" {

@@ -226,8 +226,8 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 	}
 }
 
-// TestProvidePlayerContextRejects starts from an otherwise-complete context so each
-// mutation is the sole reason the provider's stricter SABR validation rejects it.
+// TestProvidePlayerContextRejects starts from an otherwise-complete context
+// so each mutation is the sole reason the provider rejects it.
 func TestProvidePlayerContextRejects(t *testing.T) {
 	full := func() map[string]any {
 		return map[string]any{
@@ -313,8 +313,8 @@ func TestInvalidateSessionOutcomes(t *testing.T) {
 	}{
 		// The daemon closed the session immediately.
 		{"retired", map[string]any{"accepted": true, "retired": true, "generation": 9}, false},
-		// Queued for the next streaming handoff, which is the next /session or
-		// /player-context call, so the replacement still arrives before WaxTap uses it.
+		// Queued for the next streaming handoff (the next /session or
+		// /player-context call), so the replacement arrives before WaxTap uses it.
 		{"retirement pending", map[string]any{"accepted": true, "retirement_pending": true, "generation": 9}, false},
 		// Rejected as stale: the session named is already gone, which is the outcome
 		// the caller asked for.
@@ -345,7 +345,7 @@ func TestInvalidateSessionOutcomes(t *testing.T) {
 	}
 }
 
-// A daemon that cannot be reached leaves the session in place rather than
+// A daemon that fails the report leaves the session in place rather than
 // reporting a retirement that never happened.
 func TestInvalidateSessionDaemonError(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
@@ -546,14 +546,12 @@ func TestProvideSessionCarriesGeneration(t *testing.T) {
 	if s.VisitorData != "VD" || len(s.Cookies) != 1 || s.Generation != 4 {
 		t.Fatalf("session = %+v, want VD with one cookie and generation 4", s)
 	}
-	// Both are mapped here too, so this test fails on a dropped mapping rather
-	// than only TestSessionAdapts. Asserting empty against an empty fixture would
-	// pass whether or not the fields were read.
+	// Checked here too, against non-empty fixture values, so a dropped mapping
+	// fails this test and not only TestSessionAdapts.
 	if s.UserAgent != "UA" || s.ClientVersion != "2.0" {
 		t.Errorf("identity = %q/%q, want the daemon's", s.UserAgent, s.ClientVersion)
 	}
-	// The pairing is the point: a provider WaxTap can pull from must also be one it
-	// can report to.
+	// A provider WaxTap pulls sessions from must also be one it can report to.
 	var sp potoken.SessionProvider = p
 	if _, ok := sp.(potoken.SessionInvalidator); !ok {
 		t.Fatal("the session provider must also be a SessionInvalidator")
@@ -571,7 +569,8 @@ func TestProvideSessionPropagatesError(t *testing.T) {
 	}
 }
 
-// sidecarErr holds the *waxtap.SidecarResponseError inside err, or fails.
+// sidecarResponseErr returns the *waxtap.SidecarResponseError inside err, or
+// fails the test.
 func sidecarResponseErr(t *testing.T, err error) *waxtap.SidecarResponseError {
 	t.Helper()
 	sre, ok := errors.AsType[*waxtap.SidecarResponseError](err)
@@ -581,9 +580,8 @@ func sidecarResponseErr(t *testing.T, err error) *waxtap.SidecarResponseError {
 	return sre
 }
 
-// The adapter speaks WaxTap's own sidecar error types, so WaxTap's classifier,
-// its WEB-context skip window, its CLI hints, and its doctor output all work
-// through this provider unchanged.
+// The adapter returns WaxTap's own sidecar error types, so everything WaxTap
+// builds on them works through this provider unchanged (see sidecarErr).
 func TestProviderTranslatesRefusals(t *testing.T) {
 	t.Run("video-unavailable classifies as the playability verdict", func(t *testing.T) {
 		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
@@ -667,7 +665,7 @@ func TestProviderTranslatesRefusals(t *testing.T) {
 		}
 	})
 
-	t.Run("a cancelled caller gets its own error, not an unreachable daemon", func(t *testing.T) {
+	t.Run("a canceled caller gets its own error, not an unreachable daemon", func(t *testing.T) {
 		started := make(chan struct{})
 		release := make(chan struct{})
 		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
@@ -770,10 +768,10 @@ func TestInvalidateSessionRateLimited(t *testing.T) {
 	}
 }
 
-// The arms below run WaxTap's own rule through call, so a consumer behaves the
-// same whichever adapter it wires: after the daemon's stated wait on a transient
-// refusal, after a short poke on one that stated none, and never at all on a
-// verdict or a stated wait too long to serve.
+// The arms below run WaxTap's own rule through call, so a consumer retries the
+// same way whichever adapter it wires: after the daemon's stated wait on a
+// transient refusal, after a short poke when none was stated, and never on a
+// verdict or on a stated wait too long to serve.
 func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 	// slept records the waits served instead of serving them, so the table runs at
 	// full speed and can assert on the wait itself.
@@ -891,12 +889,11 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 		}
 	})
 
-	// The arms below run WaxTap's pause policy through this adapter on the
-	// caller's own budget, so a wrapper that dropped the context, or slept before
-	// asking, would pass the table above and fail here: a budget has to clear the
-	// wait plus a second of headroom, one that does not gets the refusal instead
-	// of a sleep it cannot finish, and a wait the context ends early returns the
-	// refusal for a deadline and the cancellation for a caller giving up.
+	// The arms below run WaxTap's pause policy on the caller's own budget, which
+	// the table above cannot see: a wrapper that dropped the context or slept
+	// before asking would pass it. A budget must clear the wait plus a second of
+	// headroom or get the refusal now; a wait the context ends early returns the
+	// refusal on a deadline and the cancellation on a caller giving up.
 	//
 	// refuseAll answers every request with a 502 stating retryAfter and counts
 	// them, for the arms that never reach a second attempt.
@@ -967,11 +964,10 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 	})
 
 	t.Run("a caller that leaves during the wait gets its cancellation, not the wait", func(t *testing.T) {
-		// The real wait, handed the caller's context, which the caller ends the
-		// moment the wait starts: after the refusal, so a retry is due, and before
-		// any of the wait has been served. A wait given a context of its own would
-		// hold the caller for the whole stated wait, which is long enough here to
-		// be unmistakable and is never served when the wiring is right.
+		// The real wait, whose context the caller cancels the moment it starts:
+		// after the refusal, so a retry is due, and before any of it is served. A
+		// wait on a context of its own would hold the caller for the full 30 s,
+		// which the elapsed check below catches.
 		const stated = 30 * time.Second
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -1038,7 +1034,7 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 
 // net/http reports its own client timeout as context.DeadlineExceeded, so a
 // merely slow daemon must still be translated and retried. Only a caller that
-// actually walked away gets its own error back untouched.
+// walked away gets its own error back untouched.
 func TestSlowDaemonIsATransportFailureNotACancellation(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1061,8 +1057,8 @@ func TestSlowDaemonIsATransportFailureNotACancellation(t *testing.T) {
 }
 
 // A body that is not a WaxSeal error envelope is never echoed into the sidecar
-// error. WaxTap prints Reason in its CLI hints and deliberately never forwards
-// raw bytes, which may carry tokens or cookies from an intermediary.
+// error. WaxTap prints Reason in its CLI hints and never forwards raw bytes,
+// which may carry tokens or cookies from an intermediary.
 func TestNonEnvelopeBodyIsNotEchoed(t *testing.T) {
 	const secret = "<html>proxy at internal-host.corp: session=SUPERSECRET</html>"
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
@@ -1083,7 +1079,7 @@ func TestNonEnvelopeBodyIsNotEchoed(t *testing.T) {
 	if sre.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502 kept", sre.StatusCode)
 	}
-	// A recognised envelope still carries its own text, which is the daemon's.
+	// A recognized envelope still carries its own text, which is the daemon's.
 	p2, done2 := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "player-context failed: boom", "code": "player-context-failed"})
@@ -1096,10 +1092,9 @@ func TestNonEnvelopeBodyIsNotEchoed(t *testing.T) {
 }
 
 // The daemon's own error travels in Cause, for a caller that knows this adapter.
-// It is a field rather than an unwrap, so classification through the sidecar
-// error and the line it prints are both exactly what they were. A 400 is used
-// rather than a 5xx so the call is not retried: this is about the error the
-// first attempt produced.
+// It is a field, not an unwrap, so classification and the printed line are
+// unchanged. A 400 keeps the call from being retried, so the error checked is
+// the first attempt's.
 func TestSidecarErrorCarriesCause(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)

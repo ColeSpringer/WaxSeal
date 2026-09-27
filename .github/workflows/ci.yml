@@ -17,11 +17,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Build, gofmt-check, tidy-check, vet, and run the offline race tests, plus the
-  # real-Chromium CDP pipe-transport tests (-tags live) against a pinned
-  # browser. The committed browser bundle removes the Node dependency. Only
-  # the network YouTube and BotGuard e2e (-tags e2e) still run manually,
-  # needing network access.
+  # The offline race suite plus the real-Chromium CDP live tests; the committed
+  # bundle means no Node. Only the -tags e2e suite, which needs network, runs
+  # manually.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -38,21 +36,15 @@ jobs:
             go.sum
             provider/go.sum
       - run: go build ./...
-      # gofmt and tidy-check cover this whole checkout, including the nested
-      # provider/ module, which the job below builds, vets, and tests on its own.
-      # compose-check is a static read of compose.yaml, so it runs here once
-      # rather than on both legs of the docker matrix.
+      # fmt-check and tidy-check cover provider/ too. compose-check is a static
+      # read of compose.yaml, so it runs here once, not on each docker leg.
       - run: make fmt-check tidy-check compose-check
       - run: go vet ./...
       - run: go test -race ./...
-      # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
-      # guaranteed present, not incidental to the ubuntu-latest image. From the
-      # action's v2 on, the stable channel resolves to Chrome for Testing rather
-      # than the official Chrome build. It still floats, so a new stable release
-      # can legitimately move these tests. Pin a version here if deterministic CI
-      # matters more. The WAXSEAL_REQUIRE_CHROME hook makes a missing browser fail
-      # loudly instead of skipping. The tests drive a local Chromium over the pipe
-      # transport and need no network.
+      # Install Chrome explicitly rather than rely on the runner image. In
+      # setup-chrome v2, "stable" is Chrome for Testing and floats, so a new
+      # release can move these tests; pin a version if determinism matters more.
+      # WAXSEAL_REQUIRE_CHROME fails on a missing browser instead of skipping.
       - id: setup-chrome
         uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
         with:
@@ -64,7 +56,7 @@ jobs:
         run: go test -race -tags live ./internal/cdp
 
   # govulncheck over both modules. It reports only vulnerabilities in functions
-  # the code actually calls, so a red run here is something to act on.
+  # the code calls, so a red run here is something to act on.
   vulncheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -81,9 +73,9 @@ jobs:
             provider/go.sum
       - run: make vulncheck
 
-  # Build, vet, and test the nested consumer-adapter module separately. Its
-  # untagged tests are pure httptest: no browser, no network, so they belong in
-  # every run. The -tags e2e files need both, so they are only type-checked here.
+  # The nested provider/ module. Its untagged tests are pure httptest (no
+  # browser, no network); the -tags e2e files need both, so they are only
+  # type-checked here.
   provider:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -96,18 +88,18 @@ jobs:
           go-version-file: go.mod
           cache: true
           # This job builds in provider/, but setup-go runs at the repo root, so
-          # its default cache key would ignore provider/go.sum entirely.
+          # its default cache key would ignore provider/go.sum.
           cache-dependency-path: |
             go.sum
             provider/go.sum
       - working-directory: provider
         run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test -race ./...
 
-  # The Windows transport (named pipes, handle inheritance, the job object, the
-  # exclusive-open profile lock) has no Unix equivalent, and the dev box is WSL,
-  # so this job is the only thing that runs it. The live tests need a browser,
-  # which setup-chrome only has for amd64. -race is windows/amd64 only, so the
-  # flag is a matrix value; hardcoded, the Arm leg would refuse to run at all.
+  # Only this job runs the Windows-only code (named pipes, handle inheritance,
+  # the job object, the exclusive-open profile lock); the dev box is WSL.
+  # setup-chrome's stable channel has no Windows Arm build, so only the amd64
+  # leg runs the live tests. -race is windows/amd64 only, so the flag is a
+  # matrix value; hardcoded, the Arm leg would refuse to run.
   windows:
     strategy:
       fail-fast: false
@@ -143,9 +135,9 @@ jobs:
         uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
         with:
           chrome-version: stable
-      # The one check that the io-pipes transport actually drives a real browser
-      # on this platform. WAXSEAL_REQUIRE_CHROME makes a missing browser a failure
-      # rather than a skip, so the coverage cannot be lost quietly.
+      # The only check that the io-pipes transport drives a real browser on
+      # Windows. WAXSEAL_REQUIRE_CHROME fails on a missing browser instead of
+      # skipping, so the coverage cannot be lost quietly.
       - name: CDP live tests (real Chrome, io-pipes transport)
         if: matrix.live
         env:
@@ -155,8 +147,7 @@ jobs:
 
   # Cross-compile every RELEASE_PLATFORMS target through the same `make release`
   # the release workflow runs, so a target the Makefile cannot build fails on a
-  # push to main rather than on a tag. The windows job above builds, vets, and
-  # tests those binaries natively; this is the cross-compilation check.
+  # push to main rather than on a tag.
   cross:
     runs-on: ubuntu-latest
     timeout-minutes: 10

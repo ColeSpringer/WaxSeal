@@ -13,9 +13,7 @@ import (
 
 // The Windows transport is two named pipes standing in for what os.Pipe gives
 // every other platform, so everything the rest of the package assumes about a
-// pipe has to be checked here: that bytes flow the right way, that the parent end
-// honours deadlines and cancel-on-close, that the child end reports EOF, and that
-// exactly the child end is inheritable.
+// pipe has to be checked here.
 
 // Both directions must carry bytes the way their names say.
 func TestPipePairRoundTrip(t *testing.T) {
@@ -178,8 +176,8 @@ func TestPipeInheritFlags(t *testing.T) {
 }
 
 // childPollable is what separates the transport's child end from a test's. The
-// production end is synchronous by design, so it must refuse a deadline; asking
-// for a pollable one must actually give a different handle.
+// production end is synchronous, so it must refuse a deadline; a pollable one
+// must accept it.
 func TestPipeChildPollability(t *testing.T) {
 	blocking, err := newPipePair(pipeParentReads, false)
 	if err != nil {

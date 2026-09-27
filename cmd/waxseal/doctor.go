@@ -56,9 +56,8 @@ func newDoctorCmd() *cobra.Command {
 }
 
 // validateDoctorStage rejects flag combinations that ask for a check the chosen
-// stage cannot deliver. A flag the caller typed is judged on having been typed,
-// not on its value, so an unset variable behind it is loud rather than silently
-// the default.
+// stage cannot deliver. A typed --landing-url counts even when empty, so an
+// unset variable behind it fails loudly instead of meaning the default.
 func validateDoctorStage(cmd *cobra.Command, o *doctorOpts) error {
 	if o.full && (o.skipAttest || o.stopAfterLoad) {
 		return &usageError{msg: "--full needs an attested session, so it cannot be combined with --skip-attest or --stop-after-load"}
@@ -143,8 +142,8 @@ func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	kind := sess.AttestKind()
 	report := doctorReport(sess.Identity(), kind)
 
-	// Run the optional probe before writing the report so failed and skipped probes
-	// are included in the output.
+	// Probe before writing the report so its result is in the output even when
+	// the command then fails.
 	var probe browser.FullLengthProbe
 	var probeErr error
 	if o.full {
@@ -155,16 +154,14 @@ func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	_ = enc.Encode(report)
 
 	if o.full {
-		// A successful full-length probe is stronger evidence than the
-		// attestation grade.
 		if probeErr != nil {
 			return fmt.Errorf("full-length probe: %w", probeErr)
 		}
 		if probe.Outcome != browser.OutcomeFullLength {
 			return fmt.Errorf("full-length not verified (outcome %q): %s", probe.Outcome, probe.Reason)
 		}
-		// Once full-length playback is verified, a non-integrity attestation grade
-		// is informational rather than fatal.
+		// Verified full-length playback outranks the attestation grade, so a
+		// non-integrity grade is informational rather than fatal.
 		if kind != "integrity" {
 			fmt.Fprintf(stderr, "waxseal: note: attestation grade is %q, but full-length streaming was verified\n", kind)
 		}

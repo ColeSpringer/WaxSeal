@@ -13,7 +13,7 @@ import (
 
 // The probe's default budget is the named constant, so the two cannot drift, and
 // a value the probe could never run under is a usage error rather than a dial
-// that is cancelled the moment it starts.
+// that is canceled the moment it starts.
 func TestPingTimeoutFlag(t *testing.T) {
 	if got, err := newPingCmd().Flags().GetDuration("timeout"); err != nil || got != pingTimeout {
 		t.Errorf("--timeout default = %v (err %v), want %v", got, err, pingTimeout)
@@ -26,8 +26,8 @@ func TestPingTimeoutFlag(t *testing.T) {
 	}
 }
 
-// Bad --addr values should be usage errors (exit 2), not nil-request panics. URL
-// input is rejected before request construction. The rest fail URL parsing.
+// Bad --addr values are usage errors (exit 2), not nil-request panics, whether
+// the scheme check, SplitHostPort, or request construction rejects them.
 func TestPingCLIInvalidAddr(t *testing.T) {
 	for _, addr := range []string{
 		"http://127.0.0.1:4416", // URL instead of host:port
@@ -55,9 +55,8 @@ func TestPingCLIInvalidAddr(t *testing.T) {
 	}
 }
 
-// An out-of-range, zero, empty, non-numeric, or signed port gets the clear
-// "port must be 1-65535" usage message (exit 2), not a generic parse error at
-// dial time. The signed case (:+80) guards the ParseUint-over-Atoi choice.
+// Every bad port gets the "port must be 1-65535" usage message (exit 2), not a
+// parse error at dial time; the :+80 case guards choosing ParseUint over Atoi.
 func TestPingCLIPortRangeMessage(t *testing.T) {
 	for _, addr := range []string{
 		"127.0.0.1:99999", // out of range
@@ -82,11 +81,9 @@ func TestPingCLIPortRangeMessage(t *testing.T) {
 	}
 }
 
-// pingFake is the scripted /ping these CLI tests drive. The handler runs on the
-// server's goroutine while the test writes the next answer on its own, so the
-// fields are guarded. That is hygiene, not a race fix: every write precedes the
-// request that reads it, and the race detector already sees that ordering
-// through the request, which is why the suite passes without the lock.
+// pingFake is the scripted /ping these CLI tests drive. Its lock is hygiene,
+// not a race fix: each answer is written before the request that reads it, and
+// the race detector sees that ordering through the request.
 type pingFake struct {
 	mu       sync.Mutex
 	status   int
@@ -117,11 +114,10 @@ func (f *pingFake) query() url.Values {
 	return f.gotQuery
 }
 
-// TestPingCLIStrict verifies the exit semantics of `waxseal ping` with and
-// without --strict against canned /ping responses. Without --strict a live
-// session (ok:true) is required; with --strict the CLI defers to the server's
-// status code, so the benign no-session window (HTTP 200) is healthy and only a
-// real probe failure (non-200) fails.
+// TestPingCLIStrict pins the exit semantics of `waxseal ping` against canned
+// /ping answers. Without --strict only ok:true passes. With --strict the benign
+// reasons (no-session, busy) also pass, but a probe failure fails even under a
+// 200, as does a body with no ok field.
 func TestPingCLIStrict(t *testing.T) {
 	fake := &pingFake{}
 	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
@@ -170,11 +166,10 @@ func TestPingCLIStrict(t *testing.T) {
 		t.Errorf("no-session strict: %v, want success (benign window)", err)
 	}
 
-	// Benign busy (HTTP 200, ok:false): a probe failed twice but a request held the
-	// page, so nothing was retired. --strict must treat it as healthy, or the
-	// image's HEALTHCHECK marks a busy but healthy container unhealthy after three
-	// probes. Non-strict still reports not-ready: there is no confirmed live
-	// session.
+	// Benign busy (HTTP 200, ok:false): a probe failed twice while a request
+	// held the page, so nothing was retired. --strict must pass it, or the
+	// image's HEALTHCHECK marks a busy, healthy container unhealthy after three
+	// probes. Non-strict fails: no live session is confirmed.
 	fake.answer(http.StatusOK, `{"ok":false,"reason":"busy"}`)
 	if err := run(false); err == nil {
 		t.Error("busy non-strict: want error (no confirmed live session)")
@@ -208,10 +203,8 @@ func TestPingCLIStrict(t *testing.T) {
 	}
 }
 
-// TestPingSendsKeyAsHeader pins that the API key never reaches the query string,
-// where it would land in proxy and container access logs. The healthcheck runs
-// every few seconds, so a key in the request line is written to those logs for
-// the life of the container.
+// TestPingSendsKeyAsHeader pins that the API key travels in X-API-Key and never
+// in the query string, where proxy and container access logs would record it.
 func TestPingSendsKeyAsHeader(t *testing.T) {
 	const key = "s3cr3t-tenant-key"
 	var gotHeader, gotQueryKey, gotRawQuery string
@@ -244,11 +237,10 @@ func TestPingSendsKeyAsHeader(t *testing.T) {
 	}
 }
 
-// TestPingCLIDaemonProbe covers the body a keyed daemon returns to a probe that
-// sends no key: the shared browser's liveness rather than a tenant's session.
-// That is what the image's HEALTHCHECK receives once the daemon is keyed, so
-// both modes must read it, and the output must say what was checked instead of
-// printing an empty attest.
+// TestPingCLIDaemonProbe covers a keyed daemon's answer to a keyless probe, the
+// shared browser's liveness, which is what the image's HEALTHCHECK receives.
+// Both modes must read it, and the output names the probe instead of printing
+// an empty attest.
 func TestPingCLIDaemonProbe(t *testing.T) {
 	fake := &pingFake{}
 	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
@@ -310,7 +302,7 @@ func TestPingCLIDaemonProbe(t *testing.T) {
 	}
 }
 
-// runPingAgainst runs one probe against fake and returns its stdout and error.
+// runPingAgainst runs one probe against addr and returns its stdout and error.
 func runPingAgainst(t *testing.T, addr string, args ...string) (string, error) {
 	t.Helper()
 	c := newPingCmd()
@@ -400,12 +392,9 @@ func TestPingCLIKeyIgnoredByKeylessDaemonFails(t *testing.T) {
 	}
 }
 
-// TestPingCLIEmptyKeyIsUsageError pins that `--key ""` is refused, and so is a
-// key that is only whitespace. A compose file that passes `--key ${SOME_VAR}`
-// with the variable unset would otherwise send no header, and on a keyed daemon
-// that quietly turns the tenant probe the operator configured into the
-// daemon-level one, which stays healthy while the tenant it meant to watch is
-// never checked.
+// TestPingCLIEmptyKeyIsUsageError pins that an empty or whitespace-only --key
+// is refused before any request, so an unset variable behind it cannot
+// silently downgrade a tenant probe to the daemon-level one.
 func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("the daemon was probed despite the empty --key")

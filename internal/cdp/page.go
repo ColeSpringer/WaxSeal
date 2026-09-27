@@ -6,9 +6,7 @@ import (
 	"fmt"
 )
 
-// Page is a CDP page bound to one flat session. Context returns a lightweight
-// copy with a different call context while sharing the same session and cached
-// window object id.
+// Page is a CDP page bound to one flat session.
 type Page struct {
 	conn      *Conn
 	ctx       context.Context
@@ -24,10 +22,9 @@ func (p *Page) Context(ctx context.Context) *Page {
 	return &cp
 }
 
-// Navigate stops any current load, invalidates the cached window object id, and
-// points the page at url. The id is dropped regardless of outcome: a navigation
-// can swap the execution context even when it returns an errorText, so the next
-// Eval should resolve a fresh window object.
+// Navigate stops any current load, drops the cached window object id, and
+// points the page at url. The id is dropped whatever the outcome, since a
+// navigation that returns an errorText can still swap the execution context.
 func (p *Page) Navigate(url string) error {
 	if url == "" {
 		url = "about:blank"
@@ -65,10 +62,10 @@ func (p *Page) WaitLoad() error {
 	return err
 }
 
-// Cookies returns the page's cookies for urls via Network.getCookies. The Network
-// domain is intentionally not enabled because enabling it starts an event stream.
-// WaxSeal always passes urls; callers needing page-scoped defaults should add
-// them explicitly.
+// Cookies returns the page's cookies for urls via Network.getCookies, without
+// enabling the Network domain, which would start an event stream. WaxSeal
+// always passes urls; callers needing page-scoped defaults should add them
+// explicitly.
 func (p *Page) Cookies(urls []string) ([]*Cookie, error) {
 	var res getCookiesResult
 	if err := p.conn.call(p.ctx, p.sessionID, "Network.getCookies", networkGetCookiesParams{URLs: urls}, &res); err != nil {
@@ -89,13 +86,11 @@ func (p *Page) SetUserAgentOverride(req *NetworkSetUserAgentOverride) error {
 }
 
 // WaitCrash enables the Inspector domain and blocks until the page's target
-// crashes or detaches, the connection is lost, or ctx is cancelled. It returns a
-// diagnostic reason, or "" when ctx is cancelled. Events are buffered and
-// nonblocking, and the subscription is removed on return. ctx drives both the
-// enable call and the wait, so callers can use it directly.
+// crashes or detaches, the connection is lost, or ctx is done; ctx also bounds
+// the enable call. It returns a diagnostic reason, or "" when ctx is done.
 //
 // The subscription is registered before Inspector.enable so a crash arriving in
-// the enable round-trip window is not dropped for lack of a subscriber.
+// the enable round trip is not dropped for lack of a subscriber.
 func (p *Page) WaitCrash(ctx context.Context) string {
 	sub := p.conn.subscribe(p.sessionID, "Inspector.targetCrashed", "Inspector.detached")
 	defer p.conn.unsubscribe(sub)

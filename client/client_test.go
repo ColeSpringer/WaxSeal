@@ -333,7 +333,7 @@ func TestAPIErrorRetryAfter(t *testing.T) {
 	}
 }
 
-// BaseURL reports the address New normalised, which is what a consumer labels
+// BaseURL reports the address New normalized, which is what a consumer labels
 // its own errors with.
 func TestBaseURL(t *testing.T) {
 	if got := client.New("http://127.0.0.1:4416/").BaseURL(); got != "http://127.0.0.1:4416" {
@@ -410,11 +410,10 @@ func TestReport(t *testing.T) {
 	}
 }
 
-// A deferred retirement is the other accepted outcome: the daemon took the
-// report but a browser operation held the page, so the session goes at the next
-// streaming handoff. It is the only case that sets retirement_pending, so
-// without it that tag is never decoded from anything but false, which is also
-// the zero value.
+// TestReportRetirementPending decodes a deferred retirement: a browser
+// operation held the page, so the next request to take it retires the session.
+// It is the only test that decodes retirement_pending as true; everywhere else
+// a misspelled tag would still pass, since false is the zero value.
 func TestReportRetirementPending(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -459,13 +458,11 @@ func TestReportHTTPError(t *testing.T) {
 	}
 }
 
-// TestClientDecodesREADMEExamples serves each documented response example to the
-// client and reads the values back. The shape contracts in server/ pin the
-// README's keys against the structs that produce them; a key can match there and
-// still decode into nothing here, which is the gap this closes.
-//
-// cookie_header is deliberately not checked: the client does not decode it,
-// because it is derivable from the cookies it does.
+// TestClientDecodesREADMEExamples serves the README's response examples to the
+// client and checks each value decodes. The server/ shape contracts pin those
+// keys against the structs that write them, but a key can match there and still
+// decode into nothing here. cookie_header is skipped: the client does not
+// decode it, since the cookies carry the same data.
 func TestClientDecodesREADMEExamples(t *testing.T) {
 	serve := func(t *testing.T, heading string) (*client.Client, map[string]any) {
 		t.Helper()
@@ -484,9 +481,8 @@ func TestClientDecodesREADMEExamples(t *testing.T) {
 		t.Cleanup(srv.Close)
 		return client.New(srv.URL), documented
 	}
-	// equal compares one decoded field against the value the README documents for
-	// it. The documented side is an any, so a string, a bool, and a JSON number
-	// all go through one helper.
+	// equal compares a decoded field with its documented value. want is an any,
+	// so strings, bools, and JSON numbers share one helper.
 	equal := func(t *testing.T, key string, got, want any) {
 		t.Helper()
 		if got != want {
@@ -516,9 +512,8 @@ func TestClientDecodesREADMEExamples(t *testing.T) {
 	})
 
 	t.Run("report", func(t *testing.T) {
-		// The documented example is the rate-limited one, so its three booleans are
-		// all false and only the generation and the wait carry a value here.
-		// TestReport is what pins an accepted report's true ones.
+		// The documented example is rate-limited, so its booleans are all
+		// false; TestReport and TestReportRetirementPending pin the true ones.
 		c, want := serve(t, "/report")
 		res, err := c.Report(context.Background(), 1, "", "truncated")
 		if err != nil {
@@ -563,9 +558,8 @@ func TestClientDecodesREADMEExamples(t *testing.T) {
 	})
 }
 
-// wireSameSite is the mapping the README documents for a cookie's same_site,
-// spelled out here rather than reached for: the client's own mapper is
-// unexported, and a test that called it could not tell a wrong mapping from a
+// wireSameSite is the README's same_site mapping, written out independently: a
+// test that reused the client's mapper could not tell a wrong mapping from a
 // consistent one.
 func wireSameSite(v any) http.SameSite {
 	switch v {

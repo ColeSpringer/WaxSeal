@@ -68,10 +68,9 @@ func TestWriteMarker(t *testing.T) {
 	}
 }
 
-// A profile whose removal could not finish is re-marked so that a sweep collects
-// it. The marker cannot be dated now: markerGrace would hold the sweep off the
-// directory it was written for, and on Windows that is the very next one, once
-// the handles pinning those files are gone.
+// A profile whose removal could not finish is re-marked, backdated past
+// markerGrace, so the next sweep collects it. On Windows that sweep is the
+// first to run once the handles pinning the files are gone.
 func TestReapCollectsAnAbandonedProfile(t *testing.T) {
 	setProfileBase(t, t.TempDir())
 	dir, err := os.MkdirTemp(profileBase(), profilePrefix)
@@ -109,9 +108,8 @@ func pinProfileFile(t *testing.T, dir string) (unpin func(), enforced bool) {
 	return unpin, os.Remove(filepath.Join(sub, "Local State")) != nil
 }
 
-// A sweep that cannot finish a removal has to leave the directory marked.
-// RemoveAll keeps going past the file it cannot delete, so it takes creator.pid
-// on the way, and a markerless directory is one every later sweep retains.
+// A sweep that cannot finish a removal leaves the directory marked, so a later
+// sweep collects it once the pin is gone (see removeProfile).
 func TestReapKeepsAFailedRemovalCollectible(t *testing.T) {
 	setProfileBase(t, t.TempDir())
 	dir, err := os.MkdirTemp(profileBase(), profilePrefix)
@@ -183,9 +181,9 @@ func TestRemoveProfileTakesTheMarkerLast(t *testing.T) {
 	}
 }
 
-// The marker goes one syscall before the directory holding it, so a removal that
-// gets that far and then cannot take the directory has to put the marker back:
-// what is left is a directory no later sweep would recognize.
+// The marker goes one syscall before its directory, so a removal that then
+// cannot take the directory has to put the marker back, or no later sweep would
+// collect it.
 func TestRemoveProfileRemarksADirectoryThatOutlivesItsMarker(t *testing.T) {
 	base := t.TempDir()
 	dir, err := os.MkdirTemp(base, profilePrefix)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,17 @@ type Browser struct {
 	conn      *Conn
 	ctx       context.Context
 	contextID string // "" = root browser target; non-empty = an incognito context
+
+	// dispose is shared by every copy of one incognito context. It is nil for
+	// the root.
+	dispose *disposeGuard
+}
+
+// disposeGuard serializes the Closes of one incognito context and records
+// whether one of them disposed it.
+type disposeGuard struct {
+	mu       sync.Mutex
+	disposed bool
 }
 
 // Context returns a shallow copy of the browser that uses ctx for its CDP calls.
@@ -36,15 +48,20 @@ func (b *Browser) Version() (*VersionResult, error) {
 }
 
 // Incognito creates an isolated browser context and returns a Browser copy that
-// shares the connection but is scoped to the new context. Closing that copy
-// disposes only the context.
+// shares the connection but is scoped to the new context; its Context copies
+// share one dispose guard (see Close). A reply without a context id is an
+// error, since a copy without one would be treated as the root.
 func (b *Browser) Incognito() (*Browser, error) {
 	var res createBrowserContextResult
 	if err := b.conn.call(b.ctx, "", "Target.createBrowserContext", nil, &res); err != nil {
 		return nil, err
 	}
+	if res.BrowserContextID == "" {
+		return nil, errors.New("cdp: create browser context returned no id")
+	}
 	cp := *b
 	cp.contextID = res.BrowserContextID
+	cp.dispose = &disposeGuard{}
 	return &cp, nil
 }
 
@@ -74,10 +91,9 @@ func (b *Browser) Page(target TargetCreateTarget) (*Page, error) {
 }
 
 // closeTarget discards a target Page created but could not hand back, so a
-// failed attach or enable does not leave a renderer running for as long as the
-// browser does. It runs on its own short budget rather than b.ctx, because the
-// usual way to get here is b.ctx expiring, and cleaning up after that is the
-// whole point. It is best effort: the failure that brought us here is the one
+// failed attach or enable does not leave a renderer running for the browser's
+// lifetime. It uses its own short budget, not b.ctx, because b.ctx expiring is
+// the usual way to get here. Best effort: the error that led here is the one
 // worth reporting.
 func (b *Browser) closeTarget(id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulCloseTimeout)
@@ -85,9 +101,9 @@ func (b *Browser) closeTarget(id string) {
 	_ = b.conn.call(ctx, "", "Target.closeTarget", closeTargetParams{TargetID: id}, nil)
 }
 
-// GetCookies returns the browser-level cookies for this context (Storage.getCookies
-// scoped by browserContextId; "" is the root context). This stays correct across
-// pooled incognito sessions.
+// GetCookies returns the browser-level cookies of this context via
+// Storage.getCookies scoped by browserContextId ("" is the root context), so
+// each pooled incognito session sees only its own.
 func (b *Browser) GetCookies() ([]*Cookie, error) {
 	var res getCookiesResult
 	if err := b.conn.call(b.ctx, "", "Storage.getCookies", storageGetCookiesParams{BrowserContextID: b.contextID}, &res); err != nil {
@@ -105,16 +121,28 @@ func (b *Browser) PID() int {
 	return b.conn.pid()
 }
 
-// Close tears down the browser. For an incognito context it disposes only that
-// context, leaving the shared process running. For the root it asks Chromium to
-// close, then terminates the process group and closes the pipes. It is
-// idempotent.
+// Close tears down the browser. For an incognito copy it disposes only that
+// context, leaving the shared process running. Closes across the context's
+// copies run one at a time: after a successful dispose the rest return nil
+// without sending, and after a failed one the next Close retries. For the root
+// it asks Chromium to close, kills what is left, closes the pipes, and waits
+// for the reap; it does this once and always returns nil.
 func (b *Browser) Close() error {
 	if b == nil || b.conn == nil {
 		return nil
 	}
 	if b.contextID != "" {
-		return b.conn.call(b.ctx, "", "Target.disposeBrowserContext", disposeBrowserContextParams{BrowserContextID: b.contextID}, nil)
+		g := b.dispose
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.disposed {
+			return nil
+		}
+		err := b.conn.call(b.ctx, "", "Target.disposeBrowserContext", disposeBrowserContextParams{BrowserContextID: b.contextID}, nil)
+		if err == nil {
+			g.disposed = true
+		}
+		return err
 	}
 	b.conn.closeRoot(b.ctx)
 	return nil
@@ -135,16 +163,15 @@ func (c *Conn) closeRoot(ctx context.Context) {
 	})
 }
 
-// waitExited blocks until the reaper has returned from cmd.Wait, and reports
-// whether it did. A Conn with no process returns at once.
+// waitExited blocks until the reaper has returned from cmd.Wait or waitDelay
+// passes, and reports whether the reap happened. A Conn with no process returns
+// true at once.
 //
 // Callers remove the profile directory right after teardown, and Chromium holds
-// its files open until the process object is gone: on Unix that leaves a stray
-// directory, on Windows the remove fails outright. The budget is waitDelay, which
-// is what cmd.Wait may legitimately take after the process itself is gone. No
-// caller context bounds it: the pool's teardown context is the same length and
-// the polite close has already spent part of it, so it could never cover the
-// budget the warning reports, and an expired one would make the wait a no-op.
+// its files open until its process is gone: on Unix that leaves a stray
+// directory, on Windows the remove fails outright. No caller context bounds the
+// wait: the pool's teardown context is only waitDelay long, the polite close
+// has already spent part of it, and an expired one would make the wait a no-op.
 func (c *Conn) waitExited() bool {
 	if c == nil || c.cmd == nil {
 		return true

@@ -1,12 +1,11 @@
 name: Release
 
-# Fires when a version tag is pushed. The normal flow is to write the notes by
-# hand into a draft (`gh release create vX.Y.Z --draft --notes-file ...`), which
-# reserves the tag without creating it, and then publish: publishing is what
-# pushes the tag and triggers this workflow, whose jobs attach the binaries and
-# publish the image, each with a GitHub build provenance attestation. The tag
-# name is passed to make as VERSION, and the Makefile drops its leading `v` for
-# the image tag and the -X main.version stamp (v1.2.3 -> 1.2.3).
+# Fires when a version tag is pushed. Normally a hand-written draft
+# (`gh release create vX.Y.Z --draft --notes-file ...`) reserves the tag without
+# creating it; publishing the draft pushes the tag and triggers this workflow,
+# which attaches the binaries and publishes the image, each with a build
+# provenance attestation. The tag name becomes make's VERSION, and the Makefile
+# drops its leading `v`.
 on:
   push:
     tags:
@@ -23,11 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # CI never sees a tag push, and nothing enforced that a tag sat on main, so a
-  # tag on a stray commit, or one whose provider pin has fallen behind the root,
-  # used to publish binaries and an image regardless. This job is the gate: the
-  # same Makefile targets the local gate runs, so the two cannot drift, plus the
-  # ancestry check. Nothing downstream starts until it is green.
+  # CI never sees a tag push, so this job is the gate: the tag must be on main
+  # and pass the same Makefile targets a local run uses, which keeps the two
+  # from drifting. A tag on a stray commit, or one whose provider pin has fallen
+  # behind the root, stops here before anything publishes.
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -42,9 +40,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # Uncached, for the reason the binaries job is: this workflow publishes,
-          # so nothing restored from an earlier run gets to decide whether a
-          # release goes out. ci.yml caches because it publishes nothing.
+          # Uncached like the binaries job: nothing restored from an earlier run
+          # gets to decide whether a release goes out.
           cache: false
       # HEAD, not the event SHA: an annotated tag points at the tag object, and
       # the checkout has already resolved that to the commit.
@@ -57,15 +54,11 @@ jobs:
       - name: gates
         run: make fmt-check tidy-check vet test consumer-check
 
-  # Build the version-stamped Linux, macOS, and Windows binaries and attach them,
-  # plus a SHA256SUMS manifest, to the release for the tag. Normally the release is
-  # already there, published by hand with written notes, and it keeps its body
-  # and just gains the assets. Only if none exists (a tag pushed straight with
-  # `git push`) is one created here, as a draft with an empty body, so a human
-  # writes the notes and publishes it; this workflow never publishes a release
-  # on its own. The binaries embed the committed JS bundle but need a system
-  # Chromium or Chrome at runtime. RELEASE_PLATFORMS in the Makefile is the list;
-  # the cross job in ci.yml runs the same `make release` on every push.
+  # Build the version-stamped binaries (the Makefile's RELEASE_PLATFORMS) and
+  # attach them, with SHA256SUMS, to the tag's release, which normally already
+  # exists with hand-written notes and keeps them. A tag pushed straight with
+  # `git push` gets an empty draft for a human to write up and publish; this
+  # workflow never publishes a release on its own.
   binaries:
     needs: verify
     runs-on: ubuntu-latest
@@ -98,21 +91,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The create has to be guarded rather than run unconditionally behind
-          # `|| true`. A draft release does not own its tag, so the API accepts
-          # a second draft carrying a tag name another release already uses, and
-          # `gh release create --draft` therefore succeeds against an existing
-          # release instead of failing. Unguarded, it left an empty duplicate
-          # draft beside the real v1.2.0. The pre-1.2.0 spelling of this step
-          # was not --draft, so the create did fail and `|| true` was enough.
-          #
-          # The lookup goes through the releases endpoint rather than `gh
-          # release view`: that endpoint reports drafts as well as published
-          # releases, so a re-run of this job cannot pile a second draft onto one
-          # it created earlier, and --paginate walks the whole list rather than
-          # trusting a page cap to reach far enough back. Nothing here swallows a
-          # failure any more, since a create that fails leaves the upload below
-          # nowhere to put the assets.
+          # A draft does not own its tag, so `gh release create --draft`
+          # succeeds even when another release uses the tag, leaving an empty
+          # duplicate; hence the guard. The lookup avoids `gh release view`: the
+          # releases endpoint lists drafts too, and --paginate reads every page,
+          # so a re-run cannot add a second draft. No `|| true`: a failed create
+          # leaves the upload nowhere to go.
           existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
             --jq '.[] | select(.tag_name == env.GITHUB_REF_NAME) | .id')
           if [ -z "$existing" ]; then
@@ -129,15 +113,10 @@ jobs:
         with:
           subject-path: dist/waxseal-*
 
-  # One per-architecture tag per platform, each built, smoke-tested, and pushed
-  # on its own native runner by `make docker-push-authed`; the `manifest` job
-  # assembles the plain VERSION tag from them. The authed variant exists because
-  # `make docker-push` checks a human's gh OAuth scopes, which the Actions token
-  # cannot pass, so the login happens here instead.
-  #
-  # The smoke test matters here and not only in CI: CI never sees a tag push, and
-  # this build resolves `apt-get install chromium` fresh, so without it a release
-  # could publish an image no workflow ever started.
+  # Each native runner builds, smoke-tests, and pushes its per-arch tag with
+  # `make docker-push-authed`, since the Actions token cannot pass docker-push's
+  # gh OAuth scope check. CI never sees a tag push and this build installs
+  # chromium fresh, so this smoke test is the only proof the image starts.
   image:
     needs: verify
     strategy:
@@ -178,13 +157,10 @@ jobs:
           subject-digest: ${{ steps.pushed.outputs.digest }}
           push-to-registry: true
 
-  # Assemble the plain VERSION tag from the per-arch tags, and move :latest for a
-  # stable release. The prerelease gate lives here because this is the job that
-  # owns :latest: it moves only when the tag's version has no semver prerelease
-  # suffix, so a release candidate such as v1.2.0-rc1 is published under its own
-  # tag but never repoints the public `:latest`. `make docker-manifest` inspects
-  # what it published and fails unless every architecture is present, so a
-  # half-assembled manifest cannot pass as multi-arch.
+  # Assemble the plain VERSION tag from the per-arch tags and, for a stable
+  # release, move :latest. A tag with a semver prerelease suffix (v1.2.0-rc1) is
+  # published under its own tag but never repoints :latest. The make target
+  # fails unless every architecture made it into the manifest.
   manifest:
     needs: image
     runs-on: ubuntu-latest
@@ -210,9 +186,8 @@ jobs:
             *-*) push_latest=0; echo "prerelease $GITHUB_REF_NAME; :latest will not be moved" ;;
             *)   push_latest=1 ;;
           esac
-          # docker-manifest itself would run make's docker-login, which checks a
-          # human's gh OAuth scopes and would reject the Actions token. This job
-          # has already logged in, so it calls the already-authenticated variant.
+          # Already logged in above; docker-manifest's docker-login would reject
+          # the Actions token.
           make docker-manifest-authed VERSION="$GITHUB_REF_NAME" PUSH_LATEST="$push_latest"
       # The attestation names the multi-arch manifest, which is what the VERSION
       # tag and :latest both resolve to, so it lives with the job that assembles

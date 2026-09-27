@@ -3,9 +3,9 @@ package cdp
 import "encoding/json"
 
 // This file holds the CDP request and result structs WaxSeal needs. JSON tags,
-// field order, and omitempty choices intentionally match the generated protocol
-// types used by the previous CDP driver. Golden tests pin the payloads where
-// order affects the browser fingerprint, so do not reorder those structs.
+// field order, and omitempty choices match the previous CDP driver's generated
+// protocol types. Golden tests pin the payloads where order affects the
+// browser fingerprint, so do not reorder those structs.
 
 // VersionResult is the Browser.getVersion result.
 type VersionResult struct {
@@ -89,7 +89,7 @@ type Cookie struct {
 }
 
 // NetworkSetUserAgentOverride is the Network.setUserAgentOverride params. Field
-// order and tags are pinned by a golden; UA-CH metadata fidelity depends on it.
+// order and tags are pinned by TestUACHGolden; UA-CH fidelity depends on them.
 type NetworkSetUserAgentOverride struct {
 	UserAgent         string             `json:"userAgent"`
 	AcceptLanguage    string             `json:"acceptLanguage,omitempty"`
@@ -98,9 +98,8 @@ type NetworkSetUserAgentOverride struct {
 }
 
 // UserAgentMetadata mirrors Emulation.UserAgentMetadata. Platform,
-// PlatformVersion, Architecture, Model, and Mobile deliberately have no omitempty
-// tag: empty Model and PlatformVersion must serialize as "" to preserve the
-// fingerprint.
+// PlatformVersion, Architecture, Model, and Mobile have no omitempty: empty
+// Model and PlatformVersion must serialize as "" to preserve the fingerprint.
 type UserAgentMetadata struct {
 	Brands          []*UserAgentBrandVersion `json:"brands,omitempty"`
 	FullVersionList []*UserAgentBrandVersion `json:"fullVersionList,omitempty"`
@@ -128,9 +127,8 @@ type runtimeEvaluateResult struct {
 	Result remoteObject `json:"result"`
 }
 
-// runtimeCallFunctionOn is the Runtime.callFunctionOn params. TestEvalGolden pins
-// the field order (functionDeclaration, objectId, arguments, returnByValue,
-// awaitPromise); do not reorder.
+// runtimeCallFunctionOn is the Runtime.callFunctionOn params. TestEvalGolden
+// pins the field order; do not reorder.
 type runtimeCallFunctionOn struct {
 	FunctionDeclaration string         `json:"functionDeclaration"`
 	ObjectID            string         `json:"objectId,omitempty"`

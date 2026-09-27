@@ -58,8 +58,8 @@ func TestValidateRejectsBadBase64(t *testing.T) {
 }
 
 // A length-delimited field whose length varint exceeds MaxInt64 must be rejected,
-// not panic. The old signed cast wrapped that varint negative, slipping past the
-// bounds check and reaching make([]byte, length) or a negative slice index.
+// not panic: a signed cast would wrap it negative, letting it pass the bounds
+// check and reach make([]byte, length) or a negative slice index.
 func TestValidateRejectsOverflowLength(t *testing.T) {
 	// 2^63 encoded as a varint: nine 0x80 continuation bytes, then 0x01.
 	overflow := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}

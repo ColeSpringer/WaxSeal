@@ -7,15 +7,14 @@ import (
 	"syscall"
 )
 
-// This file carries the Unix half of profile ownership and browser discovery.
-// The build tag is unix rather than !windows: !windows also selects plan9, js,
-// and wasip1, where syscall.Flock does not exist, and internal/cdp already tags
-// its own platform files the same way.
+// This file carries the Unix half of profile ownership. The build tag is unix
+// rather than !windows: !windows also selects plan9, js, and wasip1, where
+// syscall.Flock does not exist, and internal/cdp tags its platform files the
+// same way.
 
-// holdProfileLock takes an exclusive advisory lock on marker and returns the open
-// file holding it; the caller must keep the file open for as long as the lock is
-// needed and close it (via profileHandle.cleanup) to release it. The bool reports
-// whether the lock was acquired.
+// holdProfileLock takes an exclusive advisory lock on marker and reports
+// whether it succeeded. The returned file holds the lock until the caller
+// closes it through profileHandle.cleanup.
 func holdProfileLock(marker string) (*os.File, bool) {
 	f, err := os.OpenFile(marker, os.O_RDONLY, 0)
 	if err != nil {
@@ -44,10 +43,9 @@ func markerLockable(marker string) bool {
 }
 
 // cleanupProfile removes the profile directory before releasing its advisory
-// lock. That order matters because ReapStaleProfiles runs at daemon startup and
-// can race a different process tearing a profile down. Holding the lock until
-// creator.pid is gone keeps the reaper from acting on a half-removed directory.
-// A flock does not stop the unlink, so removing first is free here.
+// lock, so a ReapStaleProfiles racing in another process never acts on a
+// half-removed directory: the lock is held until creator.pid is gone. A flock
+// does not block the unlink, so removing first costs nothing.
 func cleanupProfile(h profileHandle) {
 	if h.dir != "" {
 		if err := removeProfile(h.dir); err != nil {
@@ -62,8 +60,8 @@ func cleanupProfile(h profileHandle) {
 }
 
 // profileBase returns a $HOME-rooted base dir for the user-data-dir, because
-// snap-confined Chromium cannot open a profile under /tmp. The rule is really a
-// Linux one, but a profile under $HOME is harmless on macOS too.
+// snap-confined Chromium cannot open a profile under /tmp. Snap is Linux-only,
+// but a profile under $HOME is harmless on macOS too.
 func profileBase() string {
 	if h, err := os.UserHomeDir(); err == nil && h != "" {
 		return h

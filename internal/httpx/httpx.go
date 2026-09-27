@@ -3,10 +3,9 @@
 // handling, and response size limits.
 //
 // No pause outlasts the caller's deadline. A backoff that would consume the
-// remaining budget is skipped and the failure that provoked it is returned
-// instead, so the cause reaches the caller rather than a bare context timeout
-// that names nothing. MaxDelay is the absolute cap on a pause; this is the
-// per-request one.
+// remaining budget is skipped and the failure that provoked it is returned, so
+// the caller sees the cause instead of a bare context timeout. MaxDelay is the
+// fixed cap on a pause; the deadline is the per-request one.
 package httpx
 
 import (
@@ -34,9 +33,9 @@ type Client struct {
 	Logger     *slog.Logger
 }
 
-// New wraps hc with default retry and backoff settings. A nil hc uses
-// http.DefaultClient. There is no client-level Timeout (it interacts poorly with
-// multi-attempt retries); callers must drive each request with a bounded context.
+// New wraps hc with default retry and backoff settings; a nil hc uses
+// http.DefaultClient. It adds no client Timeout (that bounds each attempt, not
+// the retry sequence), so callers must bound each request with a context.
 func New(hc *http.Client) *Client {
 	if hc == nil {
 		hc = http.DefaultClient
@@ -58,15 +57,12 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 	)
 	for attempt := range attempts {
 		if err := c.preAttempt(req, attempt, delay); err != nil {
-			// preAttempt returns either an intended cancellation from the backoff wait
-			// or a rewind (GetBody) failure. A cancellation must pass through so the
-			// caller's errors.Is(err, context.Canceled) still holds; a rewind failure
-			// should not mask the original transport error that triggered the retry.
-			//
-			// The wait is not where a deadline strands the cause: pauseBlocked has
-			// already refused any pause the deadline cannot outlast, so the wait ends
-			// early only on cancellation. Deadline handling is kept here for the
-			// degenerate case of a wait that overruns its own budget.
+			// preAttempt fails on a cancellation during the backoff wait or on a
+			// rewind (GetBody) failure. A cancellation passes through so
+			// errors.Is(err, context.Canceled) holds; a rewind failure must not mask
+			// the failure that triggered the retry. pauseBlocked already refused
+			// pauses the deadline cannot outlast, so DeadlineExceeded here only
+			// covers a wait that overran its own budget.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err
 			}
@@ -78,13 +74,14 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			err = keepCause(req.Context(), lastErr, err)
 			lastErr, lastCode = err, 0
-			if !retryableErr(err) || attempt == attempts-1 {
+			if attempt == attempts-1 {
 				return nil, err
 			}
 			delay = c.backoff(attempt)
 			// The deadline would swallow the retry: report the transport error.
-			if berr := pauseBlocked(req.Context(), delay, err); berr != nil {
+			if berr := c.pauseBlocked(req.Context(), delay, err); berr != nil {
 				return nil, berr
 			}
 			c.logRetry(req, attempt, 0, delay, err)
@@ -98,7 +95,7 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 			resp.Body.Close()
 			// A Retry-After the deadline cannot accommodate is reported as the status
 			// it came with, rather than slept into a timeout that hides the throttling.
-			if berr := pauseBlocked(req.Context(), delay, lastErr); berr != nil {
+			if berr := c.pauseBlocked(req.Context(), delay, lastErr); berr != nil {
 				return nil, berr
 			}
 			c.logRetry(req, attempt, resp.StatusCode, delay, nil)
@@ -112,13 +109,14 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 			if errors.Is(readErr, ErrBodyTooLarge) {
 				return nil, readErr // a cap breach won't shrink on retry
 			}
+			readErr = keepCause(req.Context(), lastErr, readErr)
 			lastErr, lastCode = readErr, code
-			if !retryableErr(readErr) || attempt == attempts-1 {
+			if attempt == attempts-1 {
 				return nil, readErr
 			}
 			delay = c.backoff(attempt)
 			// The deadline would swallow the retry: report the read failure.
-			if berr := pauseBlocked(req.Context(), delay, readErr); berr != nil {
+			if berr := c.pauseBlocked(req.Context(), delay, readErr); berr != nil {
 				return nil, berr
 			}
 			c.logRetry(req, attempt, code, delay, readErr)
@@ -148,41 +146,46 @@ func ReadBodyCapped(r io.Reader, maxBody int64) ([]byte, error) {
 	return data, nil
 }
 
-// retryHeadroom is the slack a pause must leave for the attempt it exists to
-// enable. Sleeping down to the wire buys a request that cannot finish, and the
-// deadline then masks the real cause all over again.
-//
-// A second is sized for what this package talks to. Every caller is Google-facing
-// over TLS, so a retry that gets less than that essentially cannot complete, and
-// shrinking the headroom would only trade a typed error for the bare timeout this
-// exists to prevent. It costs those callers nothing, because the budgets it is
-// measured against are whole minutes: the server's 3-minute request timeout, the
-// 120s warm path, the 100s ping path. A local, millisecond-scale endpoint would
-// want a smaller value, but this package serves none.
-//
-// Only a deadline on the request's context counts. The 60s on the browser
-// session's http.Client is a Timeout, which bounds each attempt separately and
-// never reaches req.Context().Deadline(), so nothing here can observe it. Resize
-// against the caller contexts above, not against that.
+// retryHeadroom is the time a pause must leave for the retry it enables. A
+// Google-facing TLS request rarely completes in under a second, and a second
+// is cheap against caller budgets of minutes (the 3-minute request timeout,
+// the 120 s startup warm-up).
 const retryHeadroom = time.Second
 
 // pauseBlocked returns the error to report instead of pausing for d, or nil when
-// the pause may proceed. pending is the failure the caller is already holding,
-// the one that provoked this retry.
+// the pause may proceed. pending is the failure that provoked this retry.
+// Cancellation and deadline come from ctx, never from pending: a per-attempt
+// http.Client.Timeout or dial timeout also matches context.DeadlineExceeded.
+// After such a timeout the deadline must also fit a whole c.HTTP.Timeout,
+// since an endpoint that stalled once likely stalls the retry too.
 //
-// Cancellation outranks pending. A context canceled while a request was failing
-// is a caller giving up, which the CLI maps to exit 130; reporting it as a 502
-// would both misclassify it and lose the interrupt. An expired or too-short
-// deadline is the opposite case, and the one this exists for: pending is exactly
-// what explains that timeout, so it is returned in place of a bare context error.
-func pauseBlocked(ctx context.Context, d time.Duration, pending error) error {
+// Cancellation outranks pending: it is a caller giving up, which the CLI maps
+// to exit 130, and reporting it as a 502 would lose the interrupt. An expired
+// or too-short deadline returns pending, since pending explains the timeout and
+// a bare context error does not.
+func (c *Client) pauseBlocked(ctx context.Context, d time.Duration, pending error) error {
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= d+retryHeadroom {
+	need := d + retryHeadroom
+	if errors.Is(pending, context.DeadlineExceeded) {
+		need += c.HTTP.Timeout
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= need {
 		return pending
 	}
 	return nil
+}
+
+// keepCause returns err, or prev with err wrapped too when err is a retry cut
+// off by the caller's deadline: err then names only the deadline, and prev the
+// failure that forced the retry.
+func keepCause(ctx context.Context, prev, err error) error {
+	if prev == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+		!errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("%w (retry: %w)", prev, err)
 }
 
 func (c *Client) backoff(attempt int) time.Duration {
@@ -198,13 +201,13 @@ func (c *Client) backoff(attempt int) time.Duration {
 	if d > max || d <= 0 {
 		d = max
 	}
-	// Full jitter in [d/2, d]: spreads a thundering herd without starving.
+	// Equal jitter in [d/2, d]: spreads a thundering herd, keeps a d/2 floor.
 	half := d / 2
 	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
-// retryDelay honors Retry-After (delta-seconds or HTTP-date) on 429/503, else
-// falls back to jittered backoff.
+// retryDelay honors Retry-After (delta-seconds or HTTP-date), capped at
+// MaxDelay, else falls back to jittered backoff.
 func (c *Client) retryDelay(resp *http.Response, attempt int) time.Duration {
 	if v := resp.Header.Get("Retry-After"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
@@ -238,9 +241,8 @@ func (c *Client) logRetry(req *http.Request, attempt, status int, delay time.Dur
 		"status", status, "delay", delay, "err", err)
 }
 
-// preAttempt prepares a retry by rewinding the request body and waiting for the
-// backoff period. The first attempt needs no preparation. DoJSON calls it before
-// each attempt.
+// preAttempt rewinds the request body and waits out the backoff before each
+// retry. The first attempt needs neither.
 func (c *Client) preAttempt(req *http.Request, attempt int, delay time.Duration) error {
 	if attempt == 0 {
 		return nil
@@ -282,16 +284,4 @@ func retryableStatus(code int) bool {
 		return true
 	}
 	return false
-}
-
-// retryableErr treats transport-level failures (timeouts, resets, EOF) as
-// retryable; context cancellation is not.
-func retryableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	return true
 }

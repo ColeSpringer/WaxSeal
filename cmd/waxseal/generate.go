@@ -40,11 +40,9 @@ func newGetPotCmd() *cobra.Command {
 	return c
 }
 
-// runGenerate launches a browser, attests, mints one token, and prints JSON on
-// the last stdout line. On failure it prints "{}" to satisfy the bgutil
-// script-provider contract, then returns the error for centralized reporting.
-// One-shot mode launches a fresh browser for every call. Use `waxseal server`
-// for yt-dlp.
+// runGenerate launches a fresh browser, attests, mints one token, and prints
+// JSON on the last stdout line. On failure it prints "{}", as the bgutil
+// script-provider contract requires, and returns the error for renderError.
 func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	if g.contentBinding == "" {
@@ -57,26 +55,22 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		return &usageError{msg: `content-binding "=" is not a binding; "-c=" with no value is read as "=", pass -c <binding>`}
 	}
 	if len(g.contentBinding) > browser.MaxContentBindingBytes {
-		// The bgutil script-provider contract requires {} on stdout for failures.
 		fmt.Fprintln(stdout, "{}")
 		return &usageError{msg: fmt.Sprintf("content-binding too long (max %d bytes)", browser.MaxContentBindingBytes)}
 	}
 	if browser.HasControlChars(g.contentBinding) {
-		// Keep CLI validation aligned with /get_pot and preserve bgutil's
-		// empty-object response for invalid input.
+		// Keep CLI validation aligned with /get_pot.
 		fmt.Fprintln(stdout, "{}")
 		return &usageError{msg: "content-binding must not contain control characters"}
 	}
-	// Preserve bgutil's empty-object failure response for invalid input.
 	if err := validateLandingVideo(g.video); err != nil {
 		fmt.Fprintln(stdout, "{}")
 		return err
 	}
-	// content_binding is opaque, so a URL-shaped value is warned, not rejected.
 	maybeWarnURLBinding(stderr, g.contentBinding)
-	// warn, so a one-shot caller sees the things it should act on: an ignored
-	// WAXSEAL_UA_HINTS, a fallback-only token, the profile reaper. A clean run
-	// still writes nothing to stderr, and stdout stays the token or "{}".
+	// Log at warn so a one-shot caller sees what it should act on (an ignored
+	// WAXSEAL_UA_HINTS, a fallback-only token, the profile reaper) while a
+	// clean run writes nothing to stderr.
 	level := "warn"
 	if g.verbose {
 		level = "info"
@@ -113,11 +107,9 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 }
 
 // maybeWarnURLBinding writes a one-line warning to w when binding looks like a
-// pasted watch URL. content_binding is opaque and may legitimately be arbitrary
-// (for example visitor_data), so a URL is flagged, not rejected. The warning goes
-// to stderr, never stdout, because stdout stays reserved for the bgutil {}/token
-// contract. It bypasses the logger because the CLI defaults to error level, where
-// a logger.Warn would be silent for a normal `waxseal -c <url>`.
+// pasted watch URL. content_binding is opaque (it may be visitor_data), so a
+// URL is flagged, not rejected. Callers pass stderr: stdout is reserved for the
+// bgutil {}/token contract.
 func maybeWarnURLBinding(w io.Writer, binding string) {
 	if msg, warn := browser.URLBindingWarningFor("content-binding", binding); warn {
 		fmt.Fprintln(w, "waxseal: warning: "+msg)

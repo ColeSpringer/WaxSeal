@@ -67,9 +67,8 @@ func newRootCmd() *cobra.Command {
 }
 
 // hardenHelpCompletionExitCodes brings Cobra's generated help and completion
-// commands under the same usage-error policy as the rest of the CLI. Cobra builds
-// them outside our command constructors, so we locate them by name after the
-// default commands are initialized and before wrapUsageErrors runs.
+// commands under the CLI's usage-error policy. Cobra builds them itself, so
+// they are found by name once initialized and before wrapUsageErrors runs.
 func hardenHelpCompletionExitCodes(root *cobra.Command) {
 	for _, c := range root.Commands() {
 		switch c.Name() {

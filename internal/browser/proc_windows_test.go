@@ -8,10 +8,9 @@ import (
 	"testing"
 )
 
-// setProfileBase points profileBase at dir for the duration of the test. On
-// Windows profiles live under the temp directory, which os.TempDir reads from
-// TMP, then TEMP, then USERPROFILE. All three are set so the redirect holds
-// whichever one the runtime reaches for.
+// setProfileBase points profileBase (the temp directory on Windows) at dir for
+// the duration of the test. os.TempDir reads TMP, then TEMP, then USERPROFILE,
+// so all three are set.
 func setProfileBase(t *testing.T, dir string) {
 	t.Helper()
 	t.Setenv("TMP", dir)
@@ -19,10 +18,9 @@ func setProfileBase(t *testing.T, dir string) {
 	t.Setenv("USERPROFILE", dir)
 }
 
-// The Windows lock is an exclusive open, so it has consequences a flock does not:
-// a second open is refused outright, and the file cannot be deleted while the
-// handle lives. cleanupProfile releases before removing because of that second
-// property, and this test is what pins it.
+// The Windows lock is an exclusive open, so unlike a flock it refuses a second
+// open outright and blocks deletion while the handle lives. The second property
+// is why cleanupProfile releases the lock before removing the marker.
 func TestWindowsProfileLockIsAnExclusiveOpen(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), creatorMarkerFile)
 	if err := os.WriteFile(marker, []byte("1"), 0o600); err != nil {
@@ -75,8 +73,8 @@ func TestWindowsCleanupProfileRemovesLockedDirectory(t *testing.T) {
 }
 
 // cleanupProfile can outlive its retry budget when a Chromium handle lingers on
-// a profile file. RemoveAll has deleted creator.pid by then, and the reaper
-// retains a markerless directory, so the marker has to be put back for it.
+// a profile file. It must then leave creator.pid behind, dated abandoned, so
+// the next sweep collects the directory once the handle closes.
 func TestWindowsCleanupProfileLeavesMarkerWhenFilesAreHeld(t *testing.T) {
 	setProfileBase(t, t.TempDir())
 	dir, err := os.MkdirTemp(profileBase(), profilePrefix)

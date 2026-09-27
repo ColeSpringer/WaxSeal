@@ -18,14 +18,10 @@ const (
 	// than the recorded PID, indicates whether the creator is still running.
 	creatorMarkerFile = "creator.pid"
 
-	// markerGrace keeps the reaper off a profile whose marker was written moments
-	// ago. markProfileDir writes the marker and then takes its lock, and in the
-	// instant between the two another process's sweep would see a marked
-	// directory with a free lock and delete a browser that is still starting.
-	// Every command reaps before it launches, so two of them starting together is
-	// the ordinary case rather than a rare one. A marker is written once, at
-	// launch, so a genuinely abandoned profile's is as old as the run that left
-	// it and this costs that profile one sweep at most.
+	// markerGrace keeps the reaper off a freshly written marker: markProfileDir
+	// writes it before taking the lock, and a concurrent sweep (every command
+	// reaps before launching) would delete a browser still starting. Markers
+	// date from launch, so this delays an abandoned profile one sweep at most.
 	markerGrace = 10 * time.Second
 )
 
@@ -34,7 +30,7 @@ const (
 var profileDirPattern = regexp.MustCompile("^" + regexp.QuoteMeta(profilePrefix) + `[0-9]+$`)
 
 // writeMarker records this process's PID in dir's marker file. The PID is for
-// diagnostics only; the advisory lock determines liveness.
+// diagnostics only; the ownership lock determines liveness.
 func writeMarker(dir string) error {
 	return os.WriteFile(filepath.Join(dir, creatorMarkerFile), []byte(strconv.Itoa(os.Getpid())), 0o600)
 }
@@ -52,10 +48,9 @@ func markProfileAbandoned(dir string) error {
 }
 
 // removeProfile removes a profile directory, taking creator.pid last. RemoveAll
-// on the whole directory would keep going past a file it cannot delete and
-// unlink the marker on the way, and a markerless directory is one every later
-// sweep retains rather than collects. Whatever stops the removal, a pinned file
-// or a kill, has to leave a directory the next sweep can still find.
+// on the whole directory would continue past a file it cannot delete and unlink
+// the marker, and every later sweep retains a markerless directory. Whatever
+// stops the removal (a pinned file, a kill) has to leave a marked directory.
 func removeProfile(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -89,12 +84,11 @@ func removeProfile(dir string) error {
 }
 
 // markProfileDir writes the marker and takes its ownership lock, returning the
-// open file that holds the lock (nil if marking or locking failed). The caller
-// owns the returned file and closes it through profileHandle.cleanup, which knows
-// the platform's order relative to removing the directory. A held handle avoids
-// the false liveness results a recorded PID gives under PID reuse and PID
-// namespaces. If marking or locking fails, the marker is removed so the reaper
-// leaves the profile untouched.
+// open file holding the lock. The caller closes it via profileHandle.cleanup,
+// which knows the platform's order relative to removing the directory. A held
+// handle avoids the false liveness results a recorded PID gives under PID reuse
+// and PID namespaces. If marking or locking fails it removes the marker and
+// returns nil, so the reaper leaves the profile alone.
 func markProfileDir(dir string) *os.File {
 	marker := filepath.Join(dir, creatorMarkerFile)
 	if err := writeMarker(dir); err != nil {
@@ -130,12 +124,11 @@ func classifyStaleProfiles(states []profileState, lockable func(marker string) b
 }
 
 // ReapStaleProfiles removes abandoned profile directories created by WaxSeal.
-//
-// A directory is removed only when its name matches profileDirPattern, it contains
-// a creator marker older than markerGrace, and the marker's ownership lock is
-// free. Unmarked directories are left untouched. The lock is an advisory flock on Unix and an exclusive open
-// on Windows; both are released by the kernel on any exit, so neither can leave a
-// stale lock behind. Call ReapStaleProfiles before launching a browser.
+// Call it before launching a browser. A directory is removed only when its name
+// matches profileDirPattern, its creator marker is older than markerGrace, and
+// the marker's ownership lock is free; an unmarked directory is never removed.
+// The kernel releases the lock (a flock on Unix, an exclusive open on Windows)
+// on any exit, so it cannot go stale.
 func ReapStaleProfiles(log *slog.Logger) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)

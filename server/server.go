@@ -1,6 +1,6 @@
-// Package server implements the WaxSeal HTTP service. It exposes the
-// bgutil-compatible /get_pot endpoint and the related player-context, session,
-// health, and metrics endpoints.
+// Package server implements the WaxSeal HTTP service: the bgutil-compatible
+// /get_pot endpoint plus /player-context, /session, /report, /ping, and
+// /metrics.
 package server
 
 import (
@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,11 +34,12 @@ type Config struct {
 	Addr       string            // listen address (default 127.0.0.1:4416)
 	Video      string            // landing video for each tenant session (default a stable id)
 	Headful    bool              // run headful (needs a display/Xvfb)
-	TenantKeys map[string]string // API key to tenant label; nil selects keyless single-tenant mode
+	TenantKeys map[string]string // API key to tenant label; nil selects keyless mode; NewWithContext lists what it rejects
 	Logger     *slog.Logger      // nil discards
 
-	// StreamingMaxAge recycles a session at the next streaming handoff after it
-	// reaches this age. A zero value disables time-based recycling.
+	// StreamingMaxAge recycles a session at its next streaming handoff once it is
+	// older than this age, jittered by up to 10%. A non-positive value disables
+	// time-based recycling.
 	StreamingMaxAge time.Duration
 
 	// ReportDebounce is the refill interval of the report-driven recycle budget:
@@ -45,12 +48,11 @@ type Config struct {
 	// interval. A non-positive value uses minter.DefaultReportDebounce.
 	ReportDebounce time.Duration
 
-	// MintSeparation overrides, for every tenant, the spacing the minter keeps
-	// between an in-page mint and a context establishment, when positive. A
-	// non-positive value leaves each tenant's Minter to resolve its own
-	// env-derived default (WAXSEAL_MINT_SEPARATION, or 12s). There is no flag
-	// for it: the server command resolves the variable itself, so an unparseable
-	// value stops startup, and passes the result here.
+	// MintSeparation, when positive, overrides for every tenant the spacing kept
+	// between an in-page mint and a context establishment. Otherwise each tenant
+	// reads WAXSEAL_MINT_SEPARATION (default 12s), logging and ignoring a value
+	// that is not a positive duration. The server command parses the variable
+	// itself, so a bad value stops startup, and passes the result here.
 	MintSeparation time.Duration
 
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
@@ -59,8 +61,8 @@ type Config struct {
 	MetricsPublic bool
 
 	// MetricsKey is the operator key that unlocks full per-tenant /metrics detail
-	// on keyed daemons. Tenant keys never unlock detail. It is ignored for
-	// keyless daemons.
+	// on keyed daemons; tenant keys never do. It must differ from every tenant key
+	// and is ignored for keyless daemons.
 	MetricsKey string
 }
 
@@ -75,23 +77,23 @@ type Server struct {
 }
 
 // requestProcessTimeout bounds how long one request can hold the per-tenant page
-// mutex. It allows the full cold-start retry sequence while preventing a hung
-// request from holding the mutex indefinitely. It is a var so tests can shorten it
-// to exercise the server-timeout path.
+// mutex: long enough for the full cold-start retry sequence, short enough that
+// a hung request cannot hold it forever. Tests shorten it, so it is a var.
 var requestProcessTimeout = 3 * time.Minute
 
-// New launches the shared Chromium and builds the service with a background
-// launch context, so the version handshake runs to its own timeout whatever the
-// caller is doing.
+// New is NewWithContext with a background context, so the version handshake
+// runs to its own timeout whatever the caller does.
 //
-// Deprecated: use NewWithContext, which can be interrupted. New is kept because
-// it is an exported v1 signature.
+// Deprecated: use NewWithContext, which can be interrupted.
 func New(cfg Config) (*Server, error) { return NewWithContext(context.Background(), cfg) }
 
 // NewWithContext launches the shared Chromium and builds the service. ctx bounds
 // that launch, so a signal during the version handshake stops startup instead of
 // waiting it out. It does not attest until Warm or the first request. Shutdown
-// tears the browser down.
+// tears the browser down. Before anything launches, it rejects a cfg.TenantKeys
+// that is an empty map or holds an empty key or label or a key CheckKeyChars
+// refuses (a label may repeat, so keys can rotate), and a cfg.MetricsKey equal
+// to a tenant key.
 func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 	log := cfg.Logger
 	if log == nil {
@@ -103,8 +105,10 @@ func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Video == "" {
 		cfg.Video = browser.DefaultVideo
 	}
-	// Reject a metrics key that is also a tenant key before launching the browser.
-	// The CLI performs the same check so it can return a usage exit code.
+	if err := checkTenantKeys(cfg.TenantKeys); err != nil {
+		return nil, err
+	}
+	// The CLI makes the same check so it can return a usage exit code.
 	if label, collides := MetricsKeyCollision(cfg.TenantKeys, cfg.MetricsKey); collides {
 		return nil, fmt.Errorf("waxseal: metrics key collides with API key for tenant %q", label)
 	}
@@ -121,8 +125,7 @@ func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce, cfg.MintSeparation),
 		log:           log,
 		metricsPublic: cfg.MetricsPublic,
-		// Hash once at startup. Request handling hashes the presented key and
-		// compares fixed-length digests.
+		// Hash once here; metricsFull compares fixed-length digests.
 		metricsKeyed:   cfg.MetricsKey != "",
 		metricsKeyHash: sha256.Sum256([]byte(cfg.MetricsKey)),
 	}
@@ -130,11 +133,10 @@ func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 	return s, nil
 }
 
-// newHTTPServer builds the daemon's http.Server with timeouts for browser-backed
-// handlers. WriteTimeout must exceed requestProcessTimeout: a cold
-// /player-context request can consume the full handler budget, and net/http
-// applies WriteTimeout across handler execution. Keeping this helper separate lets
-// tests assert the timeout values without launching a browser.
+// newHTTPServer builds the daemon's http.Server. WriteTimeout must exceed
+// requestProcessTimeout because net/http applies it across handler execution
+// and a cold /player-context can use the whole handler budget. It is separate
+// so tests can check the timeouts without launching a browser.
 func newHTTPServer(addr string, h http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
@@ -146,15 +148,13 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
-// routes registers method-specific handlers and path-only 405 fallbacks.
-// ServeMux routes HEAD requests to GET handlers. For /session and /player-context
-// that would run browser-backed work, so explicit HEAD patterns reject them with
-// 405. HEAD /ping and /metrics stay on the GET handlers: /metrics is cheap, and
-// /ping is a bounded probe with no navigation that some balancers issue as HEAD.
-// Their 405 fallbacks therefore name HEAD in Allow as well, since it is served.
-// Add the same HEAD gate for any future browser-backed GET endpoint. Because
-// authentication runs in endpoint handlers, unsupported methods are rejected before
-// tenant lookup.
+// routes registers method-specific handlers and path-only 405 fallbacks, which
+// reject unsupported methods before tenant lookup since auth runs in handlers.
+// ServeMux sends HEAD to GET handlers, so /session and /player-context get
+// explicit HEAD patterns that 405 instead of running browser work; give any new
+// browser-backed GET endpoint the same gate. HEAD /ping and /metrics stay
+// served (/metrics is cheap; /ping is a bounded probe with no navigation, which
+// some balancers send as HEAD), so their fallbacks list HEAD in Allow.
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /get_pot", s.handleGetPot)
@@ -172,12 +172,10 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/report", methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet, http.MethodHead))
-	// ServeMux would otherwise answer unknown paths with plaintext 404s. The "/"
-	// fallback gives canonical unknown paths and trailing-slash mismatches the same
-	// JSON envelope as the rest of the API. More specific patterns, including method
-	// fallbacks, still win. ServeMux cleans non-canonical paths with a 307 redirect
-	// before dispatch. The handler is intentionally pre-auth, so keyed daemons
-	// return 404 for unknown paths.
+	// The "/" catch-all gives unknown paths and trailing-slash mismatches the
+	// API's JSON 404 instead of ServeMux's plaintext one; more specific patterns,
+	// method fallbacks included, still win. Non-canonical paths get ServeMux's
+	// 307 redirect before dispatch.
 	mux.HandleFunc("/", s.handleNotFound)
 	return mux
 }
@@ -204,8 +202,11 @@ func (s *Server) Warm(ctx context.Context, apiKey string) error {
 	return s.tenants.WarmOne(ctx, apiKey)
 }
 
-// SelfTest mints and caches a GVS token for the selected tenant, then attempts a
-// full-length streaming proof. Pass an empty key in keyless mode.
+// SelfTest attests the selected tenant if needed, mints its GVS token only if
+// attestation did not cache one, then attempts a full-length streaming proof.
+// Attestation and persistent mint failures are returned; a failed proof is
+// logged, not returned, and a later /player-context or /session retries it.
+// Pass an empty key in keyless mode.
 func (s *Server) SelfTest(ctx context.Context, apiKey string) error {
 	return s.tenants.SelfTestOne(ctx, apiKey)
 }
@@ -223,10 +224,9 @@ func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
 // Serve accepts HTTP requests on ln and closes the listener before returning.
 func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
 
-// Shutdown drains in-flight requests until ctx is done, then tears down the
-// browser regardless of whether the drain finished. The caller supplies the
-// drain budget through ctx; the waxseal server command bounds it with
-// --shutdown-timeout (default 60s).
+// Shutdown drains in-flight requests until they finish or ctx is done, then
+// tears down the browser either way and returns the drain's error. The waxseal
+// server command bounds ctx with --shutdown-timeout (default 60s).
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.srv.Shutdown(ctx)
 	s.tenants.Close()
@@ -247,10 +247,9 @@ func apiKey(r *http.Request) string {
 }
 
 // bearerKey returns the credentials from an RFC 7235 "Bearer" Authorization
-// header, or "" when the header names another scheme or carries no value. The
-// scheme is matched case insensitively, as RFC 7235 requires, and a header with
-// no usable credentials falls through to the next source rather than resolving to
-// the empty key, which would have 401ed a request whose ?key= was fine.
+// header, matching the scheme case-insensitively as the RFC requires. It
+// returns "" for another scheme or an empty value, so apiKey falls through to
+// ?key= instead of 401ing a request whose ?key= is fine.
 func bearerKey(a string) string {
 	scheme, rest, ok := strings.Cut(a, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {
@@ -299,9 +298,8 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding must not contain control characters")
 		return
 	}
-	// A URL-shaped binding is legitimate for the opaque path (it may be
-	// visitor_data), so it is warned, not rejected. The warning is additive on the
-	// 200 response and never blocks minting.
+	// A URL-shaped binding gets a warning on the 200 response, not a rejection:
+	// the binding is opaque and may be visitor_data.
 	warning, warnURL := browser.URLBindingWarningFor("content_binding", req.ContentBinding)
 	if warnURL {
 		s.log.Warn("content_binding looks like a URL", "tenant", label, "binding_len", len(req.ContentBinding))
@@ -321,9 +319,8 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error(), err)
 		return
 	}
-	// Use the token's real expiry (fixed at attest time, preserved through the
-	// cache) rather than the current time plus lifetime. Otherwise, a cache hit
-	// overstates expiry by the token's age.
+	// Report the token's own expiry (attest time plus lifetime, kept through the
+	// cache), not now plus lifetime, which would overstate a cache hit by its age.
 	expires := res.ExpiresAt
 	if expires.IsZero() {
 		expires = time.Now().Add(6 * time.Hour)
@@ -343,9 +340,8 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePlayerContext returns the attested browser's streaming context for a
-// video_id. The response contains the status-1 SABR URL, player URL, ustreamer
-// config, visitor data, client version, and audio formats. The consumer performs
-// the streaming request.
+// video_id, including the status-1 SABR URL, plus session_generation. The
+// consumer makes the streaming request itself.
 func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
@@ -366,7 +362,7 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case errors.Is(err, browser.ErrUnplayable):
-			// Preserve the playabilityStatus so clients do not need to parse the
+			// Preserve the status so clients do not need to parse the
 			// human-readable error.
 			status := ""
 			if ue, ok := errors.AsType[*browser.UnplayableError](err); ok {
@@ -387,17 +383,15 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	}{pc, gen})
 }
 
-// playerContextVideoID reads video_id from the JSON body or query string. An
-// empty body falls through to the query form. The function writes an error
-// response and returns false when the input is missing or malformed.
+// playerContextVideoID reads video_id from the JSON body, or from the query
+// string when the body is empty or omits it. It writes a 400 and returns false
+// when the input is missing or malformed.
 func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var req struct {
 		VideoID string `json:"video_id"`
 	}
-	// Lenient: video_id may instead arrive via the query string, and the
-	// required-field check below already turns a typo'd body key into a clear
-	// "video_id is required", so a body-or-query request need not be rejected over
-	// an unmodeled field.
+	// Lenient: video_id may come from the query instead, and a typo'd body key
+	// with no query fallback already fails the required check below.
 	if !decodeJSONBody(w, r, &req, true, false) {
 		return "", false
 	}
@@ -419,9 +413,9 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 	return req.VideoID, true
 }
 
-// normalizeScope canonicalizes the cache scope for /get_pot. It trims whitespace
-// and accepts names case-insensitively. Empty scope and "pot" map to the generic
-// scope. The content_binding, not the scope, determines the token type.
+// normalizeScope canonicalizes the /get_pot cache scope, ignoring case and
+// surrounding space; "" means the generic "pot". The content_binding, not the
+// scope, determines the token type.
 func normalizeScope(raw string) (string, bool) {
 	switch s := strings.ToLower(strings.TrimSpace(raw)); s {
 	case "", "pot":
@@ -433,11 +427,9 @@ func normalizeScope(raw string) (string, bool) {
 	}
 }
 
-// strictPing reports whether ?strict asks /ping to map probe failures to HTTP
-// 503, and whether the value parsed. A bare ?strict enables it. An unparseable
-// value is rejected rather than silently disabling the mode, so a typo in a
-// liveness probe fails loudly instead of quietly losing the behaviour.
-// Healthy sessions and no-session responses stay 200.
+// strictPing reports whether ?strict asks /ping for 503 on probe-failed, and
+// whether the value parsed. A bare ?strict enables it. An unparseable value is
+// an error, not a silent false, so a typo in a liveness probe fails loudly.
 func strictPing(r *http.Request) (strict, ok bool) {
 	q := r.URL.Query()
 	if !q.Has("strict") {
@@ -461,29 +453,21 @@ const strictPingUsage = `strict must be a boolean ("true", "false", "1", "0"), a
 // The pool has already replaced it by the time the probe reports.
 var errBrowserTornDown = errors.New("the shared browser missed two probes and was torn down and relaunched")
 
-// handlePing is the health probe. It never attests or mints. Its scope depends
-// on the key: a tenant key, or no key on a keyless daemon, probes that
-// tenant's session; no key on a keyed daemon probes the shared browser (see
-// handleDaemonPing). A tenant probe whose page did not answer is followed by
-// the browser check as well, so a wedged Chromium is found and replaced by the
-// probe rather than by the next request stalling on it.
+// handlePing is the health probe; it never attests or mints. A tenant key, or
+// no key on a keyless daemon, probes that tenant's session; no key on a keyed
+// daemon probes the shared browser (see handleDaemonPing). A tenant probe whose
+// page did not answer runs the browser check too, so a wedged Chromium is
+// replaced by the probe instead of stalling the next request.
 //
-// The body reports health directly rather than through the error envelope,
-// with an always-present reason. no-session and busy are benign windows;
-// probe-failed means this probe confirmed a loss, a session retired or a browser
-// torn down or unreplaceable, and is the only reason ?strict=true maps to 503.
-// A probe runs on the raw request context: every step is bounded on its own
-// (four session round trips of pingProbeTimeout, a session teardown, two
-// browser round trips, a browser teardown, and a launch handshake), so the only
-// early exit is the caller leaving, which writes nothing.
+// The body is a health report, not the error envelope, and always carries a
+// reason (the PingReason values). The probe runs on the raw request context
+// because every step bounds itself (four session round trips of
+// pingProbeTimeout, a session teardown, two browser round trips, a browser
+// teardown, and a launch handshake), so only the caller leaving ends it early,
+// and that writes nothing.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
-	// A keyed daemon answers a probe that presents no key at daemon scope: the
-	// shared browser's liveness, which belongs to no tenant. That is what the
-	// image's HEALTHCHECK sends, and it mirrors /metrics, which serves a keyed
-	// daemon's redacted aggregate without a key. A key that is present is always
-	// resolved, so a typo in a probe still fails it with 401 instead of hiding
-	// behind the daemon-level answer. A keyless daemon has one tenant, which the
-	// empty key selects, so it keeps the tenant-level probe.
+	// The image's HEALTHCHECK sends no key, so it lands here on a keyed daemon. A
+	// present key is always resolved, so a typo in a probe still fails with 401.
 	if s.tenants.Keyed() && apiKey(r) == "" {
 		s.handleDaemonPing(w, r)
 		return
@@ -492,10 +476,8 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Validate before probing, so an unparseable value is reported whatever the
-	// session's health is. /ping otherwise bypasses the error envelope, but a
-	// rejected parameter is the same class of failure the other handlers report,
-	// so it gets the same shape.
+	// Validate before probing, so a bad value is reported whatever the session's
+	// health. A rejected parameter gets the error envelope like any other 400.
 	strict, ok := strictPing(r)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
@@ -509,25 +491,21 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		}
 		reason = tenantPingReason(err)
 		s.logPing(reason, err, "tenant", label)
-		// No page answered, whichever the reason, and the browser itself may be
-		// what hung: a retired page, a page in use, and no page at all look the
-		// same from a wedged Chromium, and the next request would stall on it for
-		// its whole budget before the pool noticed. So the browser check follows.
-		// A browser that answers leaves the tenant reason standing: the page's
-		// failure was the page's own, or contention, which is what busy means. A
-		// page that answered has already proved the browser, which is why the
-		// healthy path never gets here.
+		// Every reason escalates, since a retired page, a busy one, and none at
+		// all look the same from a wedged Chromium. A browser that answers leaves
+		// the tenant reason standing: the failure was the page's own, or
+		// contention. The healthy path skips this because a page that answered has
+		// proved the browser.
 		reason, err, relaunched = s.checkBrowser(r.Context(), reason, err, "tenant", label)
 		if s.pingAbandoned(r, "tenant", label) {
 			return
 		}
 	}
-	// Browser proof describes playback in the daemon. A consumer report can still
-	// mark the session suspect after a successful proof. /ping deliberately omits
-	// guest identity data. navigator_webdriver remains because it is a
-	// browser-detection health signal. In failure responses these values are
-	// zero-valued, except generation, which carries the last-known generation so
-	// /ping stays consistent with /metrics.
+	// No guest identity here; navigator_webdriver stays as a detection health
+	// signal. Browser proof describes playback in the daemon, and a consumer
+	// report can still mark a proven session suspect. On failure the snapshot
+	// fields are zero except generation, the last-known one as in /metrics,
+	// unless the probe was busy: that carries the live session's values.
 	writePing(w, strict, reason, err, map[string]any{
 		"ok":                         live,
 		"probe":                      PingProbeTenant,
@@ -544,15 +522,13 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDaemonPing answers a keyless probe on a keyed daemon with the shared
-// browser's health. The body carries only whether the daemon has a running
-// browser and, if not, why, plus keyed, which says nothing a probe:"daemon"
-// answer does not already say. That is less than the redacted /metrics already
-// serves anyone. There is no loopback gate: an orchestrator's probe arrives
-// from the node, not loopback, and a port published through Docker's proxy
-// arrives from the bridge address, so the source address says nothing about
-// who is asking. A caller cannot make a healthy browser fail the check, so the
-// teardown and relaunch it can lead to happen only to a browser that is wedged
-// or gone, and the pool single-flights and backs off relaunches on its own.
+// browser's health. The body says only whether a browser is running and, if
+// not, why (keyed adds nothing a probe:"daemon" body does not imply), which is
+// less than the redacted /metrics serves anyone. There is no loopback gate: an
+// orchestrator probes from the node and Docker's port proxy from the bridge
+// address, so the source address identifies no one. A caller cannot make a
+// healthy browser fail, so a probe's teardown and relaunch hit only a wedged or
+// dead browser, and the pool single-flights and backs off relaunches.
 func (s *Server) handleDaemonPing(w http.ResponseWriter, r *http.Request) {
 	strict, ok := strictPing(r)
 	if !ok {
@@ -580,26 +556,23 @@ func tenantPingReason(err error) string {
 		// lazily creates a replacement. Treat that gap as expected.
 		return PingReasonNoSession
 	case errors.Is(err, minter.ErrProbeBusy):
-		// A confirmed probe failure that could not take the page from a running
-		// request. It says as much about contention as about the browser, and
-		// nothing was retired, so it stays 200 under strict for the same reason
-		// no-session does: three of these must not mark a healthy container
-		// unhealthy. The next probe re-checks once the request finishes.
+		// A confirmed failure that could not take the page from a running
+		// request. Nothing was retired and it says as much about contention as
+		// about the browser, so it stays 200 under strict: three in a row must not
+		// mark a healthy container unhealthy.
 		return PingReasonBusy
 	}
 	return PingReasonProbeFailed
 }
 
-// checkBrowser runs the browser check and folds its outcome into a probe's
-// reason and error so far (a tenant probe's, or ok and nil for a daemon-level
-// probe). A browser that answered leaves them. One that had exited and was
-// relaunched leaves them too and reports the relaunch, since the death was
-// already handled and the daemon has a browser again. One this probe found
-// wedged, or one that could not be replaced, is a loss this probe found: the
-// reason becomes probe-failed, logged at warn with the browser named so the loss
-// is not read as one tenant's, and the error says what happened to the browser
-// after whatever the tenant probe said. Cancellation is returned as is, unlogged,
-// for the caller's abandoned-request check.
+// checkBrowser runs the browser check and folds its outcome into the probe's
+// reason and error so far (a tenant probe's, or ok and nil at daemon level). A
+// browser that answered leaves them, and so does one that had exited and was
+// relaunched, since the daemon has a browser again; the relaunch is reported.
+// One this probe found wedged, or could not replace, is a loss: the reason
+// becomes probe-failed, logged at warn naming the browser so it is not read as
+// one tenant's, and the browser's error is appended to any tenant probe error.
+// Cancellation is returned as is, unlogged, for the abandoned-request check.
 func (s *Server) checkBrowser(ctx context.Context, reason string, err error, attrs ...any) (string, error, bool) {
 	rec, berr := s.tenants.BrowserHealth(ctx)
 	if ctx.Err() != nil {
@@ -622,9 +595,8 @@ func (s *Server) checkBrowser(ctx context.Context, reason string, err error, att
 }
 
 // pingAbandoned reports whether the caller has gone away, logging it at debug.
-// A probe runs on the raw request context, so a disconnect is the only way it
-// ends early, and nothing is written for one: the response would go nowhere,
-// and a disconnect is not a server condition.
+// Nothing is written for one: the response would go nowhere, and a disconnect
+// is not a server condition.
 func (s *Server) pingAbandoned(r *http.Request, attrs ...any) bool {
 	if !clientGone(r) {
 		return false
@@ -645,11 +617,9 @@ func (s *Server) logPing(reason string, err error, attrs ...any) {
 	}
 }
 
-// writePing writes a health body. The status comes from the same predicate the
-// CLI reads (healthy is ok, or a benign reason), so the strict policy lives in
-// one place: 503 only for a failed probe whose reason is not benign, and only
-// when asked. /ping bypasses the error envelope, so the error text gets the same
-// prefix stripping and clamp.
+// writePing writes a health body. Under strict, a failed probe whose reason is
+// not benign (see BenignPingReason) gets 503; everything else is 200. The body
+// skips the error envelope, so presentErr strips and clamps its error here.
 func writePing(w http.ResponseWriter, strict bool, reason string, err error, body map[string]any) {
 	status := http.StatusOK
 	if strict && err != nil && !BenignPingReason(reason) {
@@ -662,9 +632,8 @@ func writePing(w http.ResponseWriter, strict bool, reason string, err error, bod
 	writeJSON(w, status, body)
 }
 
-// TokenResponse is the /get_pot response. Warning is omitted unless the daemon
-// has something to say about the binding, which is the conditional key the map
-// literal this replaced produced.
+// TokenResponse is the /get_pot response. ExpiresAt is RFC 3339 in UTC. Warning
+// is omitted unless the daemon has something to say about the binding.
 type TokenResponse struct {
 	POToken        string `json:"poToken"`
 	ContentBinding string `json:"contentBinding"`
@@ -684,8 +653,7 @@ type ReportResponse struct {
 }
 
 // SessionResponse is the /session response. It is exported, with SessionCookie,
-// so the README block stays a checkable contract (TestSessionShapeContract) and
-// so a reader of the wire format has one place to look.
+// so the README block stays a checkable contract (TestSessionShapeContract).
 type SessionResponse struct {
 	VisitorData       string          `json:"visitor_data"`
 	UserAgent         string          `json:"user_agent"`
@@ -771,11 +739,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // characters.
 var reportReasonRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// handleReport accepts a consumer's report that a prior session produced a
-// degraded stream. The body names the session_generation returned by
-// /player-context or /session. Reports are scoped and rate-limited per tenant.
-// Consumers must inspect the accepted response field to learn whether the report
-// applied to the current session.
+// handleReport accepts a consumer's report that the session_generation it got
+// from /player-context or /session produced a degraded stream. Reports are
+// scoped and rate-limited per tenant. A valid report always gets 200; accepted
+// says whether it applied to the current session.
 func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
@@ -850,27 +817,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// clientGone reports whether the caller disconnected or its request context timed
-// out. Browser-backed endpoints derive their work context from r.Context() with
-// WithTimeout, so a nil r.Context().Err() means the server's own timeout fired.
+// clientGone reports whether the caller disconnected or its request context
+// timed out. Browser-backed handlers derive their work context from it, so a
+// failed work context with clientGone false means the server's timeout fired.
 func clientGone(r *http.Request) bool { return r.Context().Err() != nil }
 
-// writeCtxErr handles the two request-lifecycle outcomes shared by the
-// browser-backed endpoints (/get_pot, /player-context, /session) when their
-// operation returns an error. ctx must be the handler's derived
-// WithTimeout(r.Context(), requestProcessTimeout) context. It returns true when it
-// wrote (or deliberately suppressed) the response, so the caller should return;
-// false means the error is operation-specific and the caller maps it.
-//
-//   - If the caller disconnected, log and write nothing. The response would go
-//     nowhere, and the disconnect is not a server failure.
-//   - If requestProcessTimeout fired while the caller stayed connected, write a
-//     504 timeout response.
-//
-// Gating the 504 on ctx.Err(), not on errors.Is(err, context.DeadlineExceeded),
-// keeps a shorter inner browser deadline (a ~45s nav or ~25s player-load stall)
-// classified as an upstream failure rather than a request timeout, because such an
-// inner deadline does not exhaust the outer request budget.
+// writeCtxErr handles the request-lifecycle outcomes of a failed browser-backed
+// operation and reports whether it did; on false the caller maps the error. ctx
+// must be the handler's WithTimeout(r.Context(), requestProcessTimeout). A
+// departed caller gets nothing written (see pingAbandoned); a fired
+// requestProcessTimeout gets a 504. It tests ctx.Err(), not the error, since a
+// shorter inner browser deadline (a ~45s nav or ~25s player-load stall) can
+// also yield DeadlineExceeded but is an upstream failure.
 func (s *Server) writeCtxErr(w http.ResponseWriter, r *http.Request, ctx context.Context, label string) bool {
 	if clientGone(r) {
 		s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
@@ -893,10 +851,11 @@ const (
 	CodeInvalidRequest = "invalid-request"
 	// CodeMintFailed indicates that the daemon could not mint a token.
 	CodeMintFailed = "mint-failed"
-	// CodeVideoUnavailable indicates a terminal playabilityStatus.
+	// CodeVideoUnavailable indicates a terminal playabilityStatus or an on-air
+	// broadcast; details carries the status or "LIVE_BROADCAST".
 	CodeVideoUnavailable = "video-unavailable"
-	// CodeTimeout indicates that a browser-backed operation's deadline elapsed
-	// (player-context, mint, or session).
+	// CodeTimeout indicates that a browser-backed request (player-context, mint,
+	// or session) used up the daemon's per-request time budget.
 	CodeTimeout = "timeout"
 	// CodePlayerContextFailed indicates a non-terminal player-context failure.
 	CodePlayerContextFailed = "player-context-failed"
@@ -922,7 +881,8 @@ const (
 // carries exactly one of these, and only PingReasonProbeFailed maps to 503 under
 // ?strict=true.
 const (
-	// PingReasonOK means a live session answered the probe.
+	// PingReasonOK means a live session answered the probe, or at daemon level
+	// that a browser is running.
 	PingReasonOK = "ok"
 	// PingReasonNoSession means no session is attested: a report retires one and
 	// re-establishment is lazy. Benign.
@@ -937,12 +897,11 @@ const (
 	PingReasonProbeFailed = "probe-failed"
 )
 
-// BenignPingReason reports whether a not-ok /ping reason describes a state that
-// is expected on a working daemon. /ping keeps these at HTTP 200 even under
-// ?strict=true, and `waxseal ping --strict` calls this rather than keeping its
-// own list, because --strict deliberately does not trust the status code alone: a
-// pre-strict daemon answers a real probe failure with 200. One definition means a
-// liveness probe and the daemon cannot disagree about what counts as unhealthy.
+// BenignPingReason reports whether a not-ok /ping reason is expected on a
+// working daemon. /ping keeps these at 200 even under ?strict=true, and
+// `waxseal ping --strict` calls this rather than keeping its own list, so the
+// two cannot disagree; the CLI reads the reason because a pre-strict daemon
+// answers a real probe failure with 200.
 func BenignPingReason(reason string) bool {
 	return reason == PingReasonNoSession || reason == PingReasonBusy
 }
@@ -957,24 +916,21 @@ type errEnvelope struct {
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
-// maxErrTextBytes bounds each error-envelope text field. err.Error() can include
-// multi-KiB CDP/V8 stack traces; if an envelope crosses the client's 64 KiB read
-// cap, the client may fail to parse Code and Details. Every error envelope is
-// built through writeErrEnvelope, so clamping there covers future endpoints too.
-// JSON escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields
-// still fit comfortably under the client cap.
+// maxErrTextBytes bounds each error-envelope text field. err.Error() can carry
+// multi-KiB CDP/V8 stack traces, and an envelope past the client's 64 KiB read
+// cap can lose Code and Details. Even with JSON escaping at six bytes per byte
+// (\u00XX), two clamped fields fit under that cap.
 const maxErrTextBytes = 4 << 10
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeErrDetails(w, status, code, msg, "")
 }
 
-// writeRefusal is writeErr for a refusal the daemon expects to lift on its own:
-// a cool-down after a failed proof or a bot check, or the shared browser's
-// relaunch backoff. The minter states the wait on the error, and it goes out both
-// ways, since a generic HTTP client reads the header and a JSON consumer reads
-// the field. An error carrying no wait writes neither. /report keeps its own
-// writer: it answers 200, not a refusal.
+// writeRefusal is writeErr for a refusal the daemon expects to lift on its own
+// (a proof or bot-check cool-down, or the shared browser's relaunch backoff).
+// The minter's wait on err goes out as both Retry-After, for generic HTTP
+// clients, and retry_after_seconds, for JSON consumers; no wait sets neither.
+// /report sets its own: it answers 200, not a refusal.
 func writeRefusal(w http.ResponseWriter, status int, code, msg string, err error) {
 	secs := 0
 	if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
@@ -985,8 +941,8 @@ func writeRefusal(w http.ResponseWriter, status int, code, msg string, err error
 }
 
 // clampErrText caps s at maxErrTextBytes and appends a marker. It may split a
-// UTF-8 sequence; json.Marshal replaces invalid bytes with U+FFFD, so the envelope
-// stays valid JSON.
+// UTF-8 sequence; encoding/json replaces invalid bytes with U+FFFD, so the
+// envelope stays valid JSON.
 func clampErrText(s string) string {
 	if len(s) <= maxErrTextBytes {
 		return s
@@ -994,10 +950,9 @@ func clampErrText(s string) string {
 	return s[:maxErrTextBytes] + "... [truncated]"
 }
 
-// presentErr removes the internal "waxseal: " prefix that package errors carry,
-// matching the CLI's renderError, and then clamps. Direct HTTP/provider consumers
-// should not see internal package noise. ReplaceAll also handles embedded
-// prefixes, so "mint failed: waxseal: ..." becomes "mint failed: ...".
+// presentErr strips the internal "waxseal: " prefix of package errors, as the
+// CLI's renderError does, embedded copies included ("mint failed: waxseal: x"
+// becomes "mint failed: x"), then clamps.
 func presentErr(s string) string { return clampErrText(strings.ReplaceAll(s, "waxseal: ", "")) }
 
 // decodeErrMsg returns a stable client-facing message for a JSON decoding error
@@ -1036,10 +991,10 @@ func decodeErrMsg(err error) string {
 	return "request body contains invalid JSON"
 }
 
-// decodeJSONBody decodes exactly one JSON object from r.Body and limits the body
-// to 1 MiB. It writes an invalid-request response on failure. When allowEmpty
-// is true, an empty body is accepted so the caller can use another input source.
-// When strictFields is true, unknown fields are rejected (see below).
+// decodeJSONBody decodes exactly one JSON object of at most 1 MiB from r.Body
+// into dst, or writes a 400 invalid-request and returns false. allowEmpty
+// accepts an empty body so the caller can use another input source;
+// strictFields rejects unknown fields (see below).
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty, strictFields bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	var raw json.RawMessage
@@ -1051,26 +1006,22 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, decodeErrMsg(err))
 		return false
 	}
-	// null would decode into dst as a no-op and read as a missing field; a
-	// number, array, or string as a type error. One message covers all four.
-	// Decode yields the value's own bytes, so there is no surrounding space to
-	// trim; the length check guards the index, not whitespace.
+	// null would decode into dst as a no-op and read as a missing field, and a
+	// number, array, or string as a type error; one message covers all four.
+	// Decode yields the value without surrounding space, so the length check
+	// only guards the index.
 	if len(raw) == 0 || raw[0] != '{' {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "request body must be a JSON object")
 		return false
 	}
-	// strictFields rejects unknown fields so a client typo fails with a 400 instead
-	// of being silently dropped. Only /report enables it, because its optional
-	// fields (video_id, reason) would otherwise swallow a typo'd key with no error.
-	// /get_pot stays lenient: it is the bgutil-compatible endpoint for generic
-	// yt-dlp, whose client POSTs extra fields (proxy, bypass_cache, source_address,
-	// and others) that must be ignored. /player-context stays lenient too. Its one
-	// field is required, so a typo already shows up as "video_id is required", and
-	// leniency keeps the body-or-query fallback working.
+	// Only /report is strict: a typo'd key beside its optional fields (video_id,
+	// reason) would otherwise vanish. /get_pot stays lenient for bgutil and
+	// yt-dlp interop, since yt-dlp POSTs extra fields (proxy, bypass_cache,
+	// source_address, ...). /player-context stays lenient because its one field
+	// is required, so a typo already fails, and leniency keeps the query fallback.
 	if strictFields {
-		// encoding/json matches field names case-insensitively, so
-		// DisallowUnknownFields lets REASON through. The keys are checked
-		// against the struct's tags exactly instead.
+		// encoding/json matches names case-insensitively, so DisallowUnknownFields
+		// would let REASON through; unknownField matches keys to tags exactly.
 		if msg, ok := unknownField(raw, dst); ok {
 			writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
 			return false
@@ -1102,7 +1053,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 func unknownField(raw json.RawMessage, dst any) (string, bool) {
 	var keys map[string]json.RawMessage
 	if json.Unmarshal(raw, &keys) != nil {
-		return "", false // the typed decode below reports the syntax error
+		return "", false // decodeJSONBody's typed decode reports the syntax error
 	}
 	allowed := jsonFieldNames(reflect.TypeOf(dst))
 	// The lexicographically smallest unknown key, so a body carrying several
@@ -1122,11 +1073,10 @@ func unknownField(raw json.RawMessage, dst any) (string, bool) {
 	return fmt.Sprintf("request body contains unknown field %q", first), true
 }
 
-// jsonFieldNames returns the JSON names dst's struct accepts. An untagged
-// embedded struct contributes the fields encoding/json promotes out of it,
-// rather than its Go type name. A non-struct returns nothing, so a call site
-// that passes one rejects every key rather than panicking here or silently
-// dropping the strictness it asked for.
+// jsonFieldNames returns the JSON names the struct type t accepts. An untagged
+// embedded struct contributes its promoted fields, not its type name. A
+// non-struct yields an empty set, so a caller that passes one rejects every key
+// instead of panicking or silently losing the strictness it asked for.
 func jsonFieldNames(t reflect.Type) map[string]bool {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -1172,9 +1122,36 @@ func writeErrEnvelope(w http.ResponseWriter, status int, env errEnvelope) {
 	writeJSON(w, status, env)
 }
 
+// checkTenantKeys enforces NewWithContext's TenantKeys rules, which a
+// caller-built map needs because it skips ParseTenantKeys: an empty map would
+// read as keyless, and an empty key would match a request that sends none.
+// Errors name labels, never keys.
+func checkTenantKeys(keys map[string]string) error {
+	if keys == nil {
+		return nil
+	}
+	if len(keys) == 0 {
+		return errors.New("waxseal: empty TenantKeys map; pass nil to run keyless")
+	}
+	// Sorted so the same entry is named on every run.
+	for _, key := range slices.Sorted(maps.Keys(keys)) {
+		label := keys[key]
+		switch {
+		case strings.TrimSpace(label) == "":
+			return errors.New("waxseal: TenantKeys entry has an empty label")
+		case key == "":
+			return fmt.Errorf("waxseal: TenantKeys entry for tenant %q has an empty key", label)
+		}
+		if err := CheckKeyChars(key); err != nil {
+			return fmt.Errorf("waxseal: TenantKeys entry for tenant %q: %w", label, err)
+		}
+	}
+	return nil
+}
+
 // MetricsKeyCollision reports the tenant label that shares an API key with
-// metricsKey, if one exists. An empty metricsKey never collides. New and the CLI
-// both call this helper before accepting a metrics key.
+// metricsKey, if one exists. An empty metricsKey never collides. NewWithContext
+// and the waxseal server command both call it before accepting a metrics key.
 func MetricsKeyCollision(tenantKeys map[string]string, metricsKey string) (label string, collides bool) {
 	if metricsKey == "" {
 		return "", false
@@ -1183,13 +1160,12 @@ func MetricsKeyCollision(tenantKeys map[string]string, metricsKey string) (label
 	return label, collides
 }
 
-// CheckKeyChars rejects a key that carries whitespace or a character that does
-// not print. Such a key is always an accident of parsing (a newline from a
-// file, a pasted space, a zero-width space or byte-order mark carried out of a
-// web page) and would match nothing a client sends. IsPrint is what covers the
-// invisible ones: unicode.IsControl sees only C0 and C1, not the format
-// characters an editor or a copy-paste leaves behind. The message never
-// includes the key.
+// CheckKeyChars rejects a key containing whitespace or a character that does
+// not print. Such a key is a parsing accident (a newline from a file, a pasted
+// space, a zero-width space or byte-order mark from a web page) and would match
+// nothing a client sends. It tests unicode.IsPrint because IsControl sees only
+// C0 and C1, not the invisible format characters. The error never includes the
+// key.
 func CheckKeyChars(key string) error {
 	if strings.ContainsFunc(key, func(r rune) bool { return unicode.IsSpace(r) || !unicode.IsPrint(r) }) {
 		return errors.New("key contains whitespace or a character that does not print")
@@ -1197,22 +1173,22 @@ func CheckKeyChars(key string) error {
 	return nil
 }
 
-// ParseTenantKeys parses label=key entries and bare API keys into a map from API
-// key to tenant label. Entries are separated by commas or newlines, so a key
-// file can hold one per line. Bare keys receive generated labels and must not
-// contain "="; a base64 key with padding needs a label. Empty input selects
-// keyless single-tenant mode.
+// ParseTenantKeys parses label=key entries and bare API keys, separated by
+// commas or newlines, into a map from API key to tenant label. Bare keys get
+// generated labels (t1, t2, ...) that avoid explicit ones, and must not contain
+// "=", so a padded base64 key needs a label. Blank input returns nil, which
+// selects keyless single-tenant mode; other input with no entry, such as a
+// lone comma, is an error.
 //
-// Empty or duplicate keys and labels are rejected, as is a key carrying
-// whitespace. Generated labels do not collide with explicit labels, and errors
-// never include API keys.
+// Empty or duplicate keys and labels are rejected, as is a key CheckKeyChars
+// refuses. Errors never include API keys.
 func ParseTenantKeys(s string) (map[string]string, error) {
 	s = strings.TrimSpace(s)
-	// An editor's UTF-8 BOM would otherwise become part of the first label.
-	s = strings.TrimSpace(strings.TrimPrefix(s, "\ufeff"))
 	if s == "" {
 		return nil, nil
 	}
+	// An editor's UTF-8 BOM would otherwise become part of the first label.
+	s = strings.TrimSpace(strings.TrimPrefix(s, "\ufeff"))
 	out := map[string]string{} // API key -> tenant label
 	labels := map[string]bool{}
 	var bareKeys []string
@@ -1234,10 +1210,9 @@ func ParseTenantKeys(s string) (map[string]string, error) {
 			bareKeys = append(bareKeys, pair)
 			continue
 		}
-		// "alice=" and "Zm9vYmE=" look the same here: a label with no key, or
-		// a bare key with base64 padding. Neither is guessed at, and the
-		// message names the entry by position because either reading may be a
-		// key.
+		// "alice=" and "Zm9vYmE=" look the same here: a label with no key, or a
+		// padded bare key. Neither is guessed at, and the message names the entry
+		// by position because either reading may be a key.
 		if strings.Trim(after, "=") == "" {
 			return nil, fmt.Errorf("tenant entry %d is a label with an empty key, or a bare key ending in \"=\"; write it as label=key", entry)
 		}
@@ -1269,7 +1244,7 @@ func ParseTenantKeys(s string) (map[string]string, error) {
 		n++
 	}
 	if len(out) == 0 {
-		return nil, errors.New("--tenant-keys contains no API keys")
+		return nil, errors.New("tenant keys contain no entries")
 	}
 	return out, nil
 }

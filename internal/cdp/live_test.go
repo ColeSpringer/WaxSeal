@@ -17,22 +17,18 @@ import (
 	"github.com/colespringer/waxseal/internal/chromepath"
 )
 
-// These live tests exercise the pipe transport against a real Chromium. They
-// verify remote-debugging-pipe through local launcher wrappers, eval context
-// recovery after navigation, the Accept-Language override, connection teardown
-// after process death, command-pipe EOF shutdown, incognito isolation, WaitCrash,
-// and handshake-timeout cleanup.
-// They skip when Chromium is unavailable so the offline suite remains portable.
+// These live tests run the pipe transport against the host's installed
+// Chromium, so the pipe fds must survive wrapper chains such as snap's. They
+// skip without Chromium so the offline suite stays portable.
 
 func findChrome(t *testing.T) string {
 	t.Helper()
 	if b, ok := chromepath.Detect(); ok {
 		return b
 	}
-	// WAXSEAL_REQUIRE_CHROME turns a missing browser into a hard failure. CI sets
-	// it (=1) on the -tags live step so pipe-transport coverage is lost loudly, not
-	// silently, if the runner image ever stops shipping Chromium. It is parsed as a
-	// bool, so an explicit =0/=false (or unset) still skips gracefully.
+	// WAXSEAL_REQUIRE_CHROME, parsed as a bool, turns a missing browser into a
+	// failure. CI sets it on the -tags live step so a runner image that stops
+	// shipping Chromium cannot silently drop pipe-transport coverage.
 	if require, _ := strconv.ParseBool(os.Getenv("WAXSEAL_REQUIRE_CHROME")); require {
 		t.Fatalf("no chromium found and WAXSEAL_REQUIRE_CHROME is set; install Chromium or set WAXSEAL_CHROME_BIN")
 	}
@@ -42,7 +38,7 @@ func findChrome(t *testing.T) string {
 
 // homeTmp returns a base directory for the test profile. On Unix it is rooted at
 // $HOME because snap-confined Chromium cannot open a profile under /tmp; Windows
-// has no such confinement, so the ordinary temp dir is the better neighbour.
+// has no such confinement and uses the ordinary temp dir.
 func homeTmp(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -148,7 +144,7 @@ func TestLiveSigkillSelfHeal(t *testing.T) {
 		t.Fatal("connection did not tear down within 2s after SIGKILL (pipe did not EOF)")
 	}
 
-	// A pending Call now fails promptly rather than hanging.
+	// A call now fails promptly rather than hanging.
 	ectx, ecancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer ecancel()
 	if _, err := page.Context(ectx).Eval(`() => 1`); err == nil {
@@ -163,7 +159,7 @@ func TestLivePipeEOFTerminatesChrome(t *testing.T) {
 		t.Fatalf("process not alive before pipe close (pid=%d)", pid)
 	}
 
-	// Close only the command pipe (child fd 3). Chromium should read EOF and exit.
+	// Close only the command pipe. Chromium should read EOF and exit.
 	_ = b.conn.wpipe.Close()
 
 	deadline := time.Now().Add(8 * time.Second)
@@ -206,13 +202,11 @@ func TestLiveNavigateWaitLoadEval(t *testing.T) {
 	}
 }
 
-// The Accept-Language override is what makes the bot wall's phrase deterministic
-// whatever the host's locale, so the mechanism is proved against a real browser
-// rather than assumed. The override takes Chrome's pref-style list: Chrome
-// derives the header from it, appending its own q-values, and mirrors the raw
-// list into navigator.languages. A value carrying q-values of its own would ship
-// a malformed header and an anomalous language list, which is why the exact
-// bytes are asserted here.
+// The Accept-Language override makes the bot wall's phrase independent of the
+// host's locale, so it is proved against a real browser. It takes Chrome's
+// pref-style list: Chrome appends its own q-values to derive the header and
+// copies the raw list into navigator.languages, so a value with q-values of its
+// own would ship a malformed header and an anomalous language list.
 func TestLiveAcceptLanguageOverride(t *testing.T) {
 	b := spawnForTest(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

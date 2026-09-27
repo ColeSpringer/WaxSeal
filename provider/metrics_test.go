@@ -16,17 +16,13 @@ import (
 
 // The /metrics helpers live in this untagged file, with their tests, so the
 // browser-free, network-free tests run under plain `go test` and in CI. The e2e
-// suite in e2e_test.go shares them.
+// suite shares them.
 
-// metricsSnapshot is one /metrics scrape reduced to the numbers the suite reads.
-// counters holds the process-lifetime counters, summed across tenants when the
-// daemon returned per-tenant detail. detailed records which shape came back:
-// per-tenant detail carries state such as generation, the redacted aggregate
-// carries lifetime counters only.
-//
-// generation is read separately from the counters and only when the scrape
-// described exactly one tenant. Summing it is meaningless (a two-tenant sum
-// moves when either tenant relaunches), and it is not a lifetime counter.
+// metricsSnapshot is one /metrics scrape reduced to the numbers the suite
+// reads. counters holds the lifetime counters, summed across tenants. detailed
+// is true for per-tenant detail and false for the redacted aggregate.
+// generation is known only when the scrape described exactly one tenant: it is
+// state, not a counter, and a sum over tenants names no session.
 type metricsSnapshot struct {
 	counters        map[string]int64
 	detailed        bool
@@ -36,11 +32,10 @@ type metricsSnapshot struct {
 
 // readMetrics scrapes /metrics once and reads whichever shape the daemon
 // returns. A keyed daemon redacts /metrics to summed lifetime counters unless
-// the caller holds the operator --metrics-key; a tenant key does not unlock the
-// detail (server.metricsFull says so explicitly), so an external keyed daemon,
-// which is the WAXSEAL_URL plus WAXSEAL_KEY workflow the README recommends,
-// normally answers redacted and has no per_tenant map at all. The key is still
-// sent, because it does unlock detail when the operator points WAXSEAL_KEY at
+// the caller holds the operator --metrics-key; a tenant key never unlocks
+// detail (see server.metricsFull). So an external keyed daemon, the README's
+// WAXSEAL_URL plus WAXSEAL_KEY workflow, normally answers redacted with no
+// per_tenant map. The key is still sent: it unlocks detail when WAXSEAL_KEY is
 // the metrics key.
 func readMetrics(t *testing.T, base string) metricsSnapshot {
 	t.Helper()
@@ -52,10 +47,9 @@ func readMetrics(t *testing.T, base string) metricsSnapshot {
 }
 
 // fetchMetrics is readMetrics without the fatal, so its failures are testable.
-// The daemon says which shape it sent: the redacted body carries "redacted":
-// true, and only that body is read as the aggregate. A non-redacted body with
-// no tenants is an error in its own right (the daemon has served nobody yet),
-// not a redaction, so it is not mistaken for one.
+// Only a body carrying "redacted": true is read as the aggregate. A
+// non-redacted body with no tenants (the daemon has served nobody yet) is an
+// error, not a redaction.
 func fetchMetrics(base, key string) (metricsSnapshot, error) {
 	req, err := http.NewRequest(http.MethodGet, base+"/metrics", nil)
 	if err != nil {
@@ -108,7 +102,7 @@ func fetchMetrics(base, key string) (metricsSnapshot, error) {
 		}
 	}
 	// One tenant is the cold daemon this suite starts, and the only shape in
-	// which a generation names a session rather than an arithmetic accident.
+	// which a generation names a session.
 	if len(body.PerTenant) == 1 {
 		for _, per := range body.PerTenant {
 			out.generation, out.generationKnown = metricInt(per["generation"])
@@ -131,10 +125,9 @@ func metricInt(v any) (int64, bool) {
 	return n, true
 }
 
-// counter reads one lifetime counter. A counter that neither shape carries is a
-// hard failure, not a zero: a silent zero compares equal to the zero read before
-// it, which turns a before-and-after assertion into a no-op that passes on every
-// run.
+// counter reads one lifetime counter. A counter neither shape carries fails the
+// test instead of reading as zero, since two silent zeros compare equal and
+// turn a before-and-after assertion into a no-op.
 func (m metricsSnapshot) counter(t *testing.T, name string) int64 {
 	t.Helper()
 	v, err := m.lookup(name)
@@ -164,25 +157,13 @@ func playerContexts(t *testing.T, base string) int64 {
 	return readMetrics(t, base).counter(t, "player_contexts")
 }
 
-// escalationMetrics contains the counters used together to detect an unnecessary
-// relaunch. The counters are summed across tenants, so the test does not depend
-// on the cold daemon's tenant label; the generation is not, because a sum of
-// generations describes no session. GenerationKnown is false when the scrape
-// could not name one tenant's generation: a redacted aggregate drops per-tenant
-// state, and several tenants leave no single generation to read. Attestations
-// rises on the same relaunch and survives both, so the check does not go blind.
-//
-// Everything here comes from one /metrics scrape. /ping would name the probed
-// tenant directly, but it is not an observer: it can retire a session and
-// relaunch the browser, which is the very thing these numbers are watching for,
-// and it answers 401 to the operator metrics key that readMetrics documents as
-// a supported way to reach the detail.
-//
-// Attestations and Generation are the relaunch detectors. Escalations is
-// narrower: it counts a request abandoning a generation it was still using, and
-// a request handed the replacement after somebody else retired its generation
-// relaunches without one. Reading it alone as "the ladder relaunched" would
-// under-report.
+// escalationMetrics holds the counters used together to detect an unnecessary
+// relaunch. GenerationKnown is false when the scrape named no single tenant's
+// generation (redacted, or several tenants); Attestations rises on the same
+// relaunch and survives both. Escalations alone under-reports: it misses a
+// request handed the replacement after another retired its generation. /ping
+// would name the tenant, but it is not an observer: it can retire a session and
+// relaunch the browser, and it answers 401 to the operator metrics key.
 type escalationMetrics struct {
 	Generation            int64
 	GenerationKnown       bool
@@ -205,9 +186,9 @@ func readEscalationMetrics(t *testing.T, base string) escalationMetrics {
 }
 
 // TestMetricsHelperReadsBothShapes pins the helper against both /metrics bodies
-// without a browser or the network. The bug it replaces decoded only per_tenant,
-// so a keyed daemon's redacted aggregate yielded a nil map and a silent zero,
-// and a zero read before compares equal to a zero read after.
+// without a browser or the network. Decoding only per_tenant would read a keyed
+// daemon's redacted aggregate as silent zeros, which compare equal before and
+// after.
 func TestMetricsHelperReadsBothShapes(t *testing.T) {
 	var body string
 	var gotKey string
@@ -280,7 +261,7 @@ func TestMetricsHelperRejectsWrongShapes(t *testing.T) {
 	if _, err := fetchMetrics(srv.URL, ""); err == nil || !strings.Contains(err.Error(), "no tenants") {
 		t.Errorf("tenant-less: err = %v, want one saying no tenants", err)
 	}
-	// The redacted body is recognised by its flag, not by an empty per_tenant.
+	// The redacted body is recognized by its flag, not by an empty per_tenant.
 	status, body = http.StatusOK, `{"redacted":true,"aggregate":{"player_contexts":3}}`
 	m, err := fetchMetrics(srv.URL, "")
 	if err != nil || m.detailed {
@@ -291,8 +272,8 @@ func TestMetricsHelperRejectsWrongShapes(t *testing.T) {
 	}
 }
 
-// TestMetricsHelperFailsOnMissingCounter pins that an absent counter stops the
-// test rather than reading as zero, which is the whole defect being fixed here.
+// TestMetricsHelperFailsOnMissingCounter pins that an absent counter is an
+// error rather than a zero.
 func TestMetricsHelperFailsOnMissingCounter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

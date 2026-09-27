@@ -218,9 +218,8 @@ func TestPoolRelaunchDisposesStaleOnce(t *testing.T) {
 	}
 }
 
-// A caller waiting on someone else's relaunch leaves when its own budget is
-// gone. Without that, a request whose deadline had already passed would sit
-// through a launch handshake before failing anyway, holding a page and a
+// A caller waiting on someone else's relaunch leaves when its own context ends,
+// rather than sitting through a launch handshake while holding a page and a
 // connection it can no longer use.
 func TestPoolRelaunchWaitHonoursTheCallersContext(t *testing.T) {
 	stale := &browserInstance{}
@@ -244,10 +243,10 @@ func TestPoolRelaunchWaitHonoursTheCallersContext(t *testing.T) {
 	select {
 	case err := <-second:
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("relaunch with a cancelled context = %v, want context.Canceled", err)
+			t.Errorf("relaunch with a canceled context = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("a cancelled caller waited on the in-flight relaunch")
+		t.Fatal("a canceled caller waited on the in-flight relaunch")
 	}
 
 	close(release)
@@ -350,9 +349,9 @@ func TestPoolHealthAlive(t *testing.T) {
 	wantCounts(t, p, 0, 0)
 }
 
-// A connection Chromium has torn down is a known death: no confirmation, no
-// teardown of our own, and a replacement is launched so the probe answers for a
-// browser that is running rather than for one that used to.
+// A closed connection is a known death: Health launches a replacement at once,
+// with no confirmation and no teardown of its own, so a healthy answer means a
+// browser is running.
 func TestPoolHealthExitedBrowserIsRelaunched(t *testing.T) {
 	var torn, pings int64
 	inst := &browserInstance{onTeardown: func() { atomic.AddInt64(&torn, 1) }}
@@ -491,9 +490,8 @@ func TestPoolHealthTransientFailureRecovers(t *testing.T) {
 	wantCounts(t, p, 0, 0)
 }
 
-// Two missed round trips mean the browser is wedged. It is torn down, the loss
-// is counted, and a replacement is launched, so the next request finds a
-// browser instead of stalling on the wedged one for its whole budget.
+// Two missed round trips mean the browser is wedged: Health tears it down,
+// counts the loss, and launches a replacement.
 func TestPoolHealthConfirmedFailureTearsDownAndRelaunches(t *testing.T) {
 	var torn, pings int64
 	inst := &browserInstance{onTeardown: func() { atomic.AddInt64(&torn, 1) }}
@@ -571,7 +569,7 @@ func TestPoolHealthConcurrentConfirmationsActOnce(t *testing.T) {
 
 // A caller that goes away mid-probe learns nothing about the browser. Health
 // returns the context error and neither confirms, tears down, nor launches.
-func TestPoolHealthCancelledContextDoesNotAct(t *testing.T) {
+func TestPoolHealthCanceledContextDoesNotAct(t *testing.T) {
 	for _, cancelOn := range []int64{1, 2} {
 		t.Run(fmt.Sprintf("cancel on probe %d", cancelOn), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())

@@ -57,12 +57,11 @@ func (e *EvalError) Error() string {
 	return fmt.Sprintf("cdp: eval exception: %s", e.Text)
 }
 
-// Eval runs js as a function applied to args on the page's window. It awaits
-// promises and returns results by value, using the Runtime.callFunctionOn JSON
-// shape pinned by TestEvalGolden. Args are CDP-serialized values and are never
-// embedded in the source. JavaScript exceptions return *EvalError and are not
-// retried. Context-loss RPC errors clear the cached window object id, back off,
-// and resolve it again.
+// Eval runs js as a function applied to args on the page's window, awaiting
+// promises and returning the result by value (TestEvalGolden pins the request).
+// Args are CDP-serialized, never embedded in the source. A JavaScript exception
+// returns *EvalError; a context-loss RPC error clears the cached window object
+// id and retries after a backoff.
 func (p *Page) Eval(js string, args ...any) (EvalResult, error) {
 	callArgs, err := buildArgs(args)
 	if err != nil {
@@ -126,10 +125,9 @@ func (p *Page) handleContextLoss(err error, backoff *time.Duration) (retry bool,
 	}
 }
 
-// contextLostMessages are the RPC error messages that mean the execution context
-// for the cached window object id is gone and the eval should be re-resolved.
-// Matched as substrings to tolerate trailing punctuation differences across Chrome
-// versions.
+// contextLostMessages are the RPC errors meaning the cached window object id's
+// execution context is gone and the id must be resolved again. They match as
+// substrings because trailing punctuation varies across Chrome versions.
 var contextLostMessages = []string{
 	"Execution context was destroyed",
 	"Cannot find context with specified id",
@@ -183,9 +181,9 @@ func (p *Page) windowObjectID() (string, error) {
 		return id, nil
 	}
 
-	// Resolve outside the lock so a slow or stalled CDP call cannot block a
-	// concurrent clear() or Eval. Two concurrent resolves are harmless (both yield a valid
-	// window id); they converge on one stored value below.
+	// Resolve outside the lock so a stalled CDP call cannot block a concurrent
+	// clear or Eval. Two concurrent resolves both get a valid id and converge
+	// on the first one stored.
 	var res runtimeEvaluateResult
 	if err := p.conn.call(p.ctx, p.sessionID, "Runtime.evaluate", runtimeEvaluateParams{Expression: "window"}, &res); err != nil {
 		return "", err

@@ -50,15 +50,11 @@ const (
 	// reportDebounceWarn marks values that make report-driven recycling infrequent.
 	reportDebounceWarn = time.Hour
 
-	// defaultShutdownTimeout bounds the drain on SIGTERM or SIGINT. It is sized to
-	// the work a real request does, not to requestProcessTimeout: cold
-	// /player-context calls measure 6 to 10 seconds and first-session establishment
-	// is documented as typically under ten seconds, so this covers both with real
-	// headroom.
-	// Matching the 3 minute request timeout instead would make `docker compose down`
-	// hang that long against a wedged daemon, since stop_grace_period has to match.
-	// A request still running after a minute is pathological: it is severed, logged,
-	// and the daemon still exits 0. Operators who need longer set --shutdown-timeout.
+	// defaultShutdownTimeout bounds the drain on SIGTERM or SIGINT. A cold
+	// /player-context takes 6 to 10 s and a first session usually under 10 s,
+	// so a request past a minute is pathological. Sizing it to the 3 minute
+	// requestProcessTimeout would force a matching stop_grace_period and hang
+	// `docker compose down` that long on a wedged daemon.
 	defaultShutdownTimeout = 60 * time.Second
 )
 
@@ -68,10 +64,10 @@ func newServerCmd() *cobra.Command {
 		Use:   "server",
 		Short: "Run the bgutil-compatible HTTP daemon",
 		Long: "Run the HTTP daemon over a real headless Chromium. It defaults to loopback\n" +
-			"at 127.0.0.1:4416. Set --host 0.0.0.0 to expose it. With --tenant-keys,\n" +
-			"each key receives an isolated browser context. Without it, the server is\n" +
-			"keyless. On SIGTERM or SIGINT it drains in-flight requests for up to\n" +
-			"--shutdown-timeout (default 60s) before tearing the browser down.\n\n" +
+			"at 127.0.0.1:4416. Set --host 0.0.0.0 to expose it. With tenant keys (see\n" +
+			"--tenant-keys), each key receives an isolated browser context; without\n" +
+			"them, the server is keyless. On SIGTERM or SIGINT it drains in-flight requests\n" +
+			"for up to --shutdown-timeout (default 60s) before tearing the browser down.\n\n" +
 			"Three settings are read from the environment only:\n" +
 			"  WAXSEAL_MINT_SEPARATION  spacing kept between a token mint and a context\n" +
 			"                           establishment; a positive Go duration, default 12s\n" +
@@ -112,13 +108,13 @@ func newServerCmd() *cobra.Command {
 			"the daemon still exits 0.", defaultShutdownTimeout))
 	f.BoolVar(&o.metricsPublic, "metrics-public", false,
 		"serve full per-tenant /metrics detail (tenant labels + activity) to\n"+
-			"unauthenticated scrapes on a keyed daemon. Ignored without\n"+
-			"--tenant-keys because keyless daemons already serve full detail.")
+			"unauthenticated scrapes on a keyed daemon. Ignored without tenant keys\n"+
+			"because keyless daemons already serve full detail.")
 	f.StringVar(&o.metricsKey, "metrics-key", "",
 		"operator key that unlocks full per-tenant /metrics detail on a keyed daemon.\n"+
 			"Without it (or --metrics-public), a keyed daemon serves unauthenticated\n"+
 			"scrapes a redacted, label-free aggregate. Must differ from every tenant\n"+
-			"key. Ignored without --tenant-keys, though a source that cannot be read is\n"+
+			"key. Ignored without tenant keys, though a source that cannot be read is\n"+
 			"still a usage error. Also reachable through --metrics-key-file,\n"+
 			"WAXSEAL_METRICS_KEY, and WAXSEAL_METRICS_KEY_FILE; flags outrank envs.")
 	f.StringVar(&o.metricsKeyFile, "metrics-key-file", "",
@@ -144,7 +140,6 @@ func resolveStreamingMaxAge(cmd *cobra.Command, o *serverOpts, logger *slog.Logg
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		// Preserve usageError as the top-level type so this maps to exit code 2.
 		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: %v (use a Go duration like 45m, or 0 to disable)", raw, err)}
 	}
 	if d < 0 {
@@ -198,10 +193,9 @@ func resolveReportDebounce(cmd *cobra.Command, o *serverOpts, logger *slog.Logge
 	return d, nil
 }
 
-// resolveShutdownTimeout applies flag, environment, and default precedence. The
-// result bounds the SIGTERM/SIGINT drain; a non-positive value would either
-// abandon in-flight requests immediately or make shutdown wait forever, so
-// both are rejected the same as an unparseable duration.
+// resolveShutdownTimeout applies flag, environment, and default precedence. A
+// non-positive value is a usage error, like an unparseable one: as a drain
+// budget it would mean either severing requests at once or waiting forever.
 func resolveShutdownTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logger) (time.Duration, error) {
 	raw := defaultShutdownTimeout.String()
 	if v, ok := os.LookupEnv("WAXSEAL_SHUTDOWN_TIMEOUT"); ok {
@@ -254,39 +248,42 @@ type keySource struct {
 	value, file         string
 }
 
-// resolveKeyMaterial applies flag, environment, and default precedence the way
-// the duration options do, with one addition: within a tier, a value and a file
-// both carrying something is a usage error rather than a silent winner, since
-// the two say different things and the daemon would end up keyed by something
-// the operator did not choose. Nothing it returns as an error carries key
-// material.
-func resolveKeyMaterial(cmd *cobra.Command, src keySource) (string, error) {
+// resolveKeyMaterial applies flag, environment, and default precedence like the
+// duration options, except that a value and a file in the same tier are a usage
+// error rather than a silent winner, which could key the daemon with something
+// the operator did not choose. It also returns the flag or variable that
+// supplied the value ("" if none did), so a later refusal can name it. No error
+// it returns carries key material.
+func resolveKeyMaterial(cmd *cobra.Command, src keySource) (value, from string, err error) {
 	valueSet, fileSet := cmd.Flags().Changed(src.valueFlag), cmd.Flags().Changed(src.fileFlag)
 	switch {
 	case valueSet && fileSet:
-		return "", &usageError{msg: fmt.Sprintf("--%s and --%s are mutually exclusive; pass one", src.valueFlag, src.fileFlag)}
+		return "", "", &usageError{msg: fmt.Sprintf("--%s and --%s are mutually exclusive; pass one", src.valueFlag, src.fileFlag)}
 	case valueSet:
 		// A flag the operator typed is a choice, so a blank one is refused
 		// rather than falling through to the environment it was meant to override.
 		v := strings.TrimSpace(src.value)
 		if v == "" {
-			return "", &usageError{msg: fmt.Sprintf("--%s is empty: pass a value, or omit the flag", src.valueFlag)}
+			return "", "", &usageError{msg: fmt.Sprintf("--%s is empty: pass a value, or omit the flag", src.valueFlag)}
 		}
-		return v, nil
+		return v, "--" + src.valueFlag, nil
 	case fileSet:
-		return readKeyFile("--"+src.fileFlag, src.file)
+		from = "--" + src.fileFlag
+		value, err = readKeyFile(from, src.file)
+		return value, from, err
 	}
 	envValue, hasValue := lookupNonEmpty(src.valueEnv)
 	envFile, hasFile := lookupNonEmpty(src.fileEnv)
 	switch {
 	case hasValue && hasFile:
-		return "", &usageError{msg: fmt.Sprintf("%s and %s are mutually exclusive; set one", src.valueEnv, src.fileEnv)}
+		return "", "", &usageError{msg: fmt.Sprintf("%s and %s are mutually exclusive; set one", src.valueEnv, src.fileEnv)}
 	case hasValue:
-		return envValue, nil
+		return envValue, src.valueEnv, nil
 	case hasFile:
-		return readKeyFile(src.fileEnv, envFile)
+		value, err = readKeyFile(src.fileEnv, envFile)
+		return value, src.fileEnv, err
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // lookupNonEmpty reads an environment variable, reporting false when it is
@@ -302,13 +299,11 @@ func lookupNonEmpty(name string) (string, bool) {
 	return "", false
 }
 
-// readKeyFile reads one secret from path. source names the flag or environment
-// variable that pointed here, so a failure says which one to fix. The file is
-// taken whole with surrounding whitespace and a leading byte-order mark removed,
-// since a secrets file usually ends in a newline and an editor may have put a
-// BOM at the front; either one left in place yields a key that matches nothing
-// and says nothing about why. An empty file is a usage error rather than a
-// keyless daemon the operator did not ask for.
+// readKeyFile reads one secret from path; source names the flag or environment
+// variable that pointed here, so a failure says which to fix. Surrounding
+// whitespace and a leading byte-order mark are stripped: a trailing newline or
+// an editor's BOM would otherwise yield a key that silently matches nothing. An
+// empty file is a usage error, not a keyless daemon.
 func readKeyFile(source, path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -323,9 +318,8 @@ func readKeyFile(source, path string) (string, error) {
 	return v, nil
 }
 
-// unbracketHost removes one pair of surrounding brackets. This allows --host to
-// accept IPv6 literals in bare or bracketed form before passing them to
-// net.JoinHostPort or net.ParseIP.
+// unbracketHost removes one pair of surrounding brackets, so --host accepts an
+// IPv6 literal bare or bracketed without net.JoinHostPort doubling them.
 func unbracketHost(host string) string {
 	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
 		return host[1 : len(host)-1]
@@ -368,7 +362,7 @@ func logMetricsAccess(logger *slog.Logger, keyed, metricsPublic, metricsKeySet b
 	switch {
 	case !keyed:
 		if metricsPublic || metricsKeySet {
-			logger.Warn("--metrics-public/--metrics-key are ignored without --tenant-keys; a keyless daemon already serves full /metrics detail")
+			logger.Warn("--metrics-public/--metrics-key are ignored without tenant keys; a keyless daemon already serves full /metrics detail")
 		}
 	case metricsPublic:
 		if metricsKeySet {
@@ -427,7 +421,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, err)
 	}
-	tenantKeys, err := resolveKeyMaterial(cmd, keySource{
+	tenantKeys, tenantKeysFrom, err := resolveKeyMaterial(cmd, keySource{
 		valueFlag: "tenant-keys", fileFlag: "tenant-keys-file",
 		valueEnv: "WAXSEAL_TENANT_KEYS", fileEnv: "WAXSEAL_TENANT_KEYS_FILE",
 		value: o.tenantKeys, file: o.tenantKeysFile,
@@ -435,7 +429,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, err)
 	}
-	metricsKey, err := resolveKeyMaterial(cmd, keySource{
+	metricsKey, _, err := resolveKeyMaterial(cmd, keySource{
 		valueFlag: "metrics-key", fileFlag: "metrics-key-file",
 		valueEnv: "WAXSEAL_METRICS_KEY", fileEnv: "WAXSEAL_METRICS_KEY_FILE",
 		value: o.metricsKey, file: o.metricsKeyFile,
@@ -445,7 +439,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	}
 	keys, err := server.ParseTenantKeys(tenantKeys)
 	if err != nil {
-		return failStartup(logger, &usageError{msg: err.Error()})
+		return failStartup(logger, &usageError{msg: tenantKeysFrom + ": " + err.Error()})
 	}
 	if metricsKey != "" {
 		if err := server.CheckKeyChars(metricsKey); err != nil {
@@ -465,8 +459,8 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	ln, err := bindListener(o.host, o.port)
 	if err != nil {
 		// A backstop: validatePort above already refused a bad port, so this only
-		// fires if that check ever moves. Without it the exit code would quietly
-		// drop from 2 to 1.
+		// fires if that check ever moves, and then logs the refusal as invalid
+		// configuration rather than a bind failure.
 		if ue, ok := errors.AsType[*usageError](err); ok {
 			return failStartup(logger, ue)
 		}
@@ -564,11 +558,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 			return err
 		}
 	}
-	// A second signal during the drain cuts it short: the drain context is
-	// cancelled, Shutdown returns, and the browser is torn down at once. This
-	// registers before the first handler is released, so a signal arriving
-	// between the two is caught by one of them rather than killing the process
-	// through the default disposition.
+	// A second signal cancels the drain context, so Shutdown returns and the
+	// browser is torn down at once. It is registered before the first handler
+	// is released, so a signal between the two is caught instead of killing
+	// the process through the default disposition.
 	sigCtx, stopSecond := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSecond()
 	stop() // the first signal is consumed; the drain's own handler owns the rest
@@ -580,12 +573,8 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	case err == nil:
 	case sigCtx.Err() != nil && errors.Is(err, context.Canceled):
 		logger.Warn("second signal received; in-flight requests were severed")
-	// The browser and its profile are torn down by Shutdown regardless of the
-	// drain result, so a drain budget that simply ran out is routine: it is a
-	// warning about severed connections, not a failed stop. Any other error
-	// means the stop itself failed, and is returned so the existing exit-code
-	// mapping reports a real failure instead of every busy shutdown logging as
-	// a routine warning.
+	// An expired drain budget only severed requests (see shutdownOutcome); any
+	// other error is a failed stop and is returned.
 	case shutdownOutcome(err):
 		logger.Warn("drain budget expired; in-flight requests were severed", "err", err, "drain_timeout", drainTimeout)
 	default:
@@ -596,12 +585,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	return nil
 }
 
-// shutdownOutcome classifies the error srv.Shutdown returned. A nil error or a
-// context.DeadlineExceeded (wrapped or bare) means the drain budget simply ran
-// out: routine reports true, since the browser and its profile are torn down
-// by Shutdown regardless of the drain result and only in-flight requests were
-// severed. Any other error means the stop itself failed, so routine reports
-// false and the caller returns the error instead of warning past it.
+// shutdownOutcome reports whether srv.Shutdown's error is routine: nil, or a
+// DeadlineExceeded (wrapped or bare) from a drain budget that ran out. Shutdown
+// tears the browser and its profile down either way, so an expired budget only
+// severed in-flight requests. Any other error means the stop itself failed.
 func shutdownOutcome(err error) (routine bool) {
 	return err == nil || errors.Is(err, context.DeadlineExceeded)
 }

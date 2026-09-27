@@ -56,8 +56,8 @@ func TestParseBGChallengeMissingFields(t *testing.T) {
 
 func TestGetChallengeWiresResolution(t *testing.T) {
 	// att/get returns a valid bgChallenge whose interpreter host is outside the
-	// allowlist, so resolution rejects it before any network call. This verifies
-	// This covers fetch, parse, and ResolveInterpreter without contacting that host.
+	// allowlist, so resolution rejects it before any network call. This covers
+	// fetch, parse, and ResolveInterpreter without contacting that host.
 	var gotBody map[string]json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
@@ -95,6 +95,22 @@ func TestGetChallengeBadJSON(t *testing.T) {
 	}
 }
 
+func TestGetChallengeServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	defer swap(&attGetURL, srv.URL)()
+
+	c := httpx.New(srv.Client())
+	c.MaxRetries = 0 // skip the 5xx retry backoff
+	_, err := GetChallenge(context.Background(), c, "UA/1.0", nil)
+	se, ok := errors.AsType[*botguard.StageError](err)
+	if !ok || se.Stage != botguard.StageTransport {
+		t.Fatalf("want StageTransport error, got %v", err)
+	}
+}
+
 func TestGetChallengePassesInnertubeContext(t *testing.T) {
 	custom := json.RawMessage(`{"client":{"clientName":"WEB","clientVersion":"9.9"}}`)
 	var gotCtx json.RawMessage
@@ -112,65 +128,6 @@ func TestGetChallengePassesInnertubeContext(t *testing.T) {
 	_, _ = GetChallenge(context.Background(), httpx.New(srv.Client()), "UA/1.0", custom)
 	if string(gotCtx) != string(custom) {
 		t.Fatalf("context not passed through: got %s", gotCtx)
-	}
-}
-
-func TestGenerateVisitorData(t *testing.T) {
-	const want = "CgtDZjBSbE5uZDJlQSij6bbFBjIKCgJVUxIEGgAgYA%3D%3D"
-	var gotPath, gotBrowseID string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		var body struct {
-			BrowseID string `json:"browseId"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotBrowseID = body.BrowseID
-		_, _ = w.Write([]byte(`{"responseContext":{"visitorData":"` + want + `"}}`))
-	}))
-	defer srv.Close()
-	defer swap(&browseURL, srv.URL)()
-
-	got, err := GenerateVisitorData(context.Background(), httpx.New(srv.Client()), "UA/1.0")
-	if err != nil {
-		t.Fatalf("GenerateVisitorData: %v", err)
-	}
-	if got != want {
-		t.Errorf("visitorData = %q, want %q", got, want)
-	}
-	if gotBrowseID != "FEwhat_to_watch" {
-		t.Errorf("browseId = %q", gotBrowseID)
-	}
-	if gotPath == "" {
-		t.Error("no request received")
-	}
-}
-
-func TestGenerateVisitorDataMissing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"responseContext":{}}`))
-	}))
-	defer srv.Close()
-	defer swap(&browseURL, srv.URL)()
-
-	_, err := GenerateVisitorData(context.Background(), httpx.New(srv.Client()), "UA/1.0")
-	se, ok := errors.AsType[*botguard.StageError](err)
-	if !ok || se.Stage != botguard.StageParse {
-		t.Fatalf("want StageParse error, got %v", err)
-	}
-}
-
-func TestGenerateVisitorDataServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	defer swap(&browseURL, srv.URL)()
-
-	// httpx retries 5xx; with a 1-attempt client it still surfaces an error.
-	c := httpx.New(srv.Client())
-	c.MaxRetries = 0
-	if _, err := GenerateVisitorData(context.Background(), c, "UA/1.0"); err == nil {
-		t.Fatal("expected error on 500")
 	}
 }
 
@@ -197,10 +154,9 @@ func TestDefaultContextShape(t *testing.T) {
 	}
 }
 
-// TestGuestContextPrefersTheCallersVersion pins which version reaches the wire.
-// The daemon captures ytcfg.INNERTUBE_CLIENT_VERSION per session and passes it
-// here, so a live version must win; the pinned constant is only the last resort
-// for a caller with none, and it drifts as YouTube ships new WEB versions.
+// TestGuestContextPrefersTheCallersVersion pins which version reaches the wire:
+// the live version the daemon captures per session must win over the pinned
+// constant, which is only the last resort and drifts.
 func TestGuestContextPrefersTheCallersVersion(t *testing.T) {
 	read := func(raw json.RawMessage) map[string]any {
 		t.Helper()
@@ -225,7 +181,7 @@ func TestGuestContextPrefersTheCallersVersion(t *testing.T) {
 	}
 
 	// An empty version is the only case that reaches the constant. captureIdentity
-	// logs at warn when it hands one over, so this path is visible in the daemon.
+	// logs at warn when it falls back to the pinned version.
 	fallback := read(GuestContext("VD", ""))
 	if fallback["clientVersion"] != clientVersion {
 		t.Errorf("clientVersion = %v, want the pinned fallback %q", fallback["clientVersion"], clientVersion)

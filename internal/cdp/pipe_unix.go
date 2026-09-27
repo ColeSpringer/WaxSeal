@@ -7,10 +7,9 @@ import (
 	"os"
 )
 
-// newPlatformPipePair returns an anonymous pipe. Go's os.Pipe registers both ends
-// with the runtime poller, so deadlines and cancel-on-close already work on both
-// sides and childPollable needs no special handling here; it exists for Windows,
-// where the child end is deliberately synchronous.
+// newPlatformPipePair returns an anonymous pipe. os.Pipe registers both ends
+// with the runtime poller, which gives them deadlines and cancel-on-close;
+// childPollable exists for Windows, whose child end is synchronous.
 func newPlatformPipePair(dir pipeDir, _ bool) (*pipePair, error) {
 	r, w, err := os.Pipe()
 	if err != nil {

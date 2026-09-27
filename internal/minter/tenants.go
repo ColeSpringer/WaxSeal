@@ -15,9 +15,8 @@ var ErrUnknownTenant = errors.New("waxseal: unknown tenant API key")
 
 // BrowserProber is the browser check behind /ping and its counters, as Tenants
 // sees them. *browser.Pool is the production prober. Tests in dependent
-// packages install a fake through SetBrowserProberForTest so a handler can be
-// driven through every browser outcome, and its counters asserted, without
-// Chromium.
+// packages install a fake through SetBrowserProberForTest to drive a handler
+// through every browser outcome, and assert its counters, without Chromium.
 type BrowserProber interface {
 	// Health probes the shared Chromium, relaunching it when it has exited and
 	// tearing it down first when it is wedged; see browser.Pool.Health.
@@ -29,7 +28,7 @@ type BrowserProber interface {
 }
 
 // noPool is the prober of a registry built without a pool, which only tests
-// do. It has no browser to lose, so it answers and counts nothing.
+// do. It has no browser to lose, so it always answers healthy and counts zero.
 type noPool struct{}
 
 func (noPool) Health(context.Context) (browser.Recovery, error) { return browser.RecoveryNone, nil }
@@ -56,8 +55,8 @@ type Tenants struct {
 	newSession func(ctx context.Context, videoID string) (minterSession, error)
 	// prober is the browser check behind BrowserHealth and the browser counters
 	// in the metrics views: the pool, or noPool when there is none. Like
-	// newSession it is set before the registry serves and never after, so it
-	// needs no lock; SetBrowserProberForTest replaces it under the same rule.
+	// newSession it is set only before the registry serves, so it needs no lock;
+	// SetBrowserProberForTest follows the same rule.
 	prober BrowserProber
 
 	mu      sync.Mutex
@@ -70,11 +69,11 @@ type Tenants struct {
 
 const defaultTenant = "default"
 
-// NewTenants builds a registry over pool. Keys maps API keys to tenant labels. An
-// empty map selects keyless single-tenant mode. streamingMaxAge and reportDebounce
-// configure each tenant's Minter. mintSeparation, when positive, overrides the
-// env-derived mint-to-establishment spacing for every tenant's Minter; a
-// non-positive value leaves each Minter to resolve its own env-derived default.
+// NewTenants builds a registry over pool. keys maps API keys to tenant labels;
+// an empty map selects keyless single-tenant mode. streamingMaxAge,
+// reportDebounce, and mintSeparation configure each tenant's Minter as in
+// NewMinter: a positive mintSeparation overrides the env-derived
+// mint-to-establishment spacing, and a non-positive one keeps it.
 func NewTenants(pool *browser.Pool, video string, keys map[string]string, opts browser.Options, streamingMaxAge, reportDebounce, mintSeparation time.Duration) *Tenants {
 	log := opts.Logger
 	if log == nil {
@@ -140,12 +139,10 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 	if t.closed {
 		t.mu.Unlock()
 		// A request that outlives the shutdown drain still resolves its key, so it
-		// gets its usual 502 or 503 rather than a spurious 401. What it gets is a
-		// Minter that cannot launch against a pool that is gone, built and closed
-		// here rather than registered: shutdown has already torn down every
-		// registered Minter and will not run again, so registering this one would
-		// leak it, log a tenant created after the daemon stopped, and inflate the
-		// tenant count /metrics reports for the run.
+		// gets its usual 502 or 503 rather than a spurious 401. Its Minter is built
+		// closed and not registered: shutdown already tore down every registered
+		// Minter and will not run again, so registering this one would leak it and
+		// count a tenant in /metrics that the daemon never ran.
 		m := t.newMinter()
 		m.Close() // Close owns the terminal flag; there is no session to tear down.
 		return m, label, nil
@@ -159,8 +156,8 @@ func (t *Tenants) Minter(apiKey string) (*Minter, string, error) {
 
 // newMinter builds a tenant Minter that launches through this registry. Every
 // tenant Minter is built here, including the one a post-Close request is handed,
-// so none is ever left with the browser-wide launcher NewMinter defaults to,
-// which would start a second Chromium outside the pool.
+// so none keeps NewMinter's default launcher, which would start a second
+// Chromium outside the pool.
 func (t *Tenants) newMinter() *Minter {
 	m := NewMinter(t.video, t.opts, t.streamingMaxAge, t.reportDebounce, t.mintSeparation)
 	m.launch = func(ctx context.Context) (minterSession, error) {
@@ -197,12 +194,10 @@ func (t *Tenants) CurrentBrowserPID() int {
 	return t.pool.CurrentBrowserPID()
 }
 
-// BrowserHealth runs the browser check without touching any tenant, so a
-// caller that presents no key on a keyed daemon can still learn whether the
-// daemon has a running browser, and a tenant probe that found no answering page
-// can tell a wedged browser from a page's own failure. It reports nil when a
-// running Chromium answers, plus what it took to get one; see
-// browser.Pool.Health for the policy.
+// BrowserHealth runs the browser check without touching any tenant, for a
+// keyless probe on a keyed daemon or a failed tenant probe that must tell a
+// wedged browser from its page's own failure. It returns nil when a running
+// Chromium answers, with the Recovery it needed (see browser.Pool.Health).
 func (t *Tenants) BrowserHealth(ctx context.Context) (browser.Recovery, error) {
 	return t.prober.Health(ctx)
 }
@@ -219,7 +214,8 @@ func (t *Tenants) BrowserRelaunchFailures() int64 { return t.prober.RelaunchFail
 // set is fixed in NewTenants and never mutated, so this needs no lock.
 func (t *Tenants) Keyed() bool { return len(t.keys) > 0 }
 
-// MetricsSnapshot returns per-tenant metrics plus the tenant count.
+// MetricsSnapshot returns per-tenant metrics, the tenant count, and the
+// daemon-wide browser counters.
 func (t *Tenants) MetricsSnapshot() map[string]any {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -236,12 +232,11 @@ func (t *Tenants) MetricsSnapshot() map[string]any {
 }
 
 // AggregateMetricsSnapshot returns the redacted /metrics body for keyed daemons
-// when the request lacks the operator metrics key. It sums lifetime counters and
-// omits labels, tenant count, and per-tenant state. The map is seeded from
-// lifetimeCounterKeys so every counter is present even before any tenant has
-// been used. It only iterates existing minters; a scrape never creates tenant
-// state. The daemon-wide browser counters ride alongside the sums rather than
-// among them: they describe the shared browser, not any tenant.
+// when the request lacks the operator metrics key: lifetime counters summed
+// across existing tenants, with no labels, tenant count, or per-tenant state.
+// Every counter is present, at zero before any tenant is used, and a scrape
+// never creates tenant state. The daemon-wide browser counters sit beside the
+// sums, not among them, since they describe the shared browser.
 func (t *Tenants) AggregateMetricsSnapshot() map[string]any {
 	sums := make(map[string]int64, len(lifetimeCounterKeys))
 	for _, k := range lifetimeCounterKeys {

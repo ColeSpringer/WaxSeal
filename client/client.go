@@ -1,6 +1,6 @@
-// Package client calls the WaxSeal HTTP API. It can mint PO tokens, fetch player
-// contexts, and export guest sessions without depending on WaxTap. The provider
-// module contains the optional WaxTap adapter.
+// Package client calls the WaxSeal HTTP API to mint PO tokens, fetch player
+// contexts, export the guest session, and report degraded streams. It does not
+// depend on WaxTap; the provider module holds the optional WaxTap adapter.
 package client
 
 import (
@@ -16,7 +16,8 @@ import (
 	"time"
 )
 
-// Client talks to a WaxSeal daemon over HTTP.
+// Client talks to a WaxSeal daemon over HTTP. Create one with New; the zero
+// value is not usable. A Client is safe for concurrent use.
 type Client struct {
 	baseURL string
 	apiKey  string
@@ -45,18 +46,15 @@ type Session struct {
 	SessionGeneration uint64
 }
 
-// PlayerContext contains the streaming context for one video. The SABR URL
-// includes a throttling nonce that the consumer must descramble with PlayerURL
-// before starting the stream.
+// PlayerContext is the streaming context for one video. ServerAbrStreamingURL
+// carries a scrambled n parameter that the consumer must descramble with
+// PlayerURL before streaming. PlayabilityStatus is YouTube's
+// playabilityStatus.status, "OK" when the video is streamable; it is distinct
+// from the SABR status-1 protection code embedded in ServerAbrStreamingURL.
 //
-// PlayabilityStatus is YouTube's playabilityStatus.status value, which is "OK"
-// when the video is streamable. It is distinct from the SABR status-1 protection
-// code embedded in ServerAbrStreamingURL.
-//
-// This type mirrors browser.PlayerContext without importing the browser package
-// and its Chromium dependencies, with one addition: the server embeds that struct
-// and adds session_generation, which has no browser-side counterpart. Keep the
-// JSON tags of the shared fields in sync.
+// The JSON tags mirror browser.PlayerContext, which this package does not
+// import because of its Chromium dependencies; keep them in sync.
+// SessionGeneration is the one field the server adds.
 type PlayerContext struct {
 	PlayabilityStatus            string `json:"playability_status"`
 	PlayerURL                    string `json:"player_url"`
@@ -114,7 +112,7 @@ type AudioFormat struct {
 	AudioQuality     string `json:"audio_quality"`
 	IsDrc            bool   `json:"is_drc"`                     // whether client_abr_state.drc_enabled is required
 	AudioTrackID     string `json:"audio_track_id"`             // audioTrack.id, such as "en.4"; every entry of a multi-track video carries one, "" on a single-track video
-	AudioIsDefault   *bool  `json:"audio_is_default,omitempty"` // audioTrack.audioIsDefault as the player states it beside a track id: true on a multi-track video's default track, which can be a dub, false on its other tracks; absent otherwise
+	AudioIsDefault   *bool  `json:"audio_is_default,omitempty"` // audioTrack.audioIsDefault as the player states it beside a track id: true on a multi-track video's default track, which can be a dub, false on its other tracks; nil otherwise
 }
 
 // Option configures a Client.
@@ -123,11 +121,11 @@ type Option func(*Client)
 // WithAPIKey sends X-API-Key with every request.
 func WithAPIKey(key string) Option { return func(c *Client) { c.apiKey = key } }
 
-// WithHTTPClient overrides the default HTTP client.
+// WithHTTPClient sets the HTTP client; the default is http.DefaultClient.
 func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.hc = hc } }
 
-// New returns a client for the WaxSeal daemon at baseURL. A typical base URL is
-// "http://127.0.0.1:4416".
+// New returns a client for the WaxSeal daemon at baseURL, such as
+// "http://127.0.0.1:4416". Trailing slashes are trimmed.
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{baseURL: strings.TrimRight(baseURL, "/"), hc: http.DefaultClient}
 	for _, o := range opts {
@@ -177,11 +175,10 @@ func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Tok
 	return Token{Value: out.POToken, ExpiresAt: out.ExpiresAt, Warning: out.Warning}, nil
 }
 
-// sameSiteFromWire maps the /session same_site string to the net/http enum.
-// WaxSeal's server is the only producer, and it emits Strict, Lax, or None, so
-// the mapping is case-sensitive. An unset or unknown value yields the zero
-// SameSite, which emits no SameSite attribute. This duplicates the server mapper
-// because the client package must not import internal/browser.
+// sameSiteFromWire inverts the server's sameSiteWire, mapping the /session
+// same_site string to the net/http enum. The server is its only producer and
+// emits exactly Strict, Lax, or None, so the match is case-sensitive. An unset
+// or unknown value yields the zero SameSite, which emits no SameSite attribute.
 func sameSiteFromWire(s string) http.SameSite {
 	switch s {
 	case "Strict":
@@ -246,9 +243,7 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies, SessionGeneration: out.SessionGeneration}, nil
 }
 
-// PlayerContext fetches the status-1 streaming context for videoID. The
-// ServerAbrStreamingURL contains a scrambled n parameter that the consumer must
-// descramble with PlayerURL.
+// PlayerContext fetches the status-1 streaming context for videoID.
 func (c *Client) PlayerContext(ctx context.Context, videoID string) (*PlayerContext, error) {
 	if videoID == "" {
 		return nil, errors.New("waxseal/client: video_id is required")
@@ -280,9 +275,10 @@ func (c *Client) PlayerContext(ctx context.Context, videoID string) (*PlayerCont
 
 // ReportResult describes how the daemon handled a degradation report. Accepted
 // indicates that the report applies to the current session. Retired indicates
-// that the session was closed immediately. RetirementPending indicates that it
-// will be closed at the next streaming handoff. RetryAfterSeconds is set when the
-// report was rate-limited.
+// that the session was closed immediately; RetirementPending, that the next
+// request to take the page will close it. Accepted with neither set means the
+// session was already gone. RetryAfterSeconds is set when the report was
+// rate-limited. Generation is the daemon's current session generation.
 type ReportResult struct {
 	Accepted          bool
 	Retired           bool
@@ -291,13 +287,13 @@ type ReportResult struct {
 	RetryAfterSeconds int
 }
 
-// Report tells the daemon that session generation gen produced a degraded stream.
-// Pass the SessionGeneration from a prior PlayerContext or Session. videoID and
-// reason are optional; reason may contain 1 to 64 letters, digits, underscores,
-// or hyphens.
+// Report tells the daemon that session generation gen produced a degraded
+// stream. gen must be the nonzero SessionGeneration from a prior PlayerContext
+// or Session. videoID and reason are optional; when set, each must be 1 to 64
+// letters, digits, underscores, or hyphens.
 //
-// A nil error means that the HTTP request succeeded. Callers must inspect
-// ReportResult.Accepted and honor ReportResult.RetryAfterSeconds when set.
+// A nil error means only that the request succeeded. Check Accepted, and honor
+// RetryAfterSeconds when set.
 func (c *Client) Report(ctx context.Context, gen uint64, videoID, reason string) (ReportResult, error) {
 	if gen == 0 {
 		return ReportResult{}, errors.New("waxseal/client: session generation is required")
@@ -359,10 +355,11 @@ const (
 	CodeInvalidRequest = "invalid-request"
 	// CodeMintFailed indicates that the daemon could not mint a token.
 	CodeMintFailed = "mint-failed"
-	// CodeVideoUnavailable indicates a terminal playabilityStatus.
+	// CodeVideoUnavailable indicates a terminal playabilityStatus or an on-air
+	// broadcast. APIError.Details carries the status or "LIVE_BROADCAST".
 	CodeVideoUnavailable = "video-unavailable"
-	// CodeTimeout indicates that a browser-backed operation's deadline elapsed
-	// (player-context, mint, or session).
+	// CodeTimeout indicates that a browser-backed request (player-context, mint,
+	// or session) used up the daemon's per-request time budget.
 	CodeTimeout = "timeout"
 	// CodePlayerContextFailed indicates a non-terminal player-context failure.
 	CodePlayerContextFailed = "player-context-failed"
@@ -372,13 +369,10 @@ const (
 	CodeNotFound = "not-found"
 )
 
-// APIError describes a non-2xx response from the WaxSeal daemon. Callers can
-// extract it with errors.AsType[*APIError] and inspect Code instead of matching
-// Message.
-//
-// Code is empty for responses from older servers and for non-JSON proxy
-// responses. Message contains the raw body when the response is not a recognized
-// error envelope. StatusCode and Path are always set.
+// APIError is the error a Client method returns for a non-200 response. Extract
+// it with errors.AsType[*APIError] and branch on Code rather than Message.
+// StatusCode and Path are always set. Code is empty when the body is not a
+// WaxSeal error envelope, or is one from an older daemon that sends no code.
 type APIError struct {
 	Path       string // request path, such as "/player-context"
 	StatusCode int    // HTTP status code
@@ -414,8 +408,7 @@ func (c *Client) statusErr(path string, resp *http.Response) error {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	body := bytes.TrimSpace(b)
 	apiErr := &APIError{Path: path, StatusCode: resp.StatusCode}
-	// The header is read whatever the body turns out to be: a proxy that states a
-	// wait and sends no body at all is exactly the case the header exists for.
+	// Each branch below uses the header: a proxy can state a wait with no body.
 	header := resp.Header.Get("Retry-After")
 	if len(body) == 0 {
 		apiErr.RetryAfter = retryAfter(header, 0)
@@ -439,11 +432,10 @@ func (c *Client) statusErr(path string, resp *http.Response) error {
 	return apiErr
 }
 
-// retryAfter reads the stated wait, header first: a proxy can set the header
-// where it cannot change the body. The header is delta-seconds or an HTTP-date.
-// It wins only when it yields a wait still ahead; a header that is unparseable,
-// or a date already past, falls through to the body rather than discarding a
-// value the daemon did send.
+// retryAfter returns the stated wait. The header (delta-seconds or an
+// HTTP-date) wins when it yields a wait still ahead, because a proxy can set it
+// where it cannot change the body; an unparseable or past header falls through
+// to the body's value.
 func retryAfter(header string, bodySeconds int) time.Duration {
 	if header != "" {
 		if secs, err := strconv.Atoi(header); err == nil && secs > 0 {
@@ -461,6 +453,6 @@ func retryAfter(header string, bodySeconds int) time.Duration {
 	return 0
 }
 
-// BaseURL is the daemon address this client was built with, normalised the way
+// BaseURL is the daemon address this client was built with, normalized the way
 // New stores it. A consumer labels its own errors with it.
 func (c *Client) BaseURL() string { return c.baseURL }

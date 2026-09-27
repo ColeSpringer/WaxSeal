@@ -1,10 +1,7 @@
 package botguard
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -23,8 +20,8 @@ const (
 	xUserAgent       = "grpc-web-javascript/0.1"
 	DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.10 Safari/605.1.1"
 
-	// CreateURL/GenerateITURL are the default endpoint mode (youtube.com/api/jnn/v1).
-	CreateURL     = "https://www.youtube.com/api/jnn/v1/Create"
+	// GenerateITURL uses the youtube.com/api/jnn/v1 path, which needs no
+	// authentication.
 	GenerateITURL = "https://www.youtube.com/api/jnn/v1/GenerateIT"
 
 	maxChallengeBody        = 4 << 20  // bounded response bodies
@@ -32,74 +29,32 @@ const (
 	maxInterpreterRedirects = 3
 )
 
-// EndpointMode selects the WAA host for Create and GenerateIT calls. The default
-// youtube.com/api/jnn/v1 path needs no authentication. The googleapis mode uses
-// jnn-pa.googleapis.com for bgutil compatibility. InnerTube att/get always uses
-// youtube.com.
-type EndpointMode string
-
-const (
-	EndpointYouTube    EndpointMode = "youtube"    // youtube.com/api/jnn/v1 (default)
-	EndpointGoogleAPIs EndpointMode = "googleapis" // jnn-pa.googleapis.com
-)
-
-// Endpoint carries the resolved Create/GenerateIT URLs for a mode.
+// Endpoint carries the WAA GenerateIT URL.
 type Endpoint struct {
-	CreateURL     string
 	GenerateITURL string
 }
 
-// DefaultEndpoint is the youtube.com/api/jnn/v1 mode.
-var DefaultEndpoint = Endpoint{CreateURL: CreateURL, GenerateITURL: GenerateITURL}
+// DefaultEndpoint is the youtube.com/api/jnn/v1 endpoint.
+var DefaultEndpoint = Endpoint{GenerateITURL: GenerateITURL}
 
-// ResolveEndpoint maps a mode string to its Endpoint. An empty mode selects the
-// default, and an unknown mode returns an error.
-func ResolveEndpoint(mode string) (Endpoint, error) {
-	switch EndpointMode(NormalizeEndpointMode(mode)) {
-	case EndpointYouTube:
-		return DefaultEndpoint, nil
-	case EndpointGoogleAPIs:
-		return Endpoint{
-			CreateURL:     "https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/Create",
-			GenerateITURL: "https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/GenerateIT",
-		}, nil
-	default:
-		return Endpoint{}, fmt.Errorf("botguard: unknown endpoint mode %q (want %q or %q)", mode, EndpointYouTube, EndpointGoogleAPIs)
-	}
-}
-
-// NormalizeEndpointMode lowercases/trims a mode and maps empty to the default. It
-// is the canonical string mixed into cache/minter keys.
-func NormalizeEndpointMode(mode string) string {
-	m := strings.ToLower(strings.TrimSpace(mode))
-	if m == "" {
-		return string(EndpointYouTube)
-	}
-	return m
-}
-
-// orDefault substitutes DefaultEndpoint for a zero Endpoint value (defensive for
-// callers/tests that leave it unset).
+// orDefault returns DefaultEndpoint when the URL is empty, so callers and tests
+// can leave Endpoint unset.
 func (e Endpoint) orDefault() Endpoint {
-	if e.CreateURL == "" || e.GenerateITURL == "" {
+	if e.GenerateITURL == "" {
 		return DefaultEndpoint
 	}
 	return e
 }
 
-// Stage identifies where a BotGuard operation failed. Telemetry and circuit
-// breakers can use it without parsing error messages.
+// Stage identifies where a BotGuard operation failed, so callers can branch on
+// it without parsing error messages.
 type Stage string
 
 const (
 	StageTransport  Stage = "transport"
-	StageDescramble Stage = "descramble"
 	StageParse      Stage = "parse"
 	StageInterp     Stage = "interpreter-fetch"
-	StageVM         Stage = "vm"
 	StageGenerateIT Stage = "generateit"
-	StageMint       Stage = "mint"
-	StageValidate   Stage = "validate"
 )
 
 // StageError carries the stage without embedding raw Google payloads or tokens.
@@ -115,203 +70,20 @@ func stageErr(s Stage, format string, a ...any) error {
 	return &StageError{Stage: s, Err: fmt.Errorf(format, a...)}
 }
 
-// Challenge is the parsed (and interpreter-resolved) BotGuard challenge.
+// Challenge is a BotGuard challenge parsed from att/get's bgChallenge.
 type Challenge struct {
-	InterpreterJS   string // resolved inline interpreter JS (the only JS we run)
-	Program         string // arr[4]
-	GlobalName      string // arr[5]
-	InterpreterURL  string // set when sourced from a URL (for fetching/telemetry)
+	InterpreterJS   string // fetched by ResolveInterpreter
+	Program         string
+	GlobalName      string
+	InterpreterURL  string
 	InterpreterHash string // att/get's interpreterHash, when supplied (cache key)
 }
 
-// FetchCreateChallenge posts to WAA Create, parses the response, and resolves the
-// interpreter. HTTP requests use the shared httpx layer. userAgent must belong to
-// the active browser profile and use the WebKit family.
-func FetchCreateChallenge(ctx context.Context, client *httpx.Client, userAgent string, ep Endpoint) (*Challenge, error) {
-	ep = ep.orDefault()
-	body, _ := json.Marshal([]string{RequestKey})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.CreateURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, stageErr(StageTransport, "build Create request: %w", err)
-	}
-	setProtoHeaders(req, userAgent)
-
-	raw, err := client.DoJSON(req, maxChallengeBody)
-	if err != nil {
-		return nil, stageErr(StageTransport, "Create: %w", err)
-	}
-
-	var arr []json.RawMessage
-	if err := json.Unmarshal(raw, &arr); err != nil {
-		return nil, stageErr(StageParse, "Create response not an array: %w", err)
-	}
-
-	ch, err := parseCreateArray(arr)
-	if err != nil {
-		return nil, err
-	}
-	if err := ResolveInterpreter(ctx, client, ch, userAgent); err != nil {
-		return nil, err
-	}
-	return ch, nil
-}
-
-// parseCreateArray handles both Create response families: a scrambled base64
-// string at arr[1], or a structured challenge array at arr[0].
-func parseCreateArray(arr []json.RawMessage) (*Challenge, error) {
-	if len(arr) >= 2 {
-		var scrambled string
-		if json.Unmarshal(arr[1], &scrambled) == nil && scrambled != "" {
-			descrambled, err := descramble(scrambled)
-			if err != nil {
-				return nil, stageErr(StageDescramble, "%w", err)
-			}
-			var cdata []json.RawMessage
-			if err := json.Unmarshal(descrambled, &cdata); err != nil {
-				return nil, stageErr(StageParse, "descrambled challenge not an array: %w", err)
-			}
-			return parseChallengeData(cdata)
-		}
-	}
-	if len(arr) >= 1 {
-		var cdata []json.RawMessage
-		if json.Unmarshal(arr[0], &cdata) == nil && len(cdata) > 0 {
-			return parseChallengeData(cdata)
-		}
-	}
-	return nil, stageErr(StageParse, "unrecognized Create response shape")
-}
-
-// descramble ports rustypipe's descramble: standard base64 decode, then +97 per
-// byte (wrapping) yields the JSON challenge array.
-func descramble(scrambled string) ([]byte, error) {
-	bts, err := base64.StdEncoding.DecodeString(scrambled)
-	if err != nil {
-		// Tolerate raw (unpadded) base64 too.
-		bts, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(scrambled, "="))
-		if err != nil {
-			return nil, fmt.Errorf("base64: %w", err)
-		}
-	}
-	out := make([]byte, len(bts))
-	for i, b := range bts {
-		out[i] = b + 97 // wrapping add (byte arithmetic wraps mod 256)
-	}
-	return out, nil
-}
-
-// ParseProvidedChallenge parses a caller-supplied challenge from /get_pot or a
-// page into an unresolved Challenge. Accepted shapes are bgutil's structured
-// object, a challenge-data array, and the legacy scrambled string. Interpreter
-// URLs are resolved by the caller with ResolveInterpreter.
-func ParseProvidedChallenge(raw json.RawMessage) (*Challenge, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 {
-		return nil, stageErr(StageParse, "empty challenge")
-	}
-	switch trimmed[0] {
-	case '{':
-		return parseObjectChallenge(trimmed)
-	case '[':
-		var cdata []json.RawMessage
-		if err := json.Unmarshal(trimmed, &cdata); err != nil {
-			return nil, stageErr(StageParse, "challenge array: %w", err)
-		}
-		return parseChallengeData(cdata)
-	case '"':
-		var s string
-		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return nil, stageErr(StageParse, "challenge string: %w", err)
-		}
-		return parseStringChallenge(s)
-	}
-	return nil, stageErr(StageParse, "unrecognized challenge shape")
-}
-
-// parseObjectChallenge reads bgutil's structured-object shape.
-func parseObjectChallenge(raw []byte) (*Challenge, error) {
-	var obj struct {
-		InterpreterURL struct {
-			Priv string `json:"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue"`
-		} `json:"interpreterUrl"`
-		Program    string `json:"program"`
-		GlobalName string `json:"globalName"`
-	}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, stageErr(StageParse, "challenge object: %w", err)
-	}
-	if obj.Program == "" || obj.GlobalName == "" {
-		return nil, stageErr(StageParse, "challenge object missing program/globalName")
-	}
-	if obj.InterpreterURL.Priv == "" {
-		return nil, stageErr(StageParse, "challenge object missing interpreterUrl")
-	}
-	return &Challenge{InterpreterURL: obj.InterpreterURL.Priv, Program: obj.Program, GlobalName: obj.GlobalName}, nil
-}
-
-// parseStringChallenge handles the legacy string shape: scrambled base64 or, for
-// compatibility, a plain JSON challenge array encoded as a string.
-func parseStringChallenge(s string) (*Challenge, error) {
-	if descrambled, err := descramble(s); err == nil {
-		var cdata []json.RawMessage
-		if json.Unmarshal(descrambled, &cdata) == nil && len(cdata) >= 6 {
-			return parseChallengeData(cdata)
-		}
-	}
-	var cdata []json.RawMessage
-	if json.Unmarshal([]byte(s), &cdata) == nil && len(cdata) >= 6 {
-		return parseChallengeData(cdata)
-	}
-	return nil, stageErr(StageParse, "unrecognized string challenge")
-}
-
-// parseChallengeData ports parse_challenge_data. The interpreter is the first
-// non-empty string in cdata[1] for inline JavaScript or cdata[2] for a URL. The
-// program and global name are in cdata[4] and cdata[5].
-func parseChallengeData(cdata []json.RawMessage) (*Challenge, error) {
-	if len(cdata) < 6 {
-		return nil, stageErr(StageParse, "challenge array len %d < 6", len(cdata))
-	}
-	ch := &Challenge{}
-	if js := firstNonEmptyString(cdata[1]); js != "" {
-		ch.InterpreterJS = js
-	} else if u := firstNonEmptyString(cdata[2]); u != "" {
-		ch.InterpreterURL = u
-	} else {
-		return nil, stageErr(StageParse, "no interpreter JS or URL")
-	}
-	if err := json.Unmarshal(cdata[4], &ch.Program); err != nil || ch.Program == "" {
-		return nil, stageErr(StageParse, "program (arr[4]) missing")
-	}
-	if err := json.Unmarshal(cdata[5], &ch.GlobalName); err != nil || ch.GlobalName == "" {
-		return nil, stageErr(StageParse, "globalName (arr[5]) missing")
-	}
-	return ch, nil
-}
-
-// firstNonEmptyString returns the first non-empty string in a JSON array value
-// (or the string itself), else "".
-func firstNonEmptyString(raw json.RawMessage) string {
-	var s string
-	if json.Unmarshal(raw, &s) == nil && s != "" {
-		return s
-	}
-	var arr []json.RawMessage
-	if json.Unmarshal(raw, &arr) == nil {
-		for _, item := range arr {
-			if json.Unmarshal(item, &s) == nil && s != "" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
 // ResolveInterpreter fetches a URL-sourced interpreter after validating the host
-// against google.com/youtube.com. Inline interpreters pass through. The fetch
-// uses a redirect-guarded clone of the shared transport and enforces
-// maxInterpreterBody. InnerTube att/get uses this path because it returns a
-// bgChallenge with only an interpreterUrl.
+// against google.com/youtube.com. A Challenge that already has InterpreterJS
+// passes through. The fetch uses a redirect-guarded copy of the shared client
+// and enforces maxInterpreterBody. InnerTube att/get needs this path because
+// its bgChallenge carries only an interpreterUrl.
 func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge, userAgent string) error {
 	if ch.InterpreterJS != "" {
 		return nil
@@ -417,14 +189,6 @@ func (c *interpreterCache) put(key, js string) {
 		}
 	}
 	c.m[key] = js
-}
-
-// ClearInterpreterCache drops all cached interpreters. Forced refreshes and
-// tests use it to clear process-wide state.
-func ClearInterpreterCache() {
-	interpCache.mu.Lock()
-	defer interpCache.mu.Unlock()
-	clear(interpCache.m)
 }
 
 // DomainMatches reports whether host is base or a dotted subdomain of base. It is

@@ -3,13 +3,16 @@
 package provider_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,36 +26,25 @@ import (
 	"github.com/colespringer/waxtap/v3/potoken"
 )
 
-// The aging matrix measures which artifact's age, if any, predicts a capped
-// stream on the player-context path. The daemon cannot tell a good context from
-// a bad one: the URL never changes between a stream that completes and one that
-// stops at the same byte, and the browser keeps buffering past the cap on the
-// very same URL. What is left to separate is how long each artifact has existed
-// when the stream begins: the attested session, the GVS token, and the issued
-// context URL. Each arm ages exactly one of those and leaves the others fresh.
+// The aging matrices measure which artifact's age, if any, predicts a capped
+// stream on the player-context path: the attested session, the GVS token, or
+// the context URL. The daemon cannot tell a good context from a bad one (the
+// same URL can stream in full or stop at the cap, and the browser buffers past
+// the cap on it), so age at stream start is what is left to compare. The first
+// matrix (agingArms) ages one artifact per arm and found the separating
+// variable to be the distance from the token's mint to the streamed context,
+// which the second (agingMintGapArms) varies; the third (agingProofGapArms)
+// varies the distance from the proof playback.
 //
-// The second matrix follows the first. Once the separating variable is known to
-// be the distance between the token's mint and the context that gets streamed,
-// its arms hold everything else fixed and vary only that distance, and one arm
-// asks whether the daemon's own startup sequence already supplies it.
+// Attestation pre-mints the GVS token, so a fetch usually returns it from the
+// cache: tokenFetched is when the streamed token first came back, and
+// tokenMinted is when the daemon minted it (see agingTokenInstants).
 //
-// These are measurements, not assertions. A capped stream is a result, so no arm
-// fails on truncation; the test only requires that every iteration produced a
-// record.
-//
-// The daemon's own protections floor every arm regardless of what it ages:
-// attestation always pre-mints a token, and every mint or context handoff keeps
-// mintSeparation clear of the browser's last in-page activity. By default this
-// suite leaves that spacing at the daemon's own default (12s unless
-// WAXSEAL_MINT_SEPARATION overrides it), which makes the default run a
-// regression check rather than a raw-gap measurement: every arm is expected to
-// stream full length. Set WAXSEAL_E2E_AGING_SEPARATION to a Go duration such as
-// "1ms" to override server.Config.MintSeparation on every in-process daemon this
-// suite starts, which removes the gate so the arms measure the gaps they name
-// again. Because the token is minted at attestation rather than at an arm's own
-// mint call (which usually just returns that same cached token), the token_age
-// and both_age arms' measured age is really the time since warmDone
-// (attestation), not since tokenMinted.
+// Mints and context handoffs keep mintSeparation clear of the browser's last
+// in-page activity. At the daemon's default (12s unless WAXSEAL_MINT_SEPARATION
+// overrides it) a run is a regression check where every arm should stream full
+// length; set WAXSEAL_E2E_AGING_SEPARATION to a small Go duration such as "1ms"
+// to measure raw gaps.
 
 const (
 	// agingEnableEnv selects which matrix to run, "1", "2", or "3". Each runs
@@ -65,10 +57,7 @@ const (
 	// ignores it.
 	agingDelayEnv = "WAXSEAL_E2E_AGING_DELAY"
 	// agingSeparationEnv overrides server.Config.MintSeparation on every
-	// in-process daemon this suite starts. Unset, the daemon's own default
-	// applies and the matrix is a regression check (every arm expected full); a
-	// small positive duration such as "1ms" effectively removes the gate so the
-	// arms measure raw gaps again.
+	// in-process daemon this suite starts; see agingSeparation.
 	agingSeparationEnv = "WAXSEAL_E2E_AGING_SEPARATION"
 
 	agingDefaultIterations = 6
@@ -82,15 +71,16 @@ const (
 	agingStamp = "2006-01-02T15:04:05.000Z07:00"
 )
 
-// agingRecord is one iteration's measurement. Every field it reports is a wall
-// clock instant rather than a duration, so ages can be recomputed against any
-// reference point after the run.
+// agingRecord is one iteration's measurement. Its times are wall-clock instants
+// rather than durations, so ages can be recomputed against any reference point
+// after the run.
 type agingRecord struct {
 	arm  string
 	iter int
 
 	warmDone      time.Time // attestation finished; the session's identity exists from here
-	tokenMinted   time.Time // the /get_pot that produced the streamed GVS token
+	tokenMinted   time.Time // when the daemon minted the streamed GVS token
+	tokenFetched  time.Time // the first /get_pot that returned the streamed token
 	contextIssued time.Time // the player-context call that produced the streamed URL
 	streamStart   time.Time // just before the consumer's Stream call
 
@@ -99,34 +89,34 @@ type agingRecord struct {
 	contentLength int64
 
 	potCache  string // the daemon's X-POT-Cache verdict for the consumer's own token fetch
-	tokenSame string // whether the consumer received the token this arm pre-minted
+	tokenSame string // whether the consumer got the token this arm fetched first
 	potCalls  int    // token fetches the consumer made
 	pcCalls   int    // player-context fetches the consumer made
 	note      string
 
-	// gap is the arm's own delay, rendered for the record. It is set only by a
-	// matrix whose arms carry individual delays, so the run-wide-delay matrix
-	// keeps its original columns.
+	// gap is the arm's own delay, rendered for the record. Only arms that carry
+	// their own delay set it, so the run-wide-delay matrix keeps its columns.
 	gap string
-	// anchor is which instant the daemon's own separation gate held the streamed
-	// context back from: "proof" or "mint". It is what makes a proof-gap record
-	// self-certifying, because an arm that means to measure the proof edge but
-	// waited on a mint measured something else. Empty when the arm did not ask.
+	// anchor names the instant the daemon's separation gate held the streamed
+	// context back from: "proof" or "mint". It shows whether a proof-gap arm
+	// measured the proof edge; one that waited on a mint measured something
+	// else. Empty when the arm did not ask.
 	anchor string
-	// selfTestDone is when the daemon's startup self-test returned. It bounds a
-	// mint the consumer never saw, because the self-test mints inside the daemon.
+	// selfTestDone is when the daemon's startup self-test returned. It bounds
+	// the self-test's own mint, which happens only when the pre-mint failed.
 	selfTestDone time.Time
 }
 
 // line renders the machine-readable record. One line per iteration is the
 // contract the run is read back through, so it is emitted even for an iteration
-// that never reached the stream.
+// that never reached the stream. A new fixed key goes after the existing ones,
+// so readers of earlier runs keep working.
 func (r *agingRecord) line() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "AGING arm=%s iter=%d outcome=%s bytes=%d of=%d warm_done=%s token_minted=%s context_issued=%s stream_start=%s pot_cache=%s token_same=%s pot_calls=%d pc_calls=%d",
+	fmt.Fprintf(&b, "AGING arm=%s iter=%d outcome=%s bytes=%d of=%d warm_done=%s token_minted=%s context_issued=%s stream_start=%s pot_cache=%s token_same=%s pot_calls=%d pc_calls=%d token_fetched=%s",
 		r.arm, r.iter, r.status(), r.bytes, r.contentLength,
 		agingTime(r.warmDone), agingTime(r.tokenMinted), agingTime(r.contextIssued), agingTime(r.streamStart),
-		agingField(r.potCache), agingField(r.tokenSame), r.potCalls, r.pcCalls)
+		agingField(r.potCache), agingField(r.tokenSame), r.potCalls, r.pcCalls, agingTime(r.tokenFetched))
 	if r.gap != "" {
 		fmt.Fprintf(&b, " gap=%s", r.gap)
 	}
@@ -168,24 +158,14 @@ func agingField(s string) string {
 	return s
 }
 
-// agingAge is how old an artifact was when the stream began.
-func agingAge(from, to time.Time) string {
-	if from.IsZero() || to.IsZero() {
-		return "-"
-	}
-	return to.Sub(from).Round(time.Millisecond).String()
-}
-
-// potCacheRecorder records the daemon's X-POT-Cache verdict for every /get_pot
-// response. The client package does not surface that header, and the matrix
-// needs it to tell a token reused from the daemon's cache from one minted afresh
-// at stream start.
+// potCacheRecorder records every /get_pot answer as a potFetch. The client
+// package surfaces neither the X-POT-Cache header nor when an answer arrived,
+// and the matrix needs both to date the streamed token.
 type potCacheRecorder struct {
 	base http.RoundTripper
 
-	mu       sync.Mutex
-	first    time.Time
-	verdicts []string
+	mu      sync.Mutex
+	fetches []potFetch
 }
 
 func (rt *potCacheRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -193,24 +173,36 @@ func (rt *potCacheRecorder) RoundTrip(req *http.Request) (*http.Response, error)
 	if err != nil || !strings.HasSuffix(req.URL.Path, "/get_pot") {
 		return resp, err
 	}
-	verdict := resp.Header.Get("X-POT-Cache")
-	if verdict == "" {
-		verdict = "unknown"
+	f := potFetch{at: time.Now(), verdict: resp.Header.Get("X-POT-Cache")}
+	if f.verdict == "" {
+		f.verdict = "unknown"
+	}
+	if resp.StatusCode == http.StatusOK {
+		// The token is read here and the same bytes handed on to the client.
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		var tok struct {
+			POToken string `json:"poToken"`
+		}
+		if json.Unmarshal(body, &tok) == nil {
+			f.token = tok.POToken
+		}
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.first.IsZero() {
-		rt.first = time.Now()
-	}
-	rt.verdicts = append(rt.verdicts, verdict)
+	rt.fetches = append(rt.fetches, f)
 	return resp, nil
 }
 
-// firstMint is when the daemon answered the first /get_pot of the iteration.
-func (rt *potCacheRecorder) firstMint() time.Time {
+// snapshot returns the iteration's /get_pot answers in arrival order.
+func (rt *potCacheRecorder) snapshot() []potFetch {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return rt.first
+	return slices.Clone(rt.fetches)
 }
 
 // lastVerdict is the cache verdict of the most recent /get_pot, which is the one
@@ -218,15 +210,15 @@ func (rt *potCacheRecorder) firstMint() time.Time {
 func (rt *potCacheRecorder) lastVerdict() string {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if len(rt.verdicts) == 0 {
+	if len(rt.fetches) == 0 {
 		return ""
 	}
-	return rt.verdicts[len(rt.verdicts)-1]
+	return rt.fetches[len(rt.fetches)-1].verdict
 }
 
 // agingPOToken records what the consumer's own token fetch returned, so an arm
-// that pre-minted can confirm the consumer got that same token back rather than
-// a fresh one.
+// that fetched a token first can confirm the consumer got that same token back
+// rather than a fresh one.
 type agingPOToken struct {
 	inner potoken.Provider
 
@@ -352,12 +344,10 @@ func (l *separationLog) contextAnchors() []string {
 }
 
 // separationWatcher forwards every record to inner and copies the anchor out of
-// the minter's separation-wait line. Reading the daemon's own log is what makes
-// a proof-gap record self-certifying: the arm states which anchor it means to
-// measure, and the record proves which one the daemon actually used.
-//
-// Enabled delegates, which is correct here because the line is logged at Info
-// and testDaemonLogger runs at Info or Debug.
+// the minter's separation-wait line, so a proof-gap record shows which anchor
+// the daemon used, not only the one the arm meant to measure. Enabled
+// delegates, which is correct because the line is logged at Info and
+// testDaemonLogger runs at Info or Debug.
 type separationWatcher struct {
 	inner slog.Handler
 	log   *separationLog
@@ -397,19 +387,20 @@ type agingHarness struct {
 	rt   *potCacheRecorder
 	po   *agingPOToken
 	sep  *separationLog
+
+	// premintFailed reports that attestation's pre-mint cached no token, so any
+	// cache hit is on the self-test's.
+	premintFailed bool
 }
 
 // newAgingHarness starts a fresh cold daemon and warms one session the way
-// startColdDaemon does, then optionally runs the startup self-test the daemon
-// binary runs before it accepts traffic. rec.warmDone is stamped when
-// attestation finishes, before any self-test, because that is when the session's
-// identity came into being.
-//
-// Warm and SelfTest share one 120 second budget, matching the daemon's startup.
-// The server registers its own shutdown with t.Cleanup, so running each
-// iteration as a subtest is what tears the browser down between iterations.
-// separation becomes server.Config.MintSeparation; 0 leaves the daemon's own
-// default in place.
+// startColdDaemon does, then optionally runs the self-test the daemon binary
+// runs before serving. rec.warmDone is stamped when attestation finishes,
+// before any self-test, since that is when the session's identity came into
+// being. Warm and SelfTest share one 120 s budget, as at daemon startup. The
+// server's shutdown is a t.Cleanup, so running each iteration as a subtest
+// tears the browser down between iterations. separation becomes
+// server.Config.MintSeparation; 0 keeps the daemon's default.
 func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation time.Duration) *agingHarness {
 	t.Helper()
 	sepLog := &separationLog{}
@@ -443,7 +434,10 @@ func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation t
 		client.WithAPIKey(os.Getenv("WAXSEAL_KEY")),
 		client.WithHTTPClient(&http.Client{Transport: rt, Timeout: 4 * time.Minute}))
 	p := provider.New(c)
-	return &agingHarness{srv: srv, base: base, c: c, p: p, rt: rt, po: &agingPOToken{inner: p}, sep: sepLog}
+	// No token request has run yet, so a mint failure is the pre-mint's or the
+	// self-test's, which mints only when the pre-mint cached nothing.
+	premintFailed := readMetrics(t, base).counter(t, "mint_failures") > 0
+	return &agingHarness{srv: srv, base: base, c: c, p: p, rt: rt, po: &agingPOToken{inner: p}, sep: sepLog, premintFailed: premintFailed}
 }
 
 // agingStream streams videoURL over the attested player-context path. It mirrors
@@ -485,7 +479,7 @@ func agingStream(t *testing.T, ctx context.Context, po potoken.Provider, pc poto
 }
 
 // agingPrep is what an arm hands the stream: the context provider to stream
-// through and, when the arm pre-minted one, the GVS token it expects the
+// through and, when the arm fetched one first, the GVS token it expects the
 // consumer to be handed back.
 type agingPrep struct {
 	pc       agingContextSource
@@ -500,14 +494,13 @@ type agingArm struct {
 	// gap overrides the run-wide delay with one this arm owns. Nil takes the
 	// run-wide delay and leaves the gap column out of the record.
 	gap *time.Duration
-	// separation overrides the run-wide server.Config.MintSeparation with one
-	// this arm owns. An arm sets it when the daemon's own gate is the instrument
-	// rather than something to get out of the way. Nil takes the run-wide value.
+	// separation overrides the run-wide server.Config.MintSeparation for an arm
+	// whose instrument is the daemon's own gate. Nil takes the run-wide value.
 	separation *time.Duration
 	// watchAnchor asks the iteration to record which anchor the daemon's
 	// separation gate held the streamed context back from.
 	watchAnchor bool
-	run         func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep
+	run         func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep
 }
 
 // agingGap makes an arm's own delay addressable.
@@ -518,44 +511,43 @@ func agingGap(d time.Duration) *time.Duration { return &d }
 // rows is which artifact was allowed to get old.
 var agingArms = []agingArm{
 	{
-		// Nothing is aged: the token is minted and the context issued inside Stream.
+		// Nothing is aged: the consumer fetches the token and context inside Stream.
 		name: "baseline",
-		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ *agingRecord, _ time.Duration) agingPrep {
+		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ time.Duration) agingPrep {
 			return agingPrep{pc: newAgingLive(h.p)}
 		},
 	},
 	{
-		// Only the attested session and identity are old; the token and URL are
-		// minted after the wait.
+		// Only the attested session and identity are old; the consumer fetches the
+		// token and URL after the wait.
 		name: "session_age",
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, _ *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingLive(h.p)}
 		},
 	},
 	{
-		// Only the GVS token is old. The first player-context call exists solely to
-		// learn the visitor data the token binds to; the streamed context is a fresh
-		// one taken after the wait.
+		// Only the GVS token is old. The first player-context call exists only to
+		// learn the visitor data the token binds to; the streamed context is a
+		// fresh one taken after the wait.
 		name: "token_age",
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			pc, err := h.c.PlayerContext(ctx, bbbVideoID)
 			if err != nil {
 				t.Fatalf("player-context to learn visitor_data: %v", err)
 			}
 			tok, err := h.c.POToken(ctx, pc.VisitorData, "gvs")
 			if err != nil {
-				t.Fatalf("pre-mint gvs token: %v", err)
+				t.Fatalf("fetch gvs token: %v", err)
 			}
-			rec.tokenMinted = time.Now()
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingLive(h.p), preToken: tok.Value}
 		},
 	},
 	{
-		// Only the context URL is old. The consumer mints its token at stream start.
+		// Only the context URL is old; the consumer fetches its token inside Stream.
 		name: "url_age",
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, _ *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			pc, err := h.p.ProvidePlayerContext(ctx, bbbVideoID)
 			if err != nil {
 				t.Fatalf("player-context: %v", err)
@@ -568,7 +560,7 @@ var agingArms = []agingArm{
 	{
 		// Both the URL and the token it streams under are old.
 		name: "both_age",
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			pc, err := h.p.ProvidePlayerContext(ctx, bbbVideoID)
 			if err != nil {
 				t.Fatalf("player-context: %v", err)
@@ -576,40 +568,37 @@ var agingArms = []agingArm{
 			issued := time.Now()
 			tok, err := h.c.POToken(ctx, pc.VisitorData, "gvs")
 			if err != nil {
-				t.Fatalf("pre-mint gvs token: %v", err)
+				t.Fatalf("fetch gvs token: %v", err)
 			}
-			rec.tokenMinted = time.Now()
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingFixed(pc, issued), preToken: tok.Value}
 		},
 	},
 	{
-		// What an operator actually gets: warm, then the startup self-test, then
-		// serve. The self-test caches a GVS token under the same key the consumer's
-		// fetch uses, so this arm ages the token by however long the self-test's
-		// full-length establishment took.
+		// What an operator gets: warm, then the startup self-test, then serve.
+		// Attestation caches the GVS token under the key the consumer's fetch uses,
+		// so this arm ages the token by however long the self-test's streaming
+		// proof took.
 		name:     "production_path",
 		selfTest: true,
-		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ *agingRecord, _ time.Duration) agingPrep {
+		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ time.Duration) agingPrep {
 			return agingPrep{pc: newAgingLive(h.p)}
 		},
 	},
 }
 
 // agingMintGapArm builds one row of the second matrix. The arm learns the
-// identity through /session rather than a player context, so no context for the
-// target video is issued before the token is minted, then mints the GVS token,
-// waits gap, and lets the consumer take a fresh context and stream. The only
-// thing that varies across these rows is gap.
-//
-// /session runs the daemon's own establishment proof on the landing video when
-// the session has not been established yet, so the arm removes a preceding
-// context for the target video rather than removing playback altogether.
+// identity through /session rather than a player context, so no context for
+// the target video comes before the token. It then fetches the GVS token,
+// waits gap, and lets the consumer take a fresh context and stream; only gap
+// varies across these rows. /session still runs the daemon's establishment
+// proof on the landing video if the session has not proved yet, so the arm
+// removes a preceding context for the target video, not playback altogether.
 func agingMintGapArm(name string, gap time.Duration) agingArm {
 	return agingArm{
 		name: name,
 		gap:  agingGap(gap),
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, rec *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			sess, err := h.c.Session(ctx)
 			if err != nil {
 				t.Fatalf("session to learn visitor_data: %v", err)
@@ -619,9 +608,8 @@ func agingMintGapArm(name string, gap time.Duration) agingArm {
 			}
 			tok, err := h.c.POToken(ctx, sess.VisitorData, "gvs")
 			if err != nil {
-				t.Fatalf("pre-mint gvs token: %v", err)
+				t.Fatalf("fetch gvs token: %v", err)
 			}
-			rec.tokenMinted = time.Now()
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingLive(h.p), preToken: tok.Value}
 		},
@@ -639,14 +627,13 @@ var agingMintGapArms = []agingArm{
 	agingMintGapArm("mint_gap30", 30*time.Second),
 	agingMintGapArm("mint_gap45", 45*time.Second),
 	{
-		// The daemon's startup sequence in full: warm, then the self-test, which
-		// mints the GVS token and then runs the proof playback. The wait follows,
-		// so the token reaches the stream already old without the consumer having
-		// arranged it.
+		// The daemon's startup sequence in full: warm, which mints the GVS token,
+		// then the self-test's proof playback. The wait follows, so the token
+		// reaches the stream already old without the consumer arranging it.
 		name:     "selftest_gap30",
 		selfTest: true,
 		gap:      agingGap(30 * time.Second),
-		run: func(t *testing.T, ctx context.Context, h *agingHarness, _ *agingRecord, d time.Duration) agingPrep {
+		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingLive(h.p)}
 		},
@@ -654,12 +641,11 @@ var agingMintGapArms = []agingArm{
 }
 
 // agingProofGapArm builds one row of the third matrix. The arm sets the daemon's
-// separation window to gap and runs the self-test, which mints and then proves,
-// so the proof is the later anchor waitBeforeEstablish measures from and the
-// daemon holds the context exactly gap past it. The gate is the instrument here,
-// which is why the arm sets it rather than removing it. The consumer's own token
-// fetch is a cache hit, so it cannot move the mint anchor; anchor= in the record
-// proves that per iteration.
+// separation window to gap and runs the self-test, whose proof playback follows
+// attestation's mint, so the proof is the later anchor waitBeforeEstablish
+// measures from and the daemon holds the context exactly gap past it. The
+// consumer's own token fetch is a cache hit, so it cannot move the mint anchor;
+// anchor= in the record proves that per iteration.
 func agingProofGapArm(name string, gap time.Duration) agingArm {
 	return agingArm{
 		name:        name,
@@ -667,7 +653,7 @@ func agingProofGapArm(name string, gap time.Duration) agingArm {
 		gap:         agingGap(gap),
 		separation:  agingGap(gap),
 		watchAnchor: true,
-		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ *agingRecord, _ time.Duration) agingPrep {
+		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ time.Duration) agingPrep {
 			return agingPrep{pc: newAgingLive(h.p)}
 		},
 	}
@@ -705,7 +691,7 @@ func agingSleep(t *testing.T, ctx context.Context, d time.Duration) {
 }
 
 // runAgingIteration performs one cell of the matrix and fills in rec. separation
-// is passed through to newAgingHarness as server.Config.MintSeparation.
+// is the run-wide server.Config.MintSeparation, unless the arm sets its own.
 func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separation time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), agingIterationBudget)
@@ -720,7 +706,7 @@ func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separati
 		separation = *arm.separation
 	}
 	h := newAgingHarness(t, rec, arm.selfTest, separation)
-	prep := arm.run(t, ctx, h, rec, delay)
+	prep := arm.run(t, ctx, h, delay)
 
 	rec.streamStart = time.Now()
 	n, info, warnings, err := agingStream(t, ctx, h.po, prep.pc, bbbURL)
@@ -737,13 +723,15 @@ func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separati
 	if calls > 0 {
 		rec.potCache = h.rt.lastVerdict()
 	}
-	// An arm that did not pre-mint has no token instant of its own, so the
-	// daemon's first answered /get_pot is when the streamed token came into being.
-	// A self-test is the exception: it mints inside the daemon, where the consumer
-	// cannot see the instant, and selftest_done bounds it instead.
-	if rec.tokenMinted.IsZero() && !arm.selfTest {
-		rec.tokenMinted = h.rt.firstMint()
+	// A cache hit returns attestation's pre-mint, minted before warmDone. After a
+	// failed pre-mint it returns the self-test's token, which only selftest_done
+	// bounds.
+	hitMinted := rec.warmDone
+	if h.premintFailed {
+		hitMinted = time.Time{}
+		rec.appendNote("attestation's pre-mint failed")
 	}
+	rec.tokenFetched, rec.tokenMinted = agingTokenInstants(h.rt.snapshot(), streamed, hitMinted)
 	switch {
 	case prep.preToken == "":
 	case streamed == prep.preToken:
@@ -752,8 +740,8 @@ func runAgingIteration(t *testing.T, arm agingArm, rec *agingRecord, d, separati
 		rec.tokenSame = "no"
 	}
 
-	// An arm that put a token in the daemon's cache before the stream only
-	// measures an aged token if the consumer was served that same one.
+	// An arm that fetched its own token or ran the self-test measures an aged
+	// token only if the consumer's own fetch was a cache hit.
 	if (prep.preToken != "" || arm.selfTest) && rec.potCache != "hit" {
 		rec.appendNote("consumer token fetch was not a cache hit (pot_cache=" + agingField(rec.potCache) + ")")
 	}
@@ -823,12 +811,11 @@ func agingDelay(t *testing.T) time.Duration {
 	return d
 }
 
-// agingSeparation reads the server.Config.MintSeparation override passed to
-// every in-process daemon this suite starts. Unset returns 0, which leaves each
-// daemon to resolve its own env-derived default (see resolveMintSeparation in
-// the minter package) rather than disabling the gate: only a positive override
-// takes effect, so removing the gate takes a small positive value such as "1ms",
-// not "0".
+// agingSeparation reads the server.Config.MintSeparation override for every
+// in-process daemon this suite starts. Unset returns 0, which leaves each
+// daemon its env-derived default (see resolveMintSeparation in the minter
+// package): only a positive override takes effect, so removing the gate takes
+// a small value such as "1ms", not "0".
 func agingSeparation(t *testing.T) time.Duration {
 	t.Helper()
 	raw := strings.TrimSpace(os.Getenv(agingSeparationEnv))
@@ -899,12 +886,10 @@ func TestAgingMatrix(t *testing.T) {
 		}
 	}
 	agingSummary(t, records)
-	// Every record is appended before its t.Run starts, so len(records) alone
-	// cannot catch an iteration that aborted partway (a fatal setup failure, or a
-	// t.Fatal inside agingStream): the record exists either way. outcome and
-	// streamStart are the fields runAgingIteration sets on every path it can
-	// return from (a full stream, a truncated one, or a stream error), so a
-	// record still missing either one never reached that point.
+	// Every record is appended before its t.Run starts, so len(records) cannot
+	// catch an iteration that aborted partway. runAgingIteration sets outcome and
+	// streamStart on every path it returns from, so a record missing either one
+	// never got that far.
 	for _, r := range records {
 		if r.outcome == "" || r.streamStart.IsZero() {
 			t.Errorf("arm=%s iter=%d did not complete: outcome=%q stream_start=%s",
@@ -937,10 +922,8 @@ func agingSummary(t *testing.T, records []*agingRecord) {
 		tl := byArm[a]
 		t.Logf("  %-16s %d/%d", a, tl.full, tl.total)
 	}
-	// An arm that watched the separation anchor is only meaningful when every one
-	// of its iterations waited on the anchor it names, so the tally is printed
-	// beside the outcomes rather than left to be grepped out of the per-iteration
-	// lines.
+	// An anchor-watching arm is meaningful only if every iteration waited on the
+	// anchor it names, so print that tally beside the outcomes.
 	anchored := false
 	for _, r := range records {
 		if r.anchor != "" || strings.Contains(r.note, "separation") {

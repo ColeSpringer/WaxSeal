@@ -8,14 +8,12 @@ import (
 )
 
 // Profile ownership is a lock on the marker file: an advisory flock on Unix, an
-// exclusive open on Windows. The mechanism differs, the contract does not, so
-// these tests are written against holdProfileLock and markerLockable and run on
-// both. The platform-specific behaviour each one relies on is pinned in
-// proc_unix_test.go and proc_windows_test.go.
+// exclusive open on Windows. These tests pin the shared contract through
+// holdProfileLock and markerLockable and run on both; proc_unix_test.go and
+// proc_windows_test.go pin the platform-specific behavior.
 
-// markProfileDir returns the open lock file instead of stashing it in a process
-// global. cleanup then removes the profile directory and releases the lock,
-// letting another daemon's reaper reclaim the slot.
+// markProfileDir returns the open lock file. The marker stays locked until
+// profileHandle.cleanup removes the directory and releases the lock.
 func TestProfileHandleCleanup(t *testing.T) {
 	dir, err := os.MkdirTemp(t.TempDir(), profilePrefix)
 	if err != nil {
@@ -39,8 +37,8 @@ func TestProfileHandleCleanup(t *testing.T) {
 }
 
 // A marker with no owner is free; one held by holdProfileLock is not; and
-// releasing the handle frees it again. That last step is what keeps a crashed
-// daemon from leaving a profile nobody may reclaim.
+// releasing the handle frees it again, so a crashed daemon's profile stays
+// reclaimable.
 func TestMarkerLockable(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), creatorMarkerFile)
 	if err := os.WriteFile(marker, []byte("123"), 0o600); err != nil {
@@ -104,14 +102,13 @@ func TestReapStaleProfiles(t *testing.T) {
 		return dir
 	}
 
-	// Backdated past markerGrace: the sweep writes and reaps in the same instant,
-	// which every real abandoned profile is minutes or hours away from.
+	// Backdated past markerGrace: this test writes and reaps in the same instant,
+	// while a real abandoned profile's marker is minutes or hours old.
 	dead := age(t, mk(".waxseal-11111111", true))
 	live := mk(".waxseal-22222222", true)
 	markerless := mk(".waxseal-33333333", false)
-	// A marker written moments ago belongs to a browser still starting:
-	// markProfileDir writes it before it takes the lock, so a fresh marker with a
-	// free lock is that window, not an abandoned profile.
+	// A fresh marker with a free lock is a browser still starting (see
+	// markerGrace), not an abandoned profile.
 	starting := mk(".waxseal-44444444", true)
 	backup := mk(".waxseal-backup", false)
 	sentinel := filepath.Join(backup, "important.txt")

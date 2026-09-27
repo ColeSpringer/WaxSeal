@@ -1,6 +1,6 @@
-// Package botguard holds the pure-Go parts of the POT flow: challenge
-// parse/descramble, GenerateIT, mint-driving, and PO-token validation. The
-// protobuf field-6 validator is a port of rustypipe's validate_potoken (MIT).
+// Package botguard holds the pure-Go parts of the POT flow: interpreter fetch,
+// GenerateIT, and PO-token validation. The protobuf field-6 validator is a port
+// of rustypipe's validate_potoken (MIT).
 package botguard
 
 import (
@@ -19,8 +19,7 @@ var ErrInvalidToken = errors.New("invalid po token")
 // both padded and unpadded base64url: the BgUtils u8ToBase64 helper emits
 // websafe chars but keeps '=' padding, while other producers strip it.
 //
-// On success it returns the field-6 bytes for diagnostics. Callers that only need
-// validity can ignore them.
+// On success it returns the field-6 bytes for diagnostics.
 func ValidatePOToken(token string) ([]byte, error) {
 	raw, err := decodeBase64URL(token)
 	if err != nil {
@@ -79,8 +78,8 @@ func bytesFromProtobuf(pb []byte, field uint32) ([]byte, bool) {
 				return nil, false
 			}
 			i += n
-			// Keep the bound check in uint64. A length above MaxInt64 would become
-			// negative when cast to int and could pass the old end check.
+			// Keep the bound check in uint64: a length above MaxInt64 turns negative
+			// when cast to int and would pass a signed end check.
 			if i > len(pb) || length > uint64(len(pb)-i) {
 				return nil, false // out of range / truncated
 			}
