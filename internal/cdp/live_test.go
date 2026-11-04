@@ -68,6 +68,18 @@ func spawnForTest(t *testing.T) *Browser {
 	return b
 }
 
+// killPID terminates one process by pid, for tests that need to simulate a
+// browser dying under the connection. Kill is SIGKILL on Unix, and Release
+// closes the pidfd or handle FindProcess opened.
+func killPID(pid int) error {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = p.Release() }()
+	return p.Kill()
+}
+
 func TestLiveVersionAndEval(t *testing.T) {
 	b := spawnForTest(t)
 

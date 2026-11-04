@@ -21,8 +21,8 @@ import (
 // contract. Each reduces to a shape (JSON key to value kind), so a field
 // missing or mistyped in one fails here instead of reaching a consumer.
 func TestPlayerContextShapeContract(t *testing.T) {
-	browserShape := structShape(reflect.TypeOf(browser.PlayerContext{}))
-	clientShape := structShape(reflect.TypeOf(client.PlayerContext{}))
+	browserShape := structShape(reflect.TypeFor[browser.PlayerContext]())
+	clientShape := structShape(reflect.TypeFor[client.PlayerContext]())
 
 	// The server embeds browser.PlayerContext and adds session_generation, so the
 	// client type carries exactly one key the browser type does not.
@@ -40,7 +40,7 @@ func TestPlayerContextShapeContract(t *testing.T) {
 // block the way TestPlayerContextShapeContract holds /player-context. WaxTap
 // reads the identity from this response, so a renamed key fails here.
 func TestSessionShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeOf(server.SessionResponse{})), readmeResponseShape(t, "/session")); diff != "" {
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.SessionResponse]()), readmeResponseShape(t, "/session")); diff != "" {
 		t.Errorf("the README /session block drifted from server.SessionResponse (the README shape is the contract):\n%s", diff)
 	}
 }
@@ -49,13 +49,13 @@ func TestSessionShapeContract(t *testing.T) {
 // and /report. They depend on those handlers writing structs: a map literal has
 // no shape to read.
 func TestGetPotShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeOf(server.TokenResponse{})), readmeResponseShape(t, "/get_pot")); diff != "" {
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.TokenResponse]()), readmeResponseShape(t, "/get_pot")); diff != "" {
 		t.Errorf("the README /get_pot block drifted from server.TokenResponse (the README shape is the contract):\n%s", diff)
 	}
 }
 
 func TestReportShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeOf(server.ReportResponse{})), readmeResponseShape(t, "/report")); diff != "" {
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.ReportResponse]()), readmeResponseShape(t, "/report")); diff != "" {
 		t.Errorf("the README /report block drifted from server.ReportResponse (the README shape is the contract):\n%s", diff)
 	}
 }
@@ -77,7 +77,7 @@ func TestStructShape(t *testing.T) {
 	type named struct {
 		C int `json:"c"`
 	}
-	type fixture struct {
+	type Fixture struct {
 		Promoted                   // untagged embedded struct: fields promoted
 		*ViaPointer                // through a pointer too
 		inner                      // unexported, but a struct, so it promotes
@@ -86,20 +86,24 @@ func TestStructShape(t *testing.T) {
 		Opts        int            `json:",omitempty"` // no name: the Go name
 		//lint:ignore U1000 structShape must skip this unexported field
 		unexported string
-		// Dash is named "-". Skipped follows it with another kind, so keeping
-		// Skipped would change the kind of "-".
-		//lint:ignore SA5008 tests encoding/json's "-," naming rule
-		Dash    string `json:"-,"`
-		Skipped bool   `json:"-"`
 		// ",string" makes a bool, number, or string a JSON string, following one
 		// pointer, and is ignored on other kinds.
 		Quoted     int    `json:"quoted,string"`
 		QuotedBool bool   `json:"quoted_bool,string"`
 		QuotedStr  string `json:"quoted_str,string"`
 		QuotedPtr  *int   `json:"quoted_ptr,string"`
-		//lint:ignore SA5008 tests that encoding/json ignores ",string" on a slice
-		QuotedSlice []int `json:"quoted_slice,string"`
 	}
+	// SA5008 rejects these tags although encoding/json honors them, and gopls
+	// reports SA5008 despite lint:ignore (the U1000 directives above serve
+	// staticcheck alone), so the fields are declared at run time. Dash is named
+	// "-". Skipped follows it with another kind, so keeping Skipped would change
+	// the kind of "-". QuotedSlice puts ",string" on a slice.
+	fixture := reflect.StructOf([]reflect.StructField{
+		{Name: "Fixture", Type: reflect.TypeFor[Fixture](), Anonymous: true},
+		{Name: "Dash", Type: reflect.TypeFor[string](), Tag: `json:"-,"`},
+		{Name: "Skipped", Type: reflect.TypeFor[bool](), Tag: `json:"-"`},
+		{Name: "QuotedSlice", Type: reflect.TypeFor[[]int](), Tag: `json:"quoted_slice,string"`},
+	})
 	want := shape{
 		"a": "string", "b": "bool", "d": "string",
 		"named": "object", "named.c": "number",
@@ -107,13 +111,16 @@ func TestStructShape(t *testing.T) {
 		"quoted": "string", "quoted_bool": "string", "quoted_str": "string",
 		"quoted_ptr": "string", "quoted_slice": "array",
 	}
-	if diff := shapeDiff(want, structShape(reflect.TypeOf(fixture{}))); diff != "" {
+	if diff := shapeDiff(want, structShape(fixture)); diff != "" {
 		t.Errorf("structShape(fixture) differs from encoding/json:\n%s", diff)
 	}
 
 	// encoding/json is the reference. The value leaves no field to be dropped or
 	// encoded as null, so its encoding must carry exactly want.
-	raw, err := json.Marshal(fixture{ViaPointer: &ViaPointer{}, Opts: 1, QuotedPtr: new(int), QuotedSlice: []int{}})
+	val := reflect.New(fixture).Elem()
+	val.FieldByName("Fixture").Set(reflect.ValueOf(Fixture{ViaPointer: &ViaPointer{}, Opts: 1, QuotedPtr: new(int)}))
+	val.FieldByName("QuotedSlice").Set(reflect.ValueOf([]int{}))
+	raw, err := json.Marshal(val.Interface())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +151,7 @@ type shape map[string]string
 // compared struct has them.
 func structShape(typ reflect.Type) shape {
 	out := make(shape)
-	for i := range typ.NumField() {
-		f := typ.Field(i)
+	for f := range typ.Fields() {
 		ft := f.Type
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
@@ -276,7 +282,7 @@ func shapeDiff(want, got shape) string {
 	}{{"missing", missing}, {"unexpected", extra}, {"kind differs", differ}} {
 		if len(sec.keys) > 0 {
 			slices.Sort(sec.keys)
-			b.WriteString("  " + sec.label + ": " + strings.Join(sec.keys, ", ") + "\n")
+			fmt.Fprintf(&b, "  %s: %s\n", sec.label, strings.Join(sec.keys, ", "))
 		}
 	}
 	return b.String()

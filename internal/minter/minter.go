@@ -1913,7 +1913,7 @@ func (m *Minter) sessionDied(sess minterSession, gen uint64, what string, err er
 // One call is thus at most four bounded round trips plus a bounded teardown;
 // the server follows any answer but ok with its own browser check.
 func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		m.mu.Lock()
 		sess, gen := m.sess, m.gen
 		m.mu.Unlock()
@@ -1935,9 +1935,9 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 			return failHealth(gen, ctx.Err())
 		}
 		// A failure from a replaced session says nothing about its replacement, so
-		// probe that instead. Guarding on supersession alone, not attempt, lets
-		// constant churn fall through to a soft no-session instead of a misleading
-		// probe-failed (503) on the last attempt.
+		// probe that instead. Guarding on supersession alone, not on which attempt
+		// this is, lets constant churn fall through to a soft no-session instead of
+		// a misleading probe-failed (503) on the last attempt.
 		if m.isSuperseded(sess, gen) {
 			continue
 		}

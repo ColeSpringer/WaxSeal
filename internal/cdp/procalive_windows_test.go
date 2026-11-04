@@ -2,10 +2,7 @@
 
 package cdp
 
-import (
-	"os"
-	"syscall"
-)
+import "syscall"
 
 const (
 	processQueryInformation = 0x0400
@@ -25,14 +22,4 @@ func processAlive(pid int) bool {
 	defer func() { _ = syscall.CloseHandle(h) }()
 	ev, werr := syscall.WaitForSingleObject(h, 0)
 	return werr == nil && ev == waitTimeout
-}
-
-// killPID terminates one process by pid, for tests that need to simulate a
-// browser dying under the connection.
-func killPID(pid int) error {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Kill()
 }

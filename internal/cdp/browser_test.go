@@ -270,8 +270,8 @@ func TestIncognitoFailedDisposeIsRetried(t *testing.T) {
 	// A dispose must be the next frame; a read timeout here means none was sent.
 	done := goClose(incog)
 	answerDispose(t, br, reqR, respW, "C1", `"error":{"code":-32000,"message":"boom"}`)
-	var re *rpcError
-	if err := waitClose(t, done, br, reqR); !errors.As(err, &re) {
+	err := waitClose(t, done, br, reqR)
+	if _, ok := errors.AsType[*rpcError](err); !ok {
 		t.Fatalf("Close = %v, want the dispose's rpc error", err)
 	}
 	done = goClose(incog)

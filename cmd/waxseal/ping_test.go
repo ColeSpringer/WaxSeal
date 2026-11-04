@@ -406,8 +406,7 @@ func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
 		c.SetOut(io.Discard)
 		c.SetErr(io.Discard)
 		err := c.Execute()
-		var ue *usageError
-		if !errors.As(err, &ue) {
+		if _, ok := errors.AsType[*usageError](err); !ok {
 			t.Fatalf("ping --key %q = %v, want a usage error", key, err)
 		}
 		if !strings.Contains(err.Error(), "--key") {

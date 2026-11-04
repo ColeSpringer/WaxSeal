@@ -105,7 +105,7 @@ func TestInterpreterCacheURLKey(t *testing.T) {
 	ctx := context.Background()
 	const url = "https://www.youtube.com/s/player/abc/bg.js"
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ch := &Challenge{InterpreterURL: url} // no hash
 		if err := ResolveInterpreter(ctx, client, ch, ""); err != nil {
 			t.Fatalf("resolve %d: %v", i, err)

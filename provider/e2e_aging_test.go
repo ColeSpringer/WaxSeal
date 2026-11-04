@@ -503,9 +503,6 @@ type agingArm struct {
 	run         func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep
 }
 
-// agingGap makes an arm's own delay addressable.
-func agingGap(d time.Duration) *time.Duration { return &d }
-
 // agingArms isolates one artifact's age per row. Every arm streams the same
 // video from a daemon warmed moments earlier, so the only difference between two
 // rows is which artifact was allowed to get old.
@@ -597,7 +594,7 @@ var agingArms = []agingArm{
 func agingMintGapArm(name string, gap time.Duration) agingArm {
 	return agingArm{
 		name: name,
-		gap:  agingGap(gap),
+		gap:  new(gap),
 		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			sess, err := h.c.Session(ctx)
 			if err != nil {
@@ -632,7 +629,7 @@ var agingMintGapArms = []agingArm{
 		// reaches the stream already old without the consumer arranging it.
 		name:     "selftest_gap30",
 		selfTest: true,
-		gap:      agingGap(30 * time.Second),
+		gap:      new(30 * time.Second),
 		run: func(t *testing.T, ctx context.Context, h *agingHarness, d time.Duration) agingPrep {
 			agingSleep(t, ctx, d)
 			return agingPrep{pc: newAgingLive(h.p)}
@@ -650,8 +647,8 @@ func agingProofGapArm(name string, gap time.Duration) agingArm {
 	return agingArm{
 		name:        name,
 		selfTest:    true,
-		gap:         agingGap(gap),
-		separation:  agingGap(gap),
+		gap:         new(gap),
+		separation:  new(gap),
 		watchAnchor: true,
 		run: func(_ *testing.T, _ context.Context, h *agingHarness, _ time.Duration) agingPrep {
 			return agingPrep{pc: newAgingLive(h.p)}

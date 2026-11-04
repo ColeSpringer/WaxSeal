@@ -19,13 +19,13 @@ import (
 // Concurrent callers that observed the same stale instance share one relaunch.
 func TestPoolRelaunchSingleFlight(t *testing.T) {
 	stale := &browserInstance{}
-	var created int64
+	var created atomic.Int64
 	var once sync.Once
 	started := make(chan struct{})
 	release := make(chan struct{})
 	p := &Pool{opts: withDefaults(Options{}), cur: stale}
 	p.newInstance = func() (*browserInstance, error) {
-		atomic.AddInt64(&created, 1)
+		created.Add(1)
 		once.Do(func() { close(started) })
 		<-release // Keep the relaunch in progress until all callers are waiting.
 		return &browserInstance{}, nil
@@ -35,19 +35,18 @@ func TestPoolRelaunchSingleFlight(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make([]*browserInstance, n)
 	errs := make([]error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) { defer wg.Done(); results[i], errs[i] = p.relaunch(context.Background(), stale) }(i)
+	for i := range n {
+		wg.Go(func() { results[i], errs[i] = p.relaunch(context.Background(), stale) })
 	}
 	<-started
 	time.Sleep(25 * time.Millisecond) // Allow the remaining callers to begin waiting.
 	close(release)
 	wg.Wait()
 
-	if got := atomic.LoadInt64(&created); got != 1 {
+	if got := created.Load(); got != 1 {
 		t.Errorf("newInstance called %d times, want 1", got)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if errs[i] != nil {
 			t.Errorf("relaunch[%d] err = %v", i, errs[i])
 		}
@@ -61,9 +60,9 @@ func TestPoolRelaunchSingleFlight(t *testing.T) {
 func TestPoolRelaunchShortCircuitsWhenAlreadySwapped(t *testing.T) {
 	stale := &browserInstance{}
 	fresh := &browserInstance{}
-	var created int64
+	var created atomic.Int64
 	p := &Pool{opts: withDefaults(Options{}), cur: fresh}
-	p.newInstance = func() (*browserInstance, error) { atomic.AddInt64(&created, 1); return &browserInstance{}, nil }
+	p.newInstance = func() (*browserInstance, error) { created.Add(1); return &browserInstance{}, nil }
 
 	got, err := p.relaunch(context.Background(), stale)
 	if err != nil {
@@ -72,7 +71,7 @@ func TestPoolRelaunchShortCircuitsWhenAlreadySwapped(t *testing.T) {
 	if got != fresh {
 		t.Error("relaunch should return the already-current instance")
 	}
-	if atomic.LoadInt64(&created) != 0 {
+	if created.Load() != 0 {
 		t.Error("newInstance was called after the stale instance was replaced")
 	}
 }
@@ -80,24 +79,24 @@ func TestPoolRelaunchShortCircuitsWhenAlreadySwapped(t *testing.T) {
 // A failed relaunch starts a backoff window before another launch is allowed.
 func TestPoolRelaunchBackoffAfterFailure(t *testing.T) {
 	stale := &browserInstance{}
-	var created int64
+	var created atomic.Int64
 	p := &Pool{opts: withDefaults(Options{}), cur: stale}
 	p.newInstance = func() (*browserInstance, error) {
-		atomic.AddInt64(&created, 1)
+		created.Add(1)
 		return nil, errors.New("launch failed")
 	}
 
 	if _, err := p.relaunch(context.Background(), stale); err == nil {
 		t.Fatal("first relaunch should return the launch error")
 	}
-	if got := atomic.LoadInt64(&created); got != 1 {
+	if got := created.Load(); got != 1 {
 		t.Fatalf("newInstance calls = %d, want 1", got)
 	}
 	_, err := p.relaunch(context.Background(), stale)
 	if err == nil {
 		t.Fatal("second relaunch within the backoff window should fail fast")
 	}
-	if got := atomic.LoadInt64(&created); got != 1 {
+	if got := created.Load(); got != 1 {
 		t.Errorf("newInstance calls during backoff = %d, want 1", got)
 	}
 	// The wait is typed so the minter can pass it to the caller as Retry-After.
@@ -138,13 +137,13 @@ func TestPoolBackoffWindow(t *testing.T) {
 // A browser that survives relaunchStableWindow starts a new backoff streak.
 func TestPoolRelaunchResetsStreakAfterStableGap(t *testing.T) {
 	stale := &browserInstance{}
-	var created int64
+	var created atomic.Int64
 	p := &Pool{opts: withDefaults(Options{}), cur: stale, relaunchStreak: 5, lastRelaunchAt: time.Now().Add(-time.Hour)}
-	p.newInstance = func() (*browserInstance, error) { atomic.AddInt64(&created, 1); return &browserInstance{}, nil }
+	p.newInstance = func() (*browserInstance, error) { created.Add(1); return &browserInstance{}, nil }
 	if _, err := p.relaunch(context.Background(), stale); err != nil {
 		t.Fatalf("a relaunch after a long stable gap must not back off: %v", err)
 	}
-	if got := atomic.LoadInt64(&created); got != 1 {
+	if got := created.Load(); got != 1 {
 		t.Errorf("newInstance calls = %d, want 1", got)
 	}
 	if p.relaunchStreak != 1 {
@@ -170,10 +169,10 @@ func TestPoolRelaunchHoldsCeilingDuringCrashLoop(t *testing.T) {
 // A browser that starts and dies during setup still contributes to the backoff.
 func TestPoolRelaunchBackoffOnCrashLoop(t *testing.T) {
 	stale := &browserInstance{}
-	var created int64
+	var created atomic.Int64
 	p := &Pool{opts: withDefaults(Options{}), cur: stale}
 	p.newInstance = func() (*browserInstance, error) {
-		atomic.AddInt64(&created, 1)
+		created.Add(1)
 		return &browserInstance{}, nil
 	}
 	inst1, err := p.relaunch(context.Background(), stale)
@@ -183,7 +182,7 @@ func TestPoolRelaunchBackoffOnCrashLoop(t *testing.T) {
 	if _, err := p.relaunch(context.Background(), inst1); err == nil {
 		t.Fatal("immediate relaunch after a post-launch crash should be rejected")
 	}
-	if got := atomic.LoadInt64(&created); got != 1 {
+	if got := created.Load(); got != 1 {
 		t.Errorf("newInstance calls = %d, want 1", got)
 	}
 }
@@ -201,19 +200,18 @@ func TestPoolRelaunchClosedBlocks(t *testing.T) {
 
 // Concurrent relaunch callers tear down the stale instance exactly once.
 func TestPoolRelaunchDisposesStaleOnce(t *testing.T) {
-	var teardowns int64
-	stale := &browserInstance{onTeardown: func() { atomic.AddInt64(&teardowns, 1) }}
+	var teardowns atomic.Int64
+	stale := &browserInstance{onTeardown: func() { teardowns.Add(1) }}
 	p := &Pool{opts: withDefaults(Options{}), cur: stale}
 	p.newInstance = func() (*browserInstance, error) { return &browserInstance{}, nil }
 
 	const n = 6
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); _, _ = p.relaunch(context.Background(), stale) }()
+	for range n {
+		wg.Go(func() { _, _ = p.relaunch(context.Background(), stale) })
 	}
 	wg.Wait()
-	if got := atomic.LoadInt64(&teardowns); got != 1 {
+	if got := teardowns.Load(); got != 1 {
 		t.Errorf("stale teardown count = %d, want 1", got)
 	}
 }
@@ -255,7 +253,7 @@ func TestPoolRelaunchWaitHonoursTheCallersContext(t *testing.T) {
 
 // Close discards and tears down a replacement that finishes concurrently.
 func TestPoolCloseDuringRelaunch(t *testing.T) {
-	var newTorn int64
+	var newTorn atomic.Int64
 	stale := &browserInstance{}
 	enter := make(chan struct{})
 	release := make(chan struct{})
@@ -263,7 +261,7 @@ func TestPoolCloseDuringRelaunch(t *testing.T) {
 	p.newInstance = func() (*browserInstance, error) {
 		close(enter)
 		<-release
-		return &browserInstance{onTeardown: func() { atomic.AddInt64(&newTorn, 1) }}, nil
+		return &browserInstance{onTeardown: func() { newTorn.Add(1) }}, nil
 	}
 
 	done := make(chan struct{})
@@ -278,7 +276,7 @@ func TestPoolCloseDuringRelaunch(t *testing.T) {
 	if !errors.Is(relErr, ErrPoolClosed) {
 		t.Errorf("relaunch during Close = %v, want ErrPoolClosed", relErr)
 	}
-	if got := atomic.LoadInt64(&newTorn); got != 1 {
+	if got := newTorn.Load(); got != 1 {
 		t.Errorf("replacement teardown count = %d, want 1", got)
 	}
 	if p.cur != nil {
@@ -288,15 +286,14 @@ func TestPoolCloseDuringRelaunch(t *testing.T) {
 
 // teardown runs at most once when Close races with relaunch.
 func TestBrowserInstanceTeardownIdempotent(t *testing.T) {
-	var n int64
-	inst := &browserInstance{onTeardown: func() { atomic.AddInt64(&n, 1) }}
+	var n atomic.Int64
+	inst := &browserInstance{onTeardown: func() { n.Add(1) }}
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); inst.teardown() }()
+	for range 5 {
+		wg.Go(func() { inst.teardown() })
 	}
 	wg.Wait()
-	if got := atomic.LoadInt64(&n); got != 1 {
+	if got := n.Load(); got != 1 {
 		t.Errorf("teardown ran %d times, want 1", got)
 	}
 }
@@ -544,9 +541,8 @@ func TestPoolHealthConcurrentConfirmationsActOnce(t *testing.T) {
 	recs := make([]Recovery, n)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) { defer wg.Done(); recs[i], errs[i] = p.Health(context.Background()) }(i)
+	for i := range n {
+		wg.Go(func() { recs[i], errs[i] = p.Health(context.Background()) })
 	}
 	wg.Wait()
 	if torn != 1 || *launches != 1 {
@@ -554,7 +550,7 @@ func TestPoolHealthConcurrentConfirmationsActOnce(t *testing.T) {
 	}
 	wantCounts(t, p, 1, 0)
 	tornDown := 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if errs[i] != nil {
 			t.Errorf("Health[%d] err = %v", i, errs[i])
 		}

@@ -44,14 +44,14 @@ func TestReadBodyCapped(t *testing.T) {
 }
 
 func TestDoRetriesThenSucceeds(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Body must survive every retry (rewound via GetBody).
 		b, _ := io.ReadAll(r.Body)
 		if string(b) != "payload" {
-			t.Errorf("attempt %d body = %q", atomic.LoadInt32(&hits), b)
+			t.Errorf("attempt %d body = %q", hits.Load(), b)
 		}
-		if atomic.AddInt32(&hits, 1) <= 2 {
+		if hits.Add(1) <= 2 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -70,7 +70,7 @@ func TestDoRetriesThenSucceeds(t *testing.T) {
 	if string(body) != "ok" {
 		t.Fatalf("body = %q", body)
 	}
-	if got := atomic.LoadInt32(&hits); got != 3 {
+	if got := hits.Load(); got != 3 {
 		t.Fatalf("server hit %d times, want 3 (2 fail + 1 ok)", got)
 	}
 }
@@ -79,9 +79,9 @@ func TestDoRetriesThenSucceeds(t *testing.T) {
 // short close) must be retried by DoJSON rather than surfaced as a failure. The
 // request only succeeded at the header level.
 func TestDoJSONRetriesOnMidBodyDrop(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			w.Header().Set("Content-Length", "2048") // promise more than we write
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("truncated-body")) // then return with a short close
@@ -102,7 +102,7 @@ func TestDoJSONRetriesOnMidBodyDrop(t *testing.T) {
 	if string(body) != "complete" {
 		t.Fatalf("body = %q, want complete (the retried, intact response)", body)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
+	if got := hits.Load(); got != 2 {
 		t.Fatalf("server hit %d times, want 2 (truncated then complete)", got)
 	}
 }
@@ -110,9 +110,9 @@ func TestDoJSONRetriesOnMidBodyDrop(t *testing.T) {
 // An attempt cut off by http.Client.Timeout is retried while the caller's
 // context is live, although its error matches context.DeadlineExceeded.
 func TestDoJSONRetriesClientTimeoutAwaitingHeaders(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			<-r.Context().Done() // no headers until the client times out and hangs up
 			return
 		}
@@ -127,21 +127,21 @@ func TestDoJSONRetriesClientTimeoutAwaitingHeaders(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
 	body, err := c.DoJSON(req, 1<<10)
 	if err != nil {
-		t.Fatalf("DoJSON should retry the timed-out attempt: %v (server hit %d times)", err, atomic.LoadInt32(&hits))
+		t.Fatalf("DoJSON should retry the timed-out attempt: %v (server hit %d times)", err, hits.Load())
 	}
 	if string(body) != "ok" {
 		t.Fatalf("body = %q", body)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
+	if got := hits.Load(); got != 2 {
 		t.Fatalf("server hit %d times, want 2 (timed out then ok)", got)
 	}
 }
 
 // A Client.Timeout that fires mid-body is retried the same way.
 func TestDoJSONRetriesClientTimeoutReadingBody(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush() // headers go out; the body never does
 			<-r.Context().Done()
@@ -158,12 +158,12 @@ func TestDoJSONRetriesClientTimeoutReadingBody(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
 	body, err := c.DoJSON(req, 1<<10)
 	if err != nil {
-		t.Fatalf("DoJSON should retry the timed-out body read: %v (server hit %d times)", err, atomic.LoadInt32(&hits))
+		t.Fatalf("DoJSON should retry the timed-out body read: %v (server hit %d times)", err, hits.Load())
 	}
 	if string(body) != "complete" {
 		t.Fatalf("body = %q, want complete (the retried response)", body)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
+	if got := hits.Load(); got != 2 {
 		t.Fatalf("server hit %d times, want 2 (stalled body then complete)", got)
 	}
 }
@@ -171,9 +171,9 @@ func TestDoJSONRetriesClientTimeoutReadingBody(t *testing.T) {
 // After a per-attempt timeout, a retry starts only if a whole attempt still
 // fits the caller's deadline; otherwise that timeout returns at once.
 func TestDoJSONTimeoutRetryMustFitAttempt(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		<-r.Context().Done() // every attempt stalls until the client gives up
 	}))
 	defer srv.Close()
@@ -195,7 +195,7 @@ func TestDoJSONTimeoutRetryMustFitAttempt(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Client.Timeout") {
 		t.Fatalf("err = %v, want the first attempt's Client.Timeout error", err)
 	}
-	if got := atomic.LoadInt32(&hits); got > 1 {
+	if got := hits.Load(); got > 1 {
 		t.Fatalf("server hit %d times, want at most 1 (no room for a retry)", got)
 	}
 	if elapsed > 1500*time.Millisecond {
@@ -204,9 +204,9 @@ func TestDoJSONTimeoutRetryMustFitAttempt(t *testing.T) {
 }
 
 func TestDoGivesUpAfterMaxRetries(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
@@ -218,15 +218,15 @@ func TestDoGivesUpAfterMaxRetries(t *testing.T) {
 	if _, err := c.DoJSON(req, 1<<10); err == nil {
 		t.Fatal("want error after exhausting retries")
 	}
-	if got := atomic.LoadInt32(&hits); got != 3 {
+	if got := hits.Load(); got != 3 {
 		t.Fatalf("server hit %d times, want 3 (1 + 2 retries)", got)
 	}
 }
 
 func TestDoHonorsRetryAfter(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
@@ -314,9 +314,9 @@ func TestDoJSONCanceledDuringBackoffReturnsContextCanceled(t *testing.T) {
 // that provoked it reported, not slept into a bare context timeout. The server
 // is hit once, since the retry could not have completed anyway.
 func TestDoJSONDeadlineTooShortReportsStatus(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		w.Header().Set("Retry-After", "5")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
@@ -344,7 +344,7 @@ func TestDoJSONDeadlineTooShortReportsStatus(t *testing.T) {
 	if elapsed > time.Second {
 		t.Fatalf("returned after %v, want an immediate fail-fast (no backoff sleep)", elapsed)
 	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
+	if got := hits.Load(); got != 1 {
 		t.Fatalf("server hit %d times, want 1 (the retry cannot fit the deadline)", got)
 	}
 }
@@ -352,9 +352,9 @@ func TestDoJSONDeadlineTooShortReportsStatus(t *testing.T) {
 // A deadline with room to spare must still back off and retry: the fail-fast is
 // scoped to pauses the caller's budget cannot absorb, not to deadlines generally.
 func TestDoJSONRoomyDeadlineStillRetries(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -377,7 +377,7 @@ func TestDoJSONRoomyDeadlineStillRetries(t *testing.T) {
 	if string(body) != "ok" {
 		t.Fatalf("body = %q", body)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
+	if got := hits.Load(); got != 2 {
 		t.Fatalf("server hit %d times, want 2 (503 then ok)", got)
 	}
 }
@@ -432,9 +432,9 @@ func TestDoNoRetryOnCanceledContext(t *testing.T) {
 // The caller's own deadline ends the sequence: no retry, and the error still
 // matches context.DeadlineExceeded.
 func TestDoJSONCallerDeadlineNotRetried(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		<-r.Context().Done()
 	}))
 	defer srv.Close()
@@ -451,7 +451,7 @@ func TestDoJSONCallerDeadlineNotRetried(t *testing.T) {
 		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 	// A loaded runner can miss the first hit inside 100 ms; only a retry fails.
-	if got := atomic.LoadInt32(&hits); got > 1 {
+	if got := hits.Load(); got > 1 {
 		t.Fatalf("server hit %d times, want at most 1 (the caller's deadline is final)", got)
 	}
 }
@@ -459,9 +459,9 @@ func TestDoJSONCallerDeadlineNotRetried(t *testing.T) {
 // A retry cut off by the caller's deadline reports the failure that forced it,
 // with the deadline wrapped too.
 func TestDoJSONRetryCutByDeadlineKeepsCause(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&hits, 1) == 1 {
+		if hits.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -484,18 +484,18 @@ func TestDoJSONRetryCutByDeadlineKeepsCause(t *testing.T) {
 	if !strings.Contains(err.Error(), "503") {
 		t.Fatalf("err = %v, want it to name the 503 that forced the retry", err)
 	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
+	if got := hits.Load(); got != 2 {
 		t.Fatalf("server hit %d times, want 2 (503 then the stalled retry)", got)
 	}
 }
 
 // A caller that cancels mid-attempt gets context.Canceled and no retry.
 func TestDoJSONCallerCancelNotRetried(t *testing.T) {
-	var hits int32
+	var hits atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
+		hits.Add(1)
 		cancel() // the caller gives up while this attempt is in flight
 		<-r.Context().Done()
 	}))
@@ -510,7 +510,7 @@ func TestDoJSONCallerCancelNotRetried(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
+	if got := hits.Load(); got != 1 {
 		t.Fatalf("server hit %d times, want 1 (a canceled caller is not retried)", got)
 	}
 }

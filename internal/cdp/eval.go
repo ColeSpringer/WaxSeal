@@ -136,8 +136,8 @@ var contextLostMessages = []string{
 
 // isContextLost reports whether err is an RPC-level context-loss error.
 func isContextLost(err error) bool {
-	var re *rpcError
-	if !errors.As(err, &re) {
+	re, ok := errors.AsType[*rpcError](err)
+	if !ok {
 		return false
 	}
 	for _, m := range contextLostMessages {

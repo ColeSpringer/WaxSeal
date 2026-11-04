@@ -27,7 +27,7 @@ func TestArgvGolden(t *testing.T) {
 	const profile = "/waxseal-profile"
 
 	var want []string
-	for _, line := range strings.Split(strings.TrimSpace(string(readFixture(t, "argv_baseline.txt"))), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(readFixture(t, "argv_baseline.txt"))), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

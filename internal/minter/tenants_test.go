@@ -174,19 +174,17 @@ func TestTenantsConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for _, k := range []string{"A", "B", "C"} {
-		for i := 0; i < 8; i++ {
-			wg.Add(1)
-			go func(key string) {
-				defer wg.Done()
-				m, _, err := tn.Minter(key)
+		for range 8 {
+			wg.Go(func() {
+				m, _, err := tn.Minter(k)
 				if err != nil {
-					t.Errorf("Minter(%q): %v", key, err)
+					t.Errorf("Minter(%q): %v", k, err)
 					return
 				}
 				if _, _, err := m.Mint(ctx, "gvs", "vd"); err != nil {
-					t.Errorf("Mint(%q): %v", key, err)
+					t.Errorf("Mint(%q): %v", k, err)
 				}
-			}(k)
+			})
 		}
 	}
 	wg.Wait()

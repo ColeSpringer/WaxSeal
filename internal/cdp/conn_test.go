@@ -135,8 +135,8 @@ func TestConnErrorWithObjectDataCompletesCall(t *testing.T) {
 
 	select {
 	case err := <-done:
-		var re *rpcError
-		if !errors.As(err, &re) {
+		re, ok := errors.AsType[*rpcError](err)
+		if !ok {
 			t.Fatalf("rawCall error = %v; want *rpcError", err)
 		}
 		if re.Code != -32000 || !strings.Contains(re.Message, "boom") {
@@ -169,8 +169,8 @@ func TestConnErrorWithStringDataCompletesCall(t *testing.T) {
 
 	select {
 	case err := <-done:
-		var re *rpcError
-		if !errors.As(err, &re) {
+		re, ok := errors.AsType[*rpcError](err)
+		if !ok {
 			t.Fatalf("rawCall error = %v; want *rpcError", err)
 		}
 		if !strings.Contains(re.Error(), "detail text") {

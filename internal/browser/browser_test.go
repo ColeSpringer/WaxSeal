@@ -26,8 +26,7 @@ func TestSessionCloseOnce(t *testing.T) {
 	s := &Session{dispose: func() { calls.Add(1) }}
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Add(1)
-		go func() { defer wg.Done(); s.Close() }()
+		wg.Go(func() { s.Close() })
 	}
 	wg.Wait()
 	if got := calls.Load(); got != 1 {
@@ -395,15 +394,15 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 		t.Fatal("playerContextExtractJS success literal is unterminated")
 	}
 	literal = literal[:end]
-	typ := reflect.TypeOf(PlayerContext{})
+	typ := reflect.TypeFor[PlayerContext]()
 	names := func(t *testing.T, in, key string) {
 		t.Helper()
 		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(key) + `:`).MatchString(in) {
 			t.Errorf("playerContextExtractJS never emits %q", key)
 		}
 	}
-	for i := range typ.NumField() {
-		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+	for field := range typ.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if _, ok := sessionFilledContextKeys[name]; ok {
 			continue
 		}
@@ -423,9 +422,8 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 		t.Fatal("playerContextExtractJS evidence literal is unterminated")
 	}
 	evidence = evidence[:end]
-	raw := reflect.TypeOf(playerContextRaw{})
-	for i := range raw.NumField() {
-		f := raw.Field(i)
+	raw := reflect.TypeFor[playerContextRaw]()
+	for f := range raw.Fields() {
 		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
 		// The embedded context is the success literal's business, and every payload
 		// sets error itself rather than taking it from the evidence block.

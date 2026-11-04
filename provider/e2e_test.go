@@ -617,19 +617,14 @@ func TestPlayerContextFieldsHTTP(t *testing.T) {
 		if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
 			t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
 		}
-		switch {
-		case pc.PublishDate == "":
+		if pc.PublishDate == "" {
 			t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
-		default:
-			if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
-				if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
-					t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
-				} else {
-					t.Logf("publish_date = %q (bare date)", pc.PublishDate)
-				}
-			} else {
-				t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
-			}
+		} else if _, err := time.Parse(time.RFC3339, pc.PublishDate); err == nil {
+			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+		} else if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr == nil {
+			t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+		} else {
+			t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
 		}
 		// The context's identity must be the one /session exports, or a consumer
 		// that streams under the context would present a different browser than

@@ -958,8 +958,7 @@ func presentErr(s string) string { return clampErrText(strings.ReplaceAll(s, "wa
 // decodeErrMsg returns a stable client-facing message for a JSON decoding error
 // without exposing Go type information.
 func decodeErrMsg(err error) string {
-	var maxErr *http.MaxBytesError
-	if errors.As(err, &maxErr) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		return "request body too large (max 1 MiB)"
 	}
 	if isReadTimeout(err) {
@@ -973,12 +972,10 @@ func decodeErrMsg(err error) string {
 	}
 	// json.Decoder reports some syntax errors, including unterminated strings, as
 	// io.ErrUnexpectedEOF. Other syntax errors reach this branch.
-	var se *json.SyntaxError
-	if errors.As(err, &se) {
+	if _, ok := errors.AsType[*json.SyntaxError](err); ok {
 		return "request body contains malformed JSON"
 	}
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &typeErr) {
+	if typeErr, ok := errors.AsType[*json.UnmarshalTypeError](err); ok {
 		switch {
 		case typeErr.Field == "":
 			return "request body must be a JSON object"
@@ -1040,8 +1037,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 	// such as when a valid object is followed by too much whitespace, and a client
 	// that stopped sending mid-body arrives here as the read timeout.
 	msg := "request body must be a single JSON object"
-	var maxErr *http.MaxBytesError
-	if errors.As(err, &maxErr) || isReadTimeout(err) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok || isReadTimeout(err) {
 		msg = decodeErrMsg(err)
 	}
 	writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
@@ -1073,10 +1069,12 @@ func unknownField(raw json.RawMessage, dst any) (string, bool) {
 	return fmt.Sprintf("request body contains unknown field %q", first), true
 }
 
-// jsonFieldNames returns the JSON names the struct type t accepts. An untagged
-// embedded struct contributes its promoted fields, not its type name. A
-// non-struct yields an empty set, so a caller that passes one rejects every key
-// instead of panicking or silently losing the strictness it asked for.
+// jsonFieldNames returns the JSON names the struct type t accepts, by
+// encoding/json's rules: it skips fields tagged exactly "-" and unexported
+// fields other than embedded structs, and an untagged embedded struct
+// contributes its promoted fields, not its type name. A non-struct yields an
+// empty set, so a caller that passes one rejects every key instead of
+// panicking or silently losing the strictness it asked for.
 func jsonFieldNames(t reflect.Type) map[string]bool {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -1085,19 +1083,24 @@ func jsonFieldNames(t reflect.Type) map[string]bool {
 	if t.Kind() != reflect.Struct {
 		return names
 	}
-	for i := range t.NumField() {
-		f := t.Field(i)
-		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
-		if f.Anonymous && name == "" {
-			for k := range jsonFieldNames(f.Type) {
+	for f := range t.Fields() {
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		embeddedStruct := f.Anonymous && ft.Kind() == reflect.Struct
+		tag := f.Tag.Get("json")
+		if tag == "-" || (!f.IsExported() && !embeddedStruct) {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" && embeddedStruct {
+			for k := range jsonFieldNames(ft) {
 				names[k] = true
 			}
 			continue
 		}
-		switch name {
-		case "-":
-			continue
-		case "":
+		if name == "" {
 			name = f.Name
 		}
 		names[name] = true
@@ -1107,8 +1110,8 @@ func jsonFieldNames(t reflect.Type) map[string]bool {
 
 // isReadTimeout reports whether err is the request body's read deadline firing.
 func isReadTimeout(err error) bool {
-	var ne net.Error
-	return errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+	ne, ok := errors.AsType[net.Error](err)
+	return errors.Is(err, os.ErrDeadlineExceeded) || (ok && ne.Timeout())
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {

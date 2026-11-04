@@ -425,8 +425,7 @@ func TestEstablishUnplayableIsTerminal(t *testing.T) {
 	if !errors.Is(err, ErrUnplayable) {
 		t.Fatalf("establish error = %v, want ErrUnplayable", err)
 	}
-	var ue *UnplayableError
-	if !errors.As(err, &ue) || ue.Status != "LOGIN_REQUIRED" {
+	if ue, ok := errors.AsType[*UnplayableError](err); !ok || ue.Status != "LOGIN_REQUIRED" {
 		t.Errorf("error = %v, want an UnplayableError carrying LOGIN_REQUIRED", err)
 	}
 	if got := page.evalCount(playerContextExtractJS); got != 1 {
@@ -445,8 +444,8 @@ func TestEstablishPrivateWithoutVideoDetailsIsTerminal(t *testing.T) {
 	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
 	s := newFakeSession(page)
 	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
-	var ue *UnplayableError
-	if !errors.As(err, &ue) || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Private video" {
+	ue, ok := errors.AsType[*UnplayableError](err)
+	if !ok || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Private video" {
 		t.Fatalf("err = %v, want UnplayableError LOGIN_REQUIRED / Private video", err)
 	}
 	if ue.UnrecognizedLogin {
@@ -507,8 +506,7 @@ func TestEstablishLiveBroadcastIsTerminal(t *testing.T) {
 	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
 	s := newFakeSession(page)
 	_, err := s.establishStatus1(context.Background(), page, "vid", s.timing.establishTimeout, s.timing.confirmBudget)
-	var ue *UnplayableError
-	if !errors.As(err, &ue) || ue.Status != LiveBroadcastStatus {
+	if ue, ok := errors.AsType[*UnplayableError](err); !ok || ue.Status != LiveBroadcastStatus {
 		t.Fatalf("err = %v, want UnplayableError %s", err, LiveBroadcastStatus)
 	}
 	if got := page.evalCount(playerSeekJS); got != 0 {

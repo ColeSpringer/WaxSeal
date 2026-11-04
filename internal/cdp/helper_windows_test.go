@@ -15,8 +15,8 @@ import (
 func helperTransport() (in, out *os.File, err error) {
 	raw := ""
 	for _, a := range os.Args {
-		if strings.HasPrefix(a, ioPipesFlagPrefix) {
-			raw = strings.TrimPrefix(a, ioPipesFlagPrefix)
+		if after, ok := strings.CutPrefix(a, ioPipesFlagPrefix); ok {
+			raw = after
 			break
 		}
 	}

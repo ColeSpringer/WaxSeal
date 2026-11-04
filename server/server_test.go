@@ -165,26 +165,52 @@ func TestCheckKeyChars(t *testing.T) {
 	}
 }
 
-// decodeJSONBody's strict path is a contract on its dst. An embedded struct
-// contributes the keys encoding/json accepts, and a non-struct is refused
-// loudly rather than panicking in a handler.
+// decodeJSONBody's strict path is a contract on its dst: jsonFieldNames accepts
+// exactly the keys encoding/json decodes, and a non-struct is refused loudly
+// rather than panicking in a handler.
 func TestJSONFieldNames(t *testing.T) {
 	type inner struct {
 		A string `json:"a"`
 	}
+	type Named string
 	type outer struct {
-		inner
-		B   string `json:"b,omitempty"`
-		C   string `json:"-"`
-		D   string
-		Ptr *inner `json:"ptr"`
+		inner        // unexported, but a struct, so it promotes
+		Named        // not a struct: one field, named by its type
+		B     string `json:"b,omitempty"`
+		C     string `json:"-"`
+		D     string
+		Ptr   *inner `json:"ptr"`
+		//lint:ignore U1000 jsonFieldNames must skip this unexported field
+		note string
 	}
-	got := jsonFieldNames(reflect.TypeOf(&outer{}))
-	want := map[string]bool{"a": true, "b": true, "D": true, "ptr": true}
+	got := jsonFieldNames(reflect.TypeFor[*outer]())
+	want := map[string]bool{"a": true, "Named": true, "b": true, "D": true, "ptr": true}
 	if !maps.Equal(got, want) {
 		t.Errorf("jsonFieldNames = %v, want %v", got, want)
 	}
-	if got := jsonFieldNames(reflect.TypeOf(map[string]string{})); len(got) != 0 {
+	// encoding/json is the reference: with B set, its encoding carries every key.
+	raw, err := json.Marshal(outer{B: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]bool{}
+	for k := range encoded {
+		keys[k] = true
+	}
+	if !maps.Equal(keys, want) {
+		t.Errorf("want disagrees with encoding/json's output %s", raw)
+	}
+	// encoding/json names a field tagged "-," "-". SA5008 rejects that tag, and
+	// gopls reports it despite lint:ignore, so the type is built at run time.
+	dash := reflect.StructOf([]reflect.StructField{{Name: "Dash", Type: reflect.TypeFor[string](), Tag: `json:"-,"`}})
+	if got := jsonFieldNames(dash); !maps.Equal(got, map[string]bool{"-": true}) {
+		t.Errorf(`jsonFieldNames(json:"-,") = %v, want only "-"`, got)
+	}
+	if got := jsonFieldNames(reflect.TypeFor[map[string]string]()); len(got) != 0 {
 		t.Errorf("jsonFieldNames(map) = %v, want an empty set rather than a panic", got)
 	}
 }
