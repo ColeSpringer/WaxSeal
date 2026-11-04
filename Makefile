@@ -37,6 +37,11 @@ PUSH_LATEST ?= 0
 # way as the last one. Bump it by hand.
 GOVULNCHECK_VERSION ?= v1.9.0
 
+# GO_TOOLCHAIN is the Go that go.mod's toolchain line pins. vulncheck and
+# release run under it whatever Go is on PATH; the go command downloads it,
+# verified against the checksum database, if PATH has another patch.
+GO_TOOLCHAIN = $(or $(shell awk '$$1 == "toolchain" { print $$2 }' go.mod),$(error go.mod has no toolchain line))
+
 .PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check live jsbundle-browser \
         verify-assets release deps clean docker-build docker-smoke compose-check docker-login \
         docker-push docker-push-authed docker-manifest docker-manifest-authed release-guard \
@@ -85,8 +90,8 @@ tidy-check:
 # vulncheck runs govulncheck over both modules. It reports only vulnerabilities
 # in functions the code calls, so every finding is actionable.
 vulncheck:
-	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
-	cd provider && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	cd provider && GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 # vet runs what CI vets: the root module, the nested provider/ module including
 # its e2e-tagged files, and a windows cross-vet. The cross-vet is the cheap
@@ -168,7 +173,7 @@ release:
 	  out=$(DIST)/waxseal-$$os-$$arch; \
 	  if [ "$$os" = "windows" ]; then out=$$out.exe; fi; \
 	  echo "building $$out"; \
-	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
+	  GOTOOLCHAIN=$(GO_TOOLCHAIN) CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
 	    -ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/waxseal || exit 1; \
 	done
 	@echo "release binaries in $(DIST)/ (each requires a system Chromium at runtime)"

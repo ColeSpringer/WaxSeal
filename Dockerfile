@@ -16,10 +16,14 @@ COPY . .
 # Version stamping: pass `--build-arg VERSION=1.2.3`. ARG must be declared in this
 # stage for the RUN to see it.
 ARG VERSION=docker
-# A static, pure Go binary; it still needs Chromium at runtime.
+# A static, pure Go binary; it still needs Chromium at runtime. It builds with
+# go.mod's pinned toolchain, not this base image's patch; the go command
+# fetches the pin, checked against the checksum database, if they differ.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+    tc=$(awk '$1 == "toolchain" { print $2 }' go.mod) && \
+    GOTOOLCHAIN=${tc:?go.mod has no toolchain line} CGO_ENABLED=0 \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/waxseal ./cmd/waxseal
 
 # runtime
