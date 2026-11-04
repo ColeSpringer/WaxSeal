@@ -35,7 +35,7 @@ PUSH_LATEST ?= 0
 
 # GOVULNCHECK_VERSION pins the scanner vulncheck runs, so a run reads the same
 # way as the last one. Bump it by hand.
-GOVULNCHECK_VERSION ?= v1.8.0
+GOVULNCHECK_VERSION ?= v1.9.0
 
 .PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check live jsbundle-browser \
         verify-assets release deps clean docker-build docker-smoke compose-check docker-login \
