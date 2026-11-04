@@ -29,7 +29,7 @@ var (
 
 const (
 	pipeAccessInbound         = 0x00000001
-	pipeAccessOutbound        = 0x00000002
+	pipeAccessDuplex          = 0x00000003
 	pipeTypeByte              = 0x00000000
 	pipeReadmodeByte          = 0x00000000
 	pipeWaitMode              = 0x00000000
@@ -79,9 +79,11 @@ func newPlatformPipePair(dir pipeDir, childPollable bool) (_ *pipePair, err erro
 		return nil, fmt.Errorf("cdp: pipe name: %w", err)
 	}
 
-	// The server end's access is the parent's direction; the client end's is the
-	// child's, which is the opposite.
-	serverAccess, clientAccess := uint32(pipeAccessOutbound), uint32(syscall.GENERIC_READ)
+	// The client end's access is the child's direction. A writing parent still
+	// gets a duplex server end: os.NewFile polls a handle only once it can query
+	// the handle's completion modes, which takes FILE_READ_ATTRIBUTES, and an
+	// outbound-only end has GENERIC_WRITE alone (go.dev/issue/80979).
+	serverAccess, clientAccess := uint32(pipeAccessDuplex), uint32(syscall.GENERIC_READ)
 	if dir == pipeParentReads {
 		serverAccess, clientAccess = pipeAccessInbound, syscall.GENERIC_WRITE
 	}
