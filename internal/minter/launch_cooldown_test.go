@@ -563,7 +563,11 @@ func TestEnsureReturnsTheSessionItsLaunchPublished(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("launch attempts = %d, want 1", got)
 	}
-	// The next caller is the one that recycles it, once.
+	// The next caller is the one that recycles it, once. It has to come after
+	// the clock moves, and the Windows clock stands still for up to 15 ms.
+	for born := time.Now(); time.Since(born) <= m.maxAge; {
+		time.Sleep(time.Millisecond)
+	}
 	if err := m.Warm(context.Background()); err != nil {
 		t.Fatalf("second Warm: %v", err)
 	}
