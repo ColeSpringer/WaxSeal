@@ -126,6 +126,10 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		Reason     string `json:"reason"`
 		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
 		Keyed      *bool  `json:"keyed"`              // nil from a daemon older than the field
+		// LaunchFailures is nonzero when the tenant has no session because its
+		// last launches failed, and Error then says on what.
+		LaunchFailures int    `json:"consecutive_launch_failures"`
+		Error          string `json:"error"`
 	}
 	// An unreadable body is not health, whatever the status line says. Naming
 	// it apart from ok=false tells an operator they are probing something that
@@ -155,15 +159,24 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	if resp.StatusCode != http.StatusOK || !healthy {
 		// reason distinguishes the benign windows (no-session, busy) from a real
 		// probe failure; older servers omit it.
-		if body.Reason != "" {
+		switch {
+		case body.LaunchFailures > 0:
+			// An idle daemon also answers no-session, so say this one is refused.
+			// The text is whatever answered, so it is quoted and clamped.
+			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s consecutive_launch_failures=%d error=%.512q",
+				resp.StatusCode, body.OK, body.Reason, body.LaunchFailures, body.Error)
+		case body.Reason != "":
 			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s", resp.StatusCode, body.OK, body.Reason)
 		}
 		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
 	}
 	// Name a relaunch here; otherwise it shows only in the daemon's own log.
 	detail := ""
+	if body.LaunchFailures > 0 {
+		detail = fmt.Sprintf(", consecutive_launch_failures=%d", body.LaunchFailures)
+	}
 	if body.Relaunched {
-		detail = ", browser relaunched"
+		detail += ", browser relaunched"
 	}
 	switch {
 	case !body.OK: // strict mode, a benign window: healthy but nothing live to describe

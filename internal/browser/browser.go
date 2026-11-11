@@ -457,28 +457,41 @@ func launchChromium(ctx context.Context, opts Options) (*cdp.Browser, profileHan
 // launchTimeout limits how long startup waits for Chromium's version handshake.
 const launchTimeout = 60 * time.Second
 
+// bundleInjectJS installs the browser bundle (runBotguard, newMinter, mint) on
+// globalThis.
+const bundleInjectJS = `(src) => { (0, eval)(src); return true }`
+
 // setupSession parks a page in browser (the main browser, or an incognito context
 // for a tenant), navigates to videoID's watch page, captures the identity, injects
 // the bundle, and builds the HTTP client. dispose is left for the caller to set.
-// On error the caller is responsible for teardown.
+// On error the caller is responsible for teardown. A failure in the browser
+// itself is marked ErrLocalFault.
 //
 // opts.LandingURL replaces the watch page, and opts.StopAfterLoad returns right
 // after the load event, so a caller can exercise launch and navigation alone.
-func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options, uaCache *uaOverrideCache) (_ *Session, err error) {
+func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options, uaCache *uaOverrideCache) (*Session, error) {
 	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID, timing: defaultTiming()}
 
 	// Bind page creation (createTarget/attachToTarget/Page.enable) to the caller's
 	// ctx so an alive-but-unresponsive Chromium cannot hang setup past the deadline.
 	page, err := browser.Context(ctx).Page(cdp.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
-		return nil, fmt.Errorf("waxseal: new page: %w", err)
+		return nil, markLocal(ctx, fmt.Errorf("waxseal: new page: %w", err))
 	}
 	s.page = cdpPage{page}.Context(ctx)
+	if err := s.prepare(ctx, videoID, opts, uaCache); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
+// prepare is setupSession after the page exists: every stage a pageDriver can
+// run, so the offline tests drive it with a scripted page.
+func (s *Session) prepare(ctx context.Context, videoID string, opts Options, uaCache *uaOverrideCache) (err error) {
 	// Bypass CSP so the injected bundle's new Function(interpreter) can run on the
 	// youtube.com origin (which otherwise forbids unsafe-eval).
 	if err = s.page.SetBypassCSP(true); err != nil {
-		return nil, fmt.Errorf("waxseal: bypass csp: %w", err)
+		return markLocal(ctx, fmt.Errorf("waxseal: bypass csp: %w", err))
 	}
 
 	// One NavTimeout budget covers the client-hint capture, the landing
@@ -490,7 +503,7 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 
 	if opts.NormalizeUA {
 		if err = s.normalizeUA(navCtx, opts.UAHints, uaCache); err != nil {
-			return nil, err
+			return markLocal(navCtx, err)
 		}
 	}
 
@@ -502,24 +515,24 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 	// landed. captureIdentity rewrites the whole Identity with the same URL.
 	s.id.WatchURL = landingURL
 	if err = s.page.Context(navCtx).Navigate(landingURL); err != nil {
-		return nil, fmt.Errorf("waxseal: navigate landing page: %w", err)
+		return fmt.Errorf("waxseal: navigate landing page: %w", err)
 	}
 	// WaitLoad evaluates in the freshly committed document, so returning here also
 	// proves the renderer started and runs JavaScript.
 	if err = s.page.Context(navCtx).WaitLoad(); err != nil {
-		return nil, fmt.Errorf("waxseal: wait load: %w", err)
+		return fmt.Errorf("waxseal: wait load: %w", err)
 	}
 	if opts.StopAfterLoad {
-		return s, nil
+		return nil
 	}
 
 	if err = s.captureIdentity(navCtx, landingURL); err != nil {
-		return nil, err
+		return err
 	}
 	// signatureTimestamp is mandatory: a /player request without it returns
 	// UNPLAYABLE regardless of the token, so it must be captured before any consume.
 	if err = s.captureSTS(navCtx); err != nil {
-		return nil, err
+		return err
 	}
 	if res, err := s.page.Context(navCtx).Eval(landingPlayabilityJS); err == nil {
 		warnLandingPlayability(opts.Logger, videoID, res.Str())
@@ -531,18 +544,17 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 		"cookies", s.id.Cookies,
 		"sts", s.id.STS)
 	if s.id.Webdriver {
-		return nil, fmt.Errorf("waxseal: navigator.webdriver is true; automation artifact leaked")
+		return &localFault{errors.New("waxseal: navigator.webdriver is true; automation artifact leaked")}
 	}
 
-	// Inject the bundle (defines runBotguard/newMinter/mint on globalThis).
-	if _, err = s.page.Eval(`(src) => { (0, eval)(src); return true }`, browserBundle); err != nil {
-		return nil, fmt.Errorf("waxseal: inject bundle: %w", err)
+	if _, err = s.page.Eval(bundleInjectJS, browserBundle); err != nil {
+		return markLocal(ctx, fmt.Errorf("waxseal: inject bundle: %w", err))
 	}
 
 	if err = s.buildCoherentClient(); err != nil {
-		return nil, err
+		return markLocal(ctx, err)
 	}
-	return s, nil
+	return nil
 }
 
 // landingPlayabilityJS reads the watch page's own player response status.
@@ -565,6 +577,39 @@ func warnLandingPlayability(log *slog.Logger, videoID, raw string) {
 	log.Warn("waxseal: landing video is not playable; attestation continues, a streaming proof falls back to another candidate",
 		"video", videoID, "status", ps.Status, "reason", ps.Reason)
 }
+
+// ErrConnClosed is cdp.ErrConnClosed, re-exported so a caller outside this
+// package can tell a launch whose browser died under it from one the page
+// refused.
+var ErrConnClosed = cdp.ErrConnClosed
+
+// ErrLocalFault marks a session launch that failed in the browser itself: its
+// context, its page, the overrides, an automation artifact, the bundle, or the
+// HTTP client. No answer from YouTube causes these. Navigation, the identity,
+// and attestation are never marked, since either side can fail them, and
+// neither is a stage that only ran out of time (see markLocal).
+//
+// One marked failure is not proof of a broken install: Chromium can die once
+// under memory pressure and relaunch fine. A caller that acts on the mark
+// confirms it with a second launch first.
+var ErrLocalFault = errors.New("waxseal: session setup failed in the browser")
+
+// localFault marks err with ErrLocalFault and keeps its text.
+type localFault struct{ err error }
+
+// markLocal marks err as the browser's own fault, unless ctx, the context the
+// stage ran under, has ended: then the failure says the launch was slow or was
+// shut down, which a loaded host explains as well as a broken one.
+func markLocal(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return err
+	}
+	return &localFault{err}
+}
+
+func (e *localFault) Error() string        { return e.err.Error() }
+func (e *localFault) Unwrap() error        { return e.err }
+func (e *localFault) Is(target error) bool { return target == ErrLocalFault }
 
 // ErrPoolClosed is returned when a pool operation runs after Close. It is
 // exported so a caller outside this package can tell a shut-down pool apart from
@@ -689,7 +734,7 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 		// gets a fresh context: ctx may be what just expired, and judging the
 		// browser by it would relaunch a healthy one.
 		if p.ping(context.Background(), inst) == nil {
-			return nil, fmt.Errorf("waxseal: new browser context: %w", err)
+			return nil, markLocal(ctx, fmt.Errorf("waxseal: new browser context: %w", err))
 		}
 		p.opts.Logger.Warn("waxseal: pooled chromium is unreachable; relaunching", "err", err)
 		inst, err = p.relaunch(ctx, inst)
@@ -697,7 +742,7 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 			return nil, err
 		}
 		if incog, err = inst.browser.Context(ctx).Incognito(); err != nil {
-			return nil, fmt.Errorf("waxseal: new browser context after relaunch: %w", err)
+			return nil, markLocal(ctx, fmt.Errorf("waxseal: new browser context after relaunch: %w", err))
 		}
 	}
 	// incog shares inst's connection but is scoped to the new context, so closing
@@ -988,6 +1033,32 @@ const identityCaptureJS = `() => {
 	});
 }`
 
+// landedPageJS reads where the page ended up. The query is left out: an
+// interstitial's carries the watch URL and can encode the caller's address.
+const landedPageJS = `() => JSON.stringify({host: location.host, path: location.pathname, title: document.title})`
+
+// landedTitleMax bounds, in runes, the page title quoted in a capture failure.
+const landedTitleMax = 80
+
+// noIdentityError is the capture failure of a page that never exposed
+// visitor_data, naming the page when it can still be read: an address YouTube
+// refuses lands on an interstitial rather than a slow watch page.
+func noIdentityError(page pageDriver) error {
+	const msg = "waxseal: ytcfg visitor_data not available before deadline"
+	obj, err := page.Eval(landedPageJS)
+	if err != nil {
+		return errors.New(msg)
+	}
+	var at struct{ Host, Path, Title string }
+	if json.Unmarshal([]byte(obj.Str()), &at) != nil || at.Host == "" {
+		return errors.New(msg)
+	}
+	if r := []rune(at.Title); len(r) > landedTitleMax {
+		at.Title = string(r[:landedTitleMax]) + "..."
+	}
+	return fmt.Errorf("%s (page at %s%s, title %q)", msg, at.Host, at.Path, at.Title)
+}
+
 // captureIdentity polls ytcfg after the SPA boots and records visitor_data, the
 // client version, the API key, navigator.userAgent, and navigator.webdriver.
 func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
@@ -1015,6 +1086,11 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 	page := s.page.Context(ctx)
 	for {
 		obj, err := page.Eval(identityCaptureJS)
+		// A dead browser never answers, and waiting out the deadline would report
+		// it as a page with no identity.
+		if errors.Is(err, cdp.ErrConnClosed) {
+			return fmt.Errorf("waxseal: read ytcfg: %w", err)
+		}
 		if err == nil {
 			var raw struct {
 				VD  string `json:"vd"`
@@ -1047,7 +1123,7 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 				break
 			}
 		} else if time.Now().After(deadline) {
-			return fmt.Errorf("waxseal: ytcfg visitor_data not available before deadline")
+			return noIdentityError(page)
 		}
 		// Check cancellation between polls, as establish, confirmPastCap, and
 		// reReadContext do, so a canceled request does not wait out the deadline.

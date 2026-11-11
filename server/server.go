@@ -504,21 +504,29 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	// No guest identity here; navigator_webdriver stays as a detection health
 	// signal. Browser proof describes playback in the daemon, and a consumer
 	// report can still mark a proven session suspect. On failure the snapshot
-	// fields are zero except generation, the last-known one as in /metrics,
-	// unless the probe was busy: that carries the live session's values.
-	writePing(w, strict, reason, err, map[string]any{
-		"ok":                         live,
-		"probe":                      PingProbeTenant,
-		"keyed":                      s.tenants.Keyed(),
-		"tenant":                     label,
-		"attest":                     snap.AttestKind,
-		"generation":                 snap.Generation,
-		"navigator_webdriver":        snap.Identity.Webdriver,
-		"browser_proof_established":  snap.BrowserProofEstablished,
-		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
-		"streaming_suspect":          snap.StreamingSuspect,
-		"browser_relaunched":         relaunched,
-	})
+	// fields are zero except generation, the last-known one as in /metrics, and
+	// the launch failures behind a no-session, unless the probe was busy: that
+	// carries the live session's values.
+	body := map[string]any{
+		"ok":                          live,
+		"probe":                       PingProbeTenant,
+		"keyed":                       s.tenants.Keyed(),
+		"tenant":                      label,
+		"attest":                      snap.AttestKind,
+		"generation":                  snap.Generation,
+		"navigator_webdriver":         snap.Identity.Webdriver,
+		"browser_proof_established":   snap.BrowserProofEstablished,
+		"last_browser_proof_outcome":  snap.LastBrowserProofOutcome,
+		"streaming_suspect":           snap.StreamingSuspect,
+		"consecutive_launch_failures": snap.ConsecutiveLaunchFailures,
+		"browser_relaunched":          relaunched,
+	}
+	// Present only while a launch cool-down is open, like the envelope's field:
+	// any value there tells a reader to wait.
+	if snap.LaunchRetryAfterSecs > 0 {
+		body["retry_after_seconds"] = snap.LaunchRetryAfterSecs
+	}
+	writePing(w, strict, reason, err, body)
 }
 
 // handleDaemonPing answers a keyless probe on a keyed daemon with the shared
@@ -885,7 +893,9 @@ const (
 	// that a browser is running.
 	PingReasonOK = "ok"
 	// PingReasonNoSession means no session is attested: a report retires one and
-	// re-establishment is lazy. Benign.
+	// re-establishment is lazy, or the last launch failed, which the body's
+	// consecutive_launch_failures and error then say. Benign either way: the
+	// probe did not observe the failure, and nothing but a launch clears it.
 	PingReasonNoSession = "no-session"
 	// PingReasonBusy means a probe failed twice while a request held the page, so
 	// nothing was retired and the next probe re-checks. Benign.

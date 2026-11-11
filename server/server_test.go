@@ -3132,3 +3132,153 @@ func TestPingBrowserLossLogAttributes(t *testing.T) {
 		})
 	}
 }
+
+// errRefusedLaunch is the launch failure of an address YouTube answers without
+// an identity, as the minter returns it.
+var errRefusedLaunch = errors.New("waxseal: ytcfg visitor_data not available before deadline")
+
+// refusedServer is a keyed daemon whose tenant K can never launch a session:
+// what a daemon that failed its warm-up serves from.
+func refusedServer(t *testing.T) *Server {
+	t.Helper()
+	tn := minter.NewTenants(nil, "v", keyedOnly, browser.Options{}, 0, 0, 0)
+	if _, err := tn.FailLaunchForTest("K", errRefusedLaunch); err != nil {
+		t.Fatalf("FailLaunchForTest: %v", err)
+	}
+	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+}
+
+// wantRetryAfterWithin asserts the response states a wait of 1 to max seconds,
+// as both the header and the body field, and that the two agree.
+func wantRetryAfterWithin(t *testing.T, header http.Header, body []byte, max int) {
+	t.Helper()
+	var env struct {
+		RetryAfterSeconds int `json:"retry_after_seconds"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode body %q: %v", body, err)
+	}
+	if env.RetryAfterSeconds < 1 || env.RetryAfterSeconds > max {
+		t.Errorf("retry_after_seconds = %d, want 1 to %d", env.RetryAfterSeconds, max)
+	}
+	if got := header.Get("Retry-After"); got != strconv.Itoa(env.RetryAfterSeconds) {
+		t.Errorf("Retry-After = %q, want it to match retry_after_seconds %d", got, env.RetryAfterSeconds)
+	}
+}
+
+// A daemon that cannot launch a session answers every endpoint that needs one
+// with a stated wait, the failed attempt and the refusals behind it alike, so a
+// consumer backs off instead of each request loading a page of its own.
+func TestRefusedLaunchCarriesRetryAfter(t *testing.T) {
+	s := refusedServer(t)
+	do := func(method, target, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, target, strings.NewReader(body))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		return w
+	}
+	for _, tc := range []struct {
+		name, method, target, body string
+		status                     int
+		code                       string
+	}{
+		{"get_pot", http.MethodPost, "/get_pot", `{"content_binding":"vd"}`, http.StatusBadGateway, CodeMintFailed},
+		{"player-context", http.MethodPost, "/player-context", `{"video_id":"aqz-KE-bpKQ"}`, http.StatusBadGateway, CodePlayerContextFailed},
+		{"session", http.MethodGet, "/session", "", http.StatusServiceUnavailable, CodeNoSession},
+	} {
+		w := do(tc.method, tc.target, tc.body)
+		if w.Code != tc.status {
+			t.Fatalf("%s: status = %d, body = %s, want %d", tc.name, w.Code, w.Body, tc.status)
+		}
+		if got := decodeCode(t, w.Body.Bytes()); got != tc.code {
+			t.Errorf("%s: code = %q, want %q", tc.name, got, tc.code)
+		}
+		if !strings.Contains(w.Body.String(), "visitor_data not available") {
+			t.Errorf("%s: body = %s, want it to name the launch failure", tc.name, w.Body)
+		}
+		wantRetryAfterWithin(t, w.Header(), w.Body.Bytes(), 15)
+	}
+	// One launch for three requests: the last two met the cool-down.
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	var m struct {
+		Aggregate map[string]float64 `json:"aggregate"`
+	}
+	mustUnmarshal(t, w.Body.Bytes(), &m)
+	if m.Aggregate["launch_failures"] != 1 || m.Aggregate["launch_cooldown_refusals"] != 2 {
+		t.Errorf("launch_failures = %v, launch_cooldown_refusals = %v, want 1 and 2",
+			m.Aggregate["launch_failures"], m.Aggregate["launch_cooldown_refusals"])
+	}
+}
+
+// A tenant probe on a daemon that cannot launch a session stays benign, since
+// restarting would not help, but says what an idle daemon's does not: how many
+// launches failed, on what, and when the next may run.
+func TestPingReportsRefusedLaunch(t *testing.T) {
+	s := refusedServer(t)
+	proberOf(s, &fakeProber{})
+
+	code, resp := pingWith(t, s, "/ping?strict=true", "K")
+	if code != http.StatusOK || resp["reason"] != PingReasonNoSession {
+		t.Fatalf("idle probe = %d %v, want 200 no-session", code, resp)
+	}
+	if resp["consecutive_launch_failures"] != float64(0) {
+		t.Errorf("consecutive_launch_failures = %v on an idle tenant, want 0", resp["consecutive_launch_failures"])
+	}
+	if _, ok := resp["retry_after_seconds"]; ok {
+		t.Errorf("idle probe carries retry_after_seconds = %v, want the field absent", resp["retry_after_seconds"])
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	s.routes().ServeHTTP(httptest.NewRecorder(), r)
+
+	code, resp = pingWith(t, s, "/ping?strict=true", "K")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d under strict, want 200: a refused daemon is not one to restart", code)
+	}
+	if resp["ok"] != false || resp["reason"] != PingReasonNoSession {
+		t.Errorf("ok=%v reason=%v, want false and no-session", resp["ok"], resp["reason"])
+	}
+	if resp["consecutive_launch_failures"] != float64(1) {
+		t.Errorf("consecutive_launch_failures = %v, want 1", resp["consecutive_launch_failures"])
+	}
+	if secs, ok := resp["retry_after_seconds"].(float64); !ok || secs < 1 || secs > 15 {
+		t.Errorf("retry_after_seconds = %v, want 1 to 15", resp["retry_after_seconds"])
+	}
+	msg, _ := resp["error"].(string)
+	if !strings.Contains(msg, "visitor_data not available") || strings.Contains(msg, "waxseal: ") {
+		t.Errorf("error = %q, want the launch failure without the internal prefix", msg)
+	}
+}
+
+// One launch that failed in the browser does not fail the health check: the
+// probe did not observe it, and on an idle daemon nothing would launch again
+// to clear a verdict built on it. It is a benign no-session that names the
+// cause.
+func TestPingKeepsALocalLaunchFaultBenign(t *testing.T) {
+	tn := minter.NewTenants(nil, "v", keyedOnly, browser.Options{}, 0, 0, 0)
+	fault := fmt.Errorf("waxseal: new page: target closed: %w", browser.ErrLocalFault)
+	if _, err := tn.FailLaunchForTest("K", fault); err != nil {
+		t.Fatalf("FailLaunchForTest: %v", err)
+	}
+	s := &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+	proberOf(s, &fakeProber{})
+
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	s.routes().ServeHTTP(httptest.NewRecorder(), r)
+
+	code, resp := pingWith(t, s, "/ping?strict=true", "K")
+	if code != http.StatusOK || resp["reason"] != PingReasonNoSession {
+		t.Fatalf("probe = %d %v, want 200 no-session", code, resp)
+	}
+	if resp["consecutive_launch_failures"] != float64(1) {
+		t.Errorf("consecutive_launch_failures = %v, want 1", resp["consecutive_launch_failures"])
+	}
+	if msg, _ := resp["error"].(string); !strings.Contains(msg, "new page: target closed") {
+		t.Errorf("error = %q, want the fault", msg)
+	}
+}

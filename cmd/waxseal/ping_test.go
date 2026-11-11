@@ -414,3 +414,50 @@ func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
 		}
 	}
 }
+
+// A daemon that cannot launch a session answers no-session like an idle one, so
+// the probe says which it is: strict stays healthy and counts the failures, and
+// the default mode's error carries the daemon's reason.
+func TestPingCLINamesARefusedLaunch(t *testing.T) {
+	fake := &pingFake{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	run := func(args ...string) (string, error) {
+		c := newPingCmd()
+		c.SetArgs(append([]string{"--addr", addr}, args...))
+		var out strings.Builder
+		c.SetOut(&out)
+		c.SetErr(io.Discard)
+		err := c.Execute()
+		return out.String(), err
+	}
+
+	fake.answer(http.StatusOK, `{"ok":false,"probe":"tenant","reason":"no-session","consecutive_launch_failures":3,`+
+		`"retry_after_seconds":212,"error":"no attested session: the last session launch failed: ytcfg visitor_data not available before deadline"}`)
+	out, err := run("--strict")
+	if err != nil {
+		t.Fatalf("strict: %v, want success: restarting a refused daemon launches no better", err)
+	}
+	if want := "ok (reason=no-session, consecutive_launch_failures=3)\n"; out != want {
+		t.Errorf("strict stdout = %q, want %q", out, want)
+	}
+	_, err = run()
+	if err == nil {
+		t.Fatal("default mode: want an error, the daemon has no session")
+	}
+	for _, want := range []string{"reason=no-session", "consecutive_launch_failures=3", "visitor_data not available before deadline"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("default mode error = %q, want it to contain %q", err, want)
+		}
+	}
+
+	// An idle daemon's no-session reads as before.
+	fake.answer(http.StatusOK, `{"ok":false,"probe":"tenant","reason":"no-session","consecutive_launch_failures":0,"error":"no attested session"}`)
+	if out, err := run("--strict"); err != nil || out != "ok (reason=no-session)\n" {
+		t.Errorf("idle strict = (%q, %v), want the plain benign line", out, err)
+	}
+	if _, err := run(); err == nil || err.Error() != "unhealthy: status=200 ok=false reason=no-session" {
+		t.Errorf("idle default mode error = %v, want the plain unhealthy line", err)
+	}
+}

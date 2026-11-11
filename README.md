@@ -53,12 +53,21 @@ file leaves out: pinning and verifying a release, API keys and secrets, memory
 limits, a read-only rootfs, a consumer sharing the daemon's egress IP,
 `docker run` without compose, and building the image from source.
 
-The daemon opens its port at once but serves nothing until startup has attested
-the first tenant, cached a GVS token, and run a full-length streaming proof,
-typically within ten seconds (the healthcheck allows two minutes). A mint
-failure stops startup; a failed proof is logged and retried on demand. The
+The daemon opens its port at once but serves nothing until its warm-up ends:
+it attests one tenant, caches a GVS token, and runs a full-length streaming
+proof, typically within ten seconds (the healthcheck allows two minutes). The
 first token or context request may wait up to 12 seconds more behind the
-mint-separation gate (see `/player-context`). Then call the API:
+mint-separation gate (see `/player-context`).
+
+A warm-up that YouTube refuses, or that cannot reach it, is logged and does not
+stop the daemon. It serves, launching a session for a request that needs one
+(see [Errors](#errors)), and retries the launch in the background until a
+session attests, doubling the wait from 15 seconds up to 30 minutes. The
+streaming proof then runs with the first request that needs it. A warm-up that
+fails in the browser itself twice running, or attests and cannot mint, stops
+startup.
+
+Then call the API:
 
 ```sh
 curl -s localhost:4416/get_pot -d '{"content_binding":"<video_id>"}'
@@ -471,6 +480,14 @@ These counters are worth knowing exactly:
   request; with a failing probe, it means the daemon has no browser and cannot
   get one. Both browser counters describe the shared Chromium, so both views
   carry them at the top level, not among the summed counters.
+- `launch_failures` counts failed session launches, and
+  `launch_cooldown_refusals` the callers refused inside the cool-down a failure
+  opens, without a launch: requests, and the startup retry when a request's
+  failure reopened the window under it. `consecutive_launch_failures` counts
+  the launches in a row that ran to a failure and opened a cool-down, 0 once a
+  session attests; a launch cut short by a browser death, a relaunch backoff,
+  or shutdown moves only `launch_failures`. `launch_retry_after_secs` is what
+  is left of the cool-down, `null` when none is open.
 - `separation_waits` counts the mint-separation waits performed; requests
   queued behind a wait share it and are not counted.
 - `cache_entries` reports **servable** entries (current generation, not yet
@@ -500,9 +517,23 @@ uses the envelope only for its `400` and `401`.
 A refusal the daemon expects to lift on its own also sends `Retry-After` and
 `retry_after_seconds` with the remaining wait: `player-context-failed` and
 `no-session` during a cool-down after a failed proof or a bot check, and
-`mint-failed`, `player-context-failed`, or `no-session` while the shared
-browser's relaunch is backing off. A 502 without them is worth one quick retry;
-a 422 is not.
+`mint-failed`, `player-context-failed`, or `no-session` after a failed session
+launch or while the shared browser's relaunch is backing off. A 502 without
+them is worth one quick retry; a 422 is not.
+
+A session launch fails when YouTube is unreachable, answers the landing page
+without an identity, or refuses attestation, or when the browser itself cannot
+set the session up. The launch belongs to the daemon, not to the request that
+started it: it runs to its own verdict, within 3 minutes, even after that
+caller disconnects, and requests arriving meanwhile wait on it.
+
+A failed launch refuses the requests waiting on it and every request for the
+next 15 seconds, without another launch; the first request after that launches
+again. Each consecutive failure doubles the wait, up to 5 minutes, and an
+attested session resets it. A daemon refused at startup serves the same way
+while it retries its warm-up. Once a session has attested, nothing launches
+without a request, so an idle daemon that later loses its session reports the
+last failure until one arrives.
 
 | Code | HTTP | Meaning |
 |---|---:|---|
@@ -536,8 +567,9 @@ before the read timeout`. The `client` package parses these errors into
 
 ## Operations
 
-One Chromium process hosts an isolated incognito context per tenant; additional
-tenants attest on their first token, player-context, or session request.
+One Chromium process hosts an isolated incognito context per tenant. Startup
+warms the tenant whose label sorts first; the others attest on their first
+token, player-context, or session request.
 
 A normal teardown terminates Chromium's process group and removes its profile;
 on a clean exit Chromium also quits when its CDP pipe closes. If the daemon dies
@@ -562,7 +594,10 @@ warm session. The reasons are:
 
 - `ok`: the session answered.
 - `no-session`: benign. A `POST /report` retires the session and
-  re-establishment is lazy, so `ok` briefly reads `false`.
+  re-establishment is lazy, so `ok` briefly reads `false`. A tenant whose
+  session launches fail (see [Errors](#errors)) reads the same, whatever
+  failed, with `consecutive_launch_failures` above 0, the failure in `error`,
+  and `retry_after_seconds` while the cool-down is open.
 - `busy`: benign. The probe failed twice while a request held the page, so
   nothing was retired; the next probe re-checks once that request finishes.
 - `probe-failed`: this probe confirmed a loss, logged at `warn`.
@@ -588,11 +623,12 @@ single-flighted and backed off. A wrong key is still `401`, so a typo in a
 probe's `--key` fails the probe rather than downgrading it.
 
 Alert only on `probe-failed`; a caller that disconnects mid-probe never
-produces one. For status-code-only checks (k8s, `curl -f`, HAProxy),
-`?strict=true` (or a bare `?strict`) maps `probe-failed` to **503** and keeps
-`no-session`, `busy`, and healthy at **200**; `waxseal ping --strict` does the
-same. A value `strconv.ParseBool` cannot read (`yes`, `on`, `banana`) returns
-**400**.
+produces one. A `consecutive_launch_failures` that keeps growing means
+launches keep failing, and `error` says where: at YouTube, or in the browser.
+For status-code-only checks (k8s, `curl -f`, HAProxy), `?strict=true` (or a
+bare `?strict`) maps `probe-failed` to **503** and keeps `no-session`, `busy`,
+and healthy at **200**; `waxseal ping --strict` does the same. A value
+`strconv.ParseBool` cannot read (`yes`, `on`, `banana`) returns **400**.
 
 Size a probe's timeout for the worst case: four session round trips, a session
 teardown, and two browser round trips at up to 5 seconds each; a 7 second

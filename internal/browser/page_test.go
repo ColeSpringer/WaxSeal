@@ -81,6 +81,7 @@ type fakePageState struct {
 	calls      []fakeCall // every Eval, in order
 	cookies    []*cdp.Cookie
 	cookiesErr error
+	bypassErr  error // what SetBypassCSP returns
 	navigated  []string
 	crash      string
 
@@ -187,7 +188,7 @@ func (p fakePage) Navigate(url string) error {
 }
 
 func (p fakePage) WaitLoad() error                                             { return nil }
-func (p fakePage) SetBypassCSP(bool) error                                     { return nil }
+func (p fakePage) SetBypassCSP(bool) error                                     { return p.bypassErr }
 func (p fakePage) SetUserAgentOverride(*cdp.NetworkSetUserAgentOverride) error { return nil }
 func (p fakePage) WaitCrash(context.Context) string {
 	p.mu.Lock()
@@ -935,6 +936,142 @@ func TestCaptureIdentityFailsWithoutVisitorData(t *testing.T) {
 	}
 }
 
+// prepareOn runs every setup stage after page creation against a scripted
+// page. The user-agent override is left off: a fake page has no client hints.
+func prepareOn(page fakePage) (*Session, error) {
+	s := newFakeSession(page)
+	return s, s.prepare(context.Background(), "vid", withDefaults(Options{}), &uaOverrideCache{})
+}
+
+// A launch that fails in the browser itself is marked, so the daemon can tell a
+// broken install from an address YouTube refuses. The text is the stage's own.
+func TestPrepareMarksBrowserFaults(t *testing.T) {
+	leaked := identityPayload("VD", "2.99")
+	leaked["wd"] = true
+	for _, tc := range []struct {
+		name string
+		page fakePage
+		want string
+	}{
+		{"csp bypass", func() fakePage {
+			p := newFakePage(nil)
+			p.bypassErr = errors.New("Page.setBypassCSP: not allowed")
+			return p
+		}(), "waxseal: bypass csp: Page.setBypassCSP: not allowed"},
+		{"automation artifact", newFakePage(map[string][]fakeStep{
+			identityCaptureJS: {jsStringified(t, leaked)},
+		}), "waxseal: navigator.webdriver is true; automation artifact leaked"},
+		{"bundle", newFakePage(map[string][]fakeStep{
+			identityCaptureJS: {jsStringified(t, identityPayload("VD", "2.99"))},
+			bundleInjectJS:    {jsErr(errors.New("EvalError: refused"))},
+		}), "waxseal: inject bundle: EvalError: refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := prepareOn(tc.page)
+			if !errors.Is(err, ErrLocalFault) {
+				t.Fatalf("err = %v, want it marked ErrLocalFault", err)
+			}
+			if err.Error() != tc.want {
+				t.Errorf("err = %q, want the stage's own text %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A stage that failed only because the launch ran out of time, or was shut
+// down, says nothing about the browser: a slow host is not a broken install.
+// A browser that died in the stage is its own fault and keeps the mark, beside
+// the death the pool relaunches for.
+func TestPrepareMarksOnlyWhatTheBrowserDid(t *testing.T) {
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	page := newFakePage(nil)
+	page.bypassErr = context.Canceled
+	s := newFakeSession(page)
+	err := s.prepare(ended, "vid", withDefaults(Options{}), &uaOverrideCache{})
+	if err == nil || errors.Is(err, ErrLocalFault) {
+		t.Errorf("ended context: err = %v, want a failure that is not ErrLocalFault", err)
+	}
+
+	page = newFakePage(nil)
+	page.bypassErr = fmt.Errorf("Page.setBypassCSP: %w", cdp.ErrConnClosed)
+	if _, err := prepareOn(page); !errors.Is(err, ErrLocalFault) || !errors.Is(err, ErrConnClosed) {
+		t.Errorf("dead browser: err = %v, want both ErrLocalFault and ErrConnClosed", err)
+	}
+}
+
+// A page YouTube answered without an identity is YouTube's doing, not the
+// browser's, and a session that sets up cleanly carries no mark at all.
+func TestPrepareLeavesYouTubeFailuresUnmarked(t *testing.T) {
+	_, err := prepareOn(newFakePage(map[string][]fakeStep{
+		identityCaptureJS: {jsStringified(t, identityPayload("", ""))},
+	}))
+	if err == nil || errors.Is(err, ErrLocalFault) {
+		t.Fatalf("no identity: err = %v, want a failure that is not ErrLocalFault", err)
+	}
+
+	s, err := prepareOn(newFakePage(map[string][]fakeStep{
+		identityCaptureJS: {jsStringified(t, identityPayload("VD", "2.99"))},
+	}))
+	if err != nil {
+		t.Fatalf("prepare on a healthy page: %v", err)
+	}
+	if s.client == nil || s.id.VisitorData != "VD" {
+		t.Errorf("session = (client=%v, vd=%q), want the client built and the identity held", s.client != nil, s.id.VisitorData)
+	}
+}
+
+// A page with no ytcfg is usually not the watch page at all: an address YouTube
+// refuses lands on a consent or "unusual traffic" interstitial. The error names
+// where the page ended up, without the query, which can carry the caller's
+// address.
+func TestCaptureIdentityNamesWhereThePageLanded(t *testing.T) {
+	page := newFakePage(map[string][]fakeStep{
+		identityCaptureJS: {jsStringified(t, identityPayload("", ""))},
+		landedPageJS: {jsStringified(t, map[string]any{
+			"host": "www.google.com", "path": "/sorry/index", "title": "Sorry...\n" + strings.Repeat("x", 200),
+		})},
+	})
+	s := newFakeSession(page)
+
+	err := s.captureIdentity(context.Background(), "https://youtube.com/watch?v=vid")
+	if err == nil {
+		t.Fatal("captureIdentity succeeded with no visitor_data")
+	}
+	msg := err.Error()
+	for _, want := range []string{"visitor_data not available before deadline", "www.google.com/sorry/index", `"Sorry...\n`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error = %q, want it to contain %q", msg, want)
+		}
+	}
+	if len(msg) > 300 {
+		t.Errorf("error is %d bytes, want the page's title clamped", len(msg))
+	}
+}
+
+// A browser that dies mid-capture is reported as that, at once. Polling a dead
+// page to the deadline would report it as a page with no identity, which is
+// the shape of a refusal.
+func TestCaptureIdentityStopsOnADeadBrowser(t *testing.T) {
+	page := newFakePage(map[string][]fakeStep{
+		identityCaptureJS: {jsErr(fmt.Errorf("eval: %w", cdp.ErrConnClosed))},
+	})
+	s := newFakeSession(page)
+	s.timing.identityTimeout = time.Minute
+
+	start := time.Now()
+	err := s.captureIdentity(context.Background(), "https://youtube.com/watch?v=vid")
+	if !errors.Is(err, cdp.ErrConnClosed) {
+		t.Fatalf("captureIdentity err = %v, want it to wrap cdp.ErrConnClosed", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("capture took %v on a dead browser, want it to stop at once", elapsed)
+	}
+	if n := page.evalCount(identityCaptureJS); n != 1 {
+		t.Errorf("identity evals = %d, want 1", n)
+	}
+}
+
 // setupSession shares one navigation budget across the client-hint capture, the
 // navigation, this capture, and the signature timestamp, so the caller's
 // deadline is often tighter than the capture's own. Clamping to it leaves the
@@ -948,8 +1085,11 @@ func TestCaptureIdentityClampsToContextDeadline(t *testing.T) {
 	// A grace longer than the caller's remaining budget: without the clamp the
 	// loop would wait for the grace and be cut off by the context instead.
 	s.timing.clientVersionGrace = time.Minute
+	// The clamp leaves two polls before the context ends. At the 2 ms test poll
+	// that is 4 ms, which one scheduling stall on a loaded machine outlasts.
+	s.timing.poll = 10 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if err := s.captureIdentity(ctx, "https://youtube.com/watch?v=vid"); err != nil {
 		t.Fatalf("captureIdentity: %v", err)

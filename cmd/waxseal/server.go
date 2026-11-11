@@ -68,6 +68,10 @@ func newServerCmd() *cobra.Command {
 			"--tenant-keys), each key receives an isolated browser context; without\n" +
 			"them, the server is keyless. On SIGTERM or SIGINT it drains in-flight requests\n" +
 			"for up to --shutdown-timeout (default 60s) before tearing the browser down.\n\n" +
+			"A startup warm-up that YouTube refuses does not stop the server: requests\n" +
+			"that need a session are answered with a Retry-After, and the launch is\n" +
+			"retried in the background until one attests. A browser that cannot set a\n" +
+			"session up twice running, or a session that cannot mint, does stop it.\n\n" +
 			"Three settings are read from the environment only:\n" +
 			"  WAXSEAL_MINT_SEPARATION  spacing kept between a token mint and a context\n" +
 			"                           establishment; a positive Go duration, default 12s\n" +
@@ -385,6 +389,174 @@ func warnKeylessExposure(logger *slog.Logger, keyed bool, addr net.Addr) {
 	}
 }
 
+// warmUpTimeout bounds one warm-up attempt: a launch, its attestation and
+// pre-mint, and one full-length proof.
+const warmUpTimeout = 120 * time.Second
+
+const (
+	// warmRetryBase is the first wait of the background warm-up retry when the
+	// failed attempt stated none.
+	warmRetryBase = 15 * time.Second
+	// warmRetryMax caps that retry's doubling. It is well past the 5 minute cap
+	// a request's cool-down has: nobody is waiting on these attempts, and each
+	// one is a page load from an address YouTube may be refusing for days.
+	warmRetryMax = 30 * time.Minute
+)
+
+// warmer is the part of *server.Server the startup warm-up drives.
+type warmer interface {
+	Warm(ctx context.Context, apiKey string) error
+	SelfTest(ctx context.Context, apiKey string) error
+}
+
+// warmTenant picks the tenant to warm at startup: the one whose label sorts
+// first, so every start warms the same one. ParseTenantKeys gives each key its
+// own label. Keyless returns two empty strings.
+func warmTenant(keys map[string]string) (key, label string) {
+	for k, l := range keys {
+		if key == "" || l < label {
+			key, label = k, l
+		}
+	}
+	return key, label
+}
+
+// warmOnce is one startup warm-up attempt: attest the tenant, then run its
+// self-test.
+func warmOnce(ctx context.Context, srv warmer, apiKey string) error {
+	wctx, cancel := context.WithTimeout(ctx, warmUpTimeout)
+	defer cancel()
+	if err := srv.Warm(wctx, apiKey); err != nil {
+		return err
+	}
+	return srv.SelfTest(wctx, apiKey)
+}
+
+// brokenBrowser reports whether err is a launch that failed in the browser
+// itself. A cool-down refusal quotes the failure that opened it, so it is
+// excluded: it ran no launch and confirms nothing.
+func brokenBrowser(err error) bool {
+	return errors.Is(err, browser.ErrLocalFault) && !errors.Is(err, minter.ErrLaunchCooldown)
+}
+
+// sleepCtx waits d, or returns false at once when ctx ends first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// warmUp attests one tenant and runs its self-test before the daemon serves, so
+// the first request is fast. It returns an error when startup must stop: ctx
+// ended (a stop was requested), the browser itself could not set a session up
+// twice running, or the session attested and could not mint. The last two are
+// a broken install.
+//
+// The browser gets a second try because Chromium can die once under memory
+// pressure and relaunch fine, and exiting on that would be the restart loop
+// over a transient this daemon exists to avoid. The self-test has already
+// retried its mint.
+//
+// Anything else is YouTube refusing or out of reach, or the budget running
+// out. That is logged and startup goes on, with retryIn saying when
+// keepWarming should try again: exiting would restart the container into the
+// same refusal with a new browser each time and never a healthy daemon, while
+// a serving one answers with a Retry-After. A zero retryIn with no error is a
+// warm daemon.
+func warmUp(ctx context.Context, srv warmer, apiKey, label string, logger *slog.Logger) (retryIn time.Duration, err error) {
+	err = warmOnce(ctx, srv, apiKey)
+	if brokenBrowser(err) && ctx.Err() == nil {
+		// A graded failure opened a cool-down, and a launch inside it is refused.
+		var wait time.Duration
+		if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
+			wait = ra.After
+		}
+		logger.Warn("startup warm-up failed in the browser itself; trying once more before giving up",
+			append(tenantAttr(label), "err", err, "retry_in", wait)...)
+		if sleepCtx(ctx, wait) {
+			err = warmOnce(ctx, srv, apiKey)
+		}
+	}
+	switch {
+	case ctx.Err() != nil:
+		return 0, ctx.Err()
+	case err == nil:
+		return 0, nil
+	case brokenBrowser(err), errors.Is(err, minter.ErrSelfTestMint):
+		return 0, err
+	}
+	// The cause goes on the line whatever the minter logged: a wait on the error
+	// does not mean it did, since the pool's relaunch backoff carries one too.
+	retryIn = warmRetryBase
+	if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
+		retryIn = ra.After
+	}
+	logger.Warn("startup warm-up failed; serving, and retrying it in the background",
+		append(tenantAttr(label), "err", err, "retry_in", retryIn)...)
+	return retryIn, nil
+}
+
+// tenantAttr is the log attribute naming the warmed tenant, or nothing on a
+// keyless daemon.
+func tenantAttr(label string) []any {
+	if label == "" {
+		return nil
+	}
+	return []any{"tenant", label}
+}
+
+// nextWarmWait is the wait before the next background attempt: double the
+// last, never less than the cool-down the minter stated, capped at
+// warmRetryMax.
+func nextWarmWait(prev time.Duration, err error) time.Duration {
+	next := 2 * prev
+	if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
+		next = max(next, ra.After)
+	}
+	return min(next, warmRetryMax)
+}
+
+// keepWarming gives a daemon whose warm-up failed the session startup could
+// not, first after wait: it retries the launch until one attests, then
+// returns. Without it a daemon nobody asks stays cold, and reads as not
+// ready, long after YouTube stops refusing, and whatever holds traffic back
+// until it is ready never sends the request that would fix it.
+//
+// It launches and nothing more. The self-test's proof is left to the request
+// that needs one, which runs it behind the proof and bot-check cool-downs.
+// SelfTest consults neither, so run here it could replay a proof against an
+// identity a request had just found walled, holding the page from every
+// request and overwriting that cool-down with a shorter one.
+//
+// It ends at the first session. One lost later is re-established by the
+// request that needs it, as it is on a daemon that started warm.
+func keepWarming(ctx context.Context, srv warmer, apiKey, label string, logger *slog.Logger, wait time.Duration) {
+	for sleepCtx(ctx, wait) {
+		wctx, cancel := context.WithTimeout(ctx, warmUpTimeout)
+		err := srv.Warm(wctx, apiKey)
+		cancel()
+		switch {
+		case ctx.Err() != nil:
+			return
+		case err == nil:
+			logger.Info("background warm-up attested a session", tenantAttr(label)...)
+			return
+		}
+		wait = nextWarmWait(wait, err)
+		line := append(tenantAttr(label), "err", err, "next_in", wait)
+		if brokenBrowser(err) {
+			// Startup stops on this once confirmed. A serving daemon does not
+			// exit, and the retry is what would show the fault has cleared.
+			logger.Warn("background warm-up failed in the browser itself", line...)
+			continue
+		}
+		logger.Info("background warm-up attempt failed", line...)
+	}
+}
+
 // failStartup logs a configuration error once and preserves its exit-code type.
 func failStartup(logger *slog.Logger, err error) error {
 	logger.Error("startup: invalid configuration", "err", err)
@@ -504,22 +676,9 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		return err
 	}
 
-	// Warm one tenant so the first request is fast and startup catches attestation
-	// failures. Other tenants attest on first use.
-	warmKey := ""
-	for k := range keys {
-		warmKey = k
-		break
-	}
-	warmCtx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
-	err = srv.Warm(warmCtx, warmKey)
-	if err == nil {
-		// Verify minting before accepting traffic and attempt the full-length
-		// streaming proof. SelfTest reports mint failures and logs proof failures;
-		// /player-context and /session retry the proof on demand.
-		err = srv.SelfTest(warmCtx, warmKey)
-	}
-	cancel()
+	// Other tenants attest on first use.
+	warmKey, warmLabel := warmTenant(keys)
+	warmRetryIn, err := warmUp(cmd.Context(), srv, warmKey, warmLabel, logger)
 	if err != nil {
 		if cmd.Context().Err() != nil {
 			// A stop requested during warm-up is a clean stop, as it is once
@@ -548,6 +707,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	}()
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	if warmRetryIn > 0 {
+		// ctx ends on either way out below, which is what stops the retry.
+		go keepWarming(ctx, srv, warmKey, warmLabel, logger, warmRetryIn)
+	}
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:

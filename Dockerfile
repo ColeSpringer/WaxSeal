@@ -79,9 +79,10 @@ CMD ["server", "--host", "0.0.0.0"]
 
 # The built-in probe replaces curl. The start period covers browser warm-up, and
 # the timeout outlasts ping's own budget (TestImageHealthcheckOutlastsPing).
-# --strict fails only on a probe failure, not in the benign window after a
-# `POST /report` retires the session. The probe sends no key and still works on
-# a keyed daemon (--tenant-keys), which reports the shared browser's health and
-# relaunches an exited one; add `--key <key>` to also probe a tenant's session.
+# --strict fails only on a probe failure, not while the daemon has no session
+# (a `POST /report` retired it, or YouTube refuses a new one, which a restart
+# would not fix). The probe sends no key and still works on a keyed daemon
+# (--tenant-keys), which reports the shared browser's health and relaunches an
+# exited one; add `--key <key>` to also probe a tenant's session.
 HEALTHCHECK --interval=30s --timeout=110s --start-period=120s --retries=3 \
   CMD ["waxseal", "ping", "--addr", "127.0.0.1:4416", "--strict"]

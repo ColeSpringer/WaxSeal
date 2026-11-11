@@ -199,10 +199,26 @@ docker-build:
 # page it serves itself on loopback (a data: page would skip the network
 # service). --network none keeps YouTube's view of a datacenter IP out of the
 # verdict, so a red run means the image is broken. --pull=never keeps the probe
-# on the local build even when this host is logged in to the registry.
+# on the local build even when this host is logged in to the registry. The
+# second run starts the daemon on the same network, where its warm-up cannot
+# reach YouTube: it must stay up and pass the image's own health probe. Its
+# container is named before it starts and removed by a trap that also catches
+# INT and TERM, since dash runs an EXIT trap on neither.
 docker-smoke: docker-build
 	docker run --rm --network none --shm-size=1gb --pull=never \
 	  --entrypoint waxseal $(IMAGE):$(VERSION)-$(ARCH) doctor --stop-after-load
+	@name=waxseal-smoke-$$$$; \
+	  trap 'docker rm -f "$$name" >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \
+	  docker run -d --name "$$name" --network none --shm-size=1gb --pull=never \
+	    $(IMAGE):$(VERSION)-$(ARCH) >/dev/null || exit 1; \
+	  n=0; until docker exec "$$name" waxseal ping --strict --timeout 5s >/dev/null 2>&1; do \
+	    n=$$((n+1)); \
+	    if [ "$$n" -ge 60 ] || [ "$$(docker inspect -f '{{.State.Running}}' "$$name")" != true ]; then \
+	      echo "ERROR: the daemon did not stay up and serve with no network"; \
+	      docker logs --tail 20 "$$name"; exit 1; fi; \
+	    sleep 1; \
+	  done; \
+	  echo "OK: the daemon serves after a warm-up that cannot reach YouTube"
 	@out=$$(docker run --rm --pull=never --entrypoint /bin/ls \
 	  $(IMAGE):$(VERSION)-$(ARCH) /usr/share/doc/waxseal) || exit 1; \
 	  for f in LICENSE THIRD-PARTY-NOTICES.md; do \
