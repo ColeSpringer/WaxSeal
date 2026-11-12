@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The offline race suite plus the real-Chromium CDP live tests; the committed
+  # The offline race suite plus the real-Chromium live tests; the committed
   # bundle means no Node. Only the -tags e2e suite, which needs network, runs
   # manually.
   test:
@@ -54,6 +54,15 @@ jobs:
           WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
+      # provider/'s live test reads a daemon whose launches fail through the
+      # consumer's own probe. Its Chromium resolves no host but loopback, so
+      # nothing leaves the runner.
+      - name: provider live test (real Chromium, no network)
+        working-directory: provider
+        env:
+          WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          WAXSEAL_REQUIRE_CHROME: "1"
+        run: go test -race -tags live ./...
 
   # govulncheck over both modules. It reports only vulnerabilities in functions
   # the code calls, so a red run here is something to act on.
@@ -74,8 +83,9 @@ jobs:
       - run: make vulncheck
 
   # The nested provider/ module. Its untagged tests are pure httptest (no
-  # browser, no network); the -tags e2e files need both, so they are only
-  # type-checked here.
+  # browser, no network). The -tags e2e files need a browser and the network,
+  # so they are only type-checked here; the one that needs no network runs in
+  # the test job under -tags live.
   provider:
     runs-on: ubuntu-latest
     timeout-minutes: 10

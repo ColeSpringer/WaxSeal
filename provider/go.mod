@@ -7,12 +7,12 @@ require (
 	// is ignored there: keep it at a pushed commit carrying every root member
 	// this module uses, and move it to the tag after each root release.
 	github.com/colespringer/waxseal v1.5.1
-	github.com/colespringer/waxtap/v3 v3.6.0
+	github.com/colespringer/waxtap/v3 v3.7.0
 	google.golang.org/protobuf v1.36.12 // the e2e suite decodes xtags with it
 )
 
 require (
-	github.com/colespringer/waxflow v0.0.0-20260923050513-446ca3124d89 // indirect
+	github.com/colespringer/waxflow v0.0.0-20261111201239-c9d965942277 // indirect
 	github.com/colespringer/waxlabel v1.8.0 // indirect
 	github.com/dlclark/regexp2/v2 v2.12.0 // indirect
 	github.com/dop251/goja v0.0.0-20261103214539-f5d1d0025744 // indirect

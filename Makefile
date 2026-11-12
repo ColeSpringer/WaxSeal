@@ -63,7 +63,7 @@ help:
 	@echo "  vet               go vet the root and provider/ modules, plus a windows cross-vet"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  consumer-check    build provider/ as an external go get sees it (needs network)"
-	@echo "  live              real-Chromium CDP transport tests (needs a browser)"
+	@echo "  live              real-Chromium tests that need no network (root CDP transport + provider/)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
 	@echo "  release           build Linux/macOS/Windows amd64+arm64 binaries into $(DIST)/"
@@ -126,11 +126,13 @@ test: fmt-check
 	go test -race ./...
 	cd provider && go test -race ./...
 
-# live runs the real-Chromium CDP transport tests. They drive a local browser
-# over the pipe transport and need no network; set WAXSEAL_CHROME_BIN when the
+# live runs the tests that drive a local browser and need no network: the CDP
+# pipe-transport tests, then provider/'s, which reads a daemon whose launches
+# fail through the consumer's own probe. Set WAXSEAL_CHROME_BIN when the
 # browser is not on a well-known path.
 live:
 	go test -race -tags live ./internal/cdp
+	cd provider && go test -race -tags live ./...
 
 # jsbundle-browser builds the bgutils-js and BotGuard entrypoint as an ES2020
 # IIFE. Chromium evaluates the committed bundle, which Go embeds from

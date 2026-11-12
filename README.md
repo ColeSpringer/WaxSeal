@@ -679,11 +679,12 @@ environment-only variables.
 go test ./...                              # offline unit tests; no browser or network
 (cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
+(cd provider && go test -tags live ./...)  # the nested module's test that needs Chromium but no network
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs Chromium and network access
 make vet                                   # both modules, plus a windows cross-vet (CI vets Windows natively)
 make fmt-check                             # fail if any file needs gofmt
 make test                                  # both modules' offline tests, race-enabled
-make live                                  # the live CDP tests above
+make live                                  # both live lines above
 make tidy-check                            # fail if go mod tidy would change either module
 make vulncheck                             # govulncheck over both modules
 make consumer-check                        # build provider/ as an external go get sees it
@@ -696,7 +697,7 @@ make jsbundle-browser                      # regenerate internal/browser/bg_brow
 `go test ./...` is offline and deterministic: no browser, no network. It does
 not reach the separate `provider/` module, whose own offline tests need the
 second line; `make test` runs both. The committed browser bundle means builds
-need no Node. The live CDP tests skip when no browser is found;
+need no Node. The live tests skip when no browser is found;
 `WAXSEAL_CHROME_BIN` picks one, and `WAXSEAL_REQUIRE_CHROME=1` (set in CI) fails
 instead of skipping.
 

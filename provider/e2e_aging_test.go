@@ -404,7 +404,7 @@ type agingHarness struct {
 func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation time.Duration) *agingHarness {
 	t.Helper()
 	sepLog := &separationLog{}
-	srv, addr, ln := newInProcessDaemon(t, server.Config{
+	srv, ln := newInProcessDaemon(t, server.Config{
 		MintSeparation: separation,
 		Logger:         slog.New(separationWatcher{inner: testDaemonLogger(t).Handler(), log: sepLog}),
 	})
@@ -423,9 +423,7 @@ func newAgingHarness(t *testing.T, rec *agingRecord, selfTest bool, separation t
 		}
 		rec.selfTestDone = time.Now()
 	}
-	go func() { _ = srv.Serve(ln) }()
-	base := "http://" + addr
-	waitDaemonReady(t, base)
+	base := serveDaemon(t, srv, ln)
 
 	rt := &potCacheRecorder{base: http.DefaultTransport}
 	// The timeout must clear the daemon's own per-request budget so a slow
