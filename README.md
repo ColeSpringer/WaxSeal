@@ -52,7 +52,7 @@ must leave from the same IP: run it on the same host, or in a container that
 shares the daemon's network namespace
 ([snippet](docs/deployment.md#run-a-consumer-on-the-same-egress-ip)).
 
-`WAXSEAL_VERSION=1.5.1 docker compose up -d --wait` pins a release.
+`WAXSEAL_VERSION=1.6.0 docker compose up -d --wait` pins a release.
 [docs/deployment.md](docs/deployment.md) has the optional extras as paste-in
 snippets: API keys from a secret file, a memory limit, a read-only root
 filesystem, `docker run` without compose, and verifying or building the image.
