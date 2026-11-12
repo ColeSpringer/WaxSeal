@@ -1,0 +1,6 @@
+{
+    // The e2e and live test files are build-tagged; gopls skips them without the tags.
+    "gopls": {
+        "build.buildFlags": ["-tags=e2e,live"]
+    }
+}
