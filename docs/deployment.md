@@ -10,7 +10,8 @@ docker compose up -d --wait
 
 `--wait` returns once the image's healthcheck passes, typically within ten
 seconds of Chromium starting. The first token or context request may still wait
-up to 12 seconds behind the mint-separation gate (README, `/player-context`).
+up to 12 seconds behind the mint-separation gate (see
+[`/player-context`](api.md#get-post-player-context)).
 
 A daemon that YouTube refuses, or that cannot reach it, turns healthy too: it
 answers with a `Retry-After` and retries its warm-up in the background, backing
@@ -185,12 +186,21 @@ block from `waxseal`.
 ## Tune the daemon
 
 Settings go under `environment:` like the keys above; the README's
-[Operations](../README.md#operations) section lists every variable and the flag
-it stands in for. `WAXSEAL_SHUTDOWN_TIMEOUT` (default 60s) is how long a
-stopping daemon drains in-flight requests, and the file's `stop_grace_period`
-of 70s covers it: raise both together, or Docker kills the container
-mid-request. `WAXSEAL_MINT_SEPARATION` must be a positive Go duration, or the
-daemon refuses to start.
+[Configuration](../README.md#configuration) section lists every variable and
+its default. `WAXSEAL_SHUTDOWN_TIMEOUT` (default 60s) is how long a stopping
+daemon drains in-flight requests, and the file's `stop_grace_period` of 70s
+covers it: raise both together, or Docker kills the container mid-request.
+`WAXSEAL_MINT_SEPARATION` must be a positive Go duration, or the daemon refuses
+to start.
+
+A setting that is a flag only, such as `--metrics-public`, goes in `command:`,
+which replaces the image's `server --host 0.0.0.0`. Repeat those words: without
+`--host 0.0.0.0` the daemon binds loopback inside the container, so the
+published port reaches nothing while the healthcheck still passes.
+
+```yaml
+    command: ["server", "--host", "0.0.0.0", "--metrics-public"]
+```
 
 ## Health checks
 
@@ -204,9 +214,8 @@ daemon is healthy or has no session, because one was retired or YouTube will
 not grant one yet, and 503 once a probe confirms the session or the browser
 lost.
 Give it the same generous timeout, since a probe that finds a wedged browser
-relaunches it before answering. The README's
-[Operations](../README.md#operations) section has the details, including what a
-probe on a keyed daemon checks.
+relaunches it before answering. [operations.md](operations.md#health-checks)
+has the details, including what a probe on a keyed daemon checks.
 
 ## Upgrade, follow, stop
 

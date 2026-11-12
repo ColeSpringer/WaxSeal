@@ -27,7 +27,7 @@ func TestErrorCodeContract(t *testing.T) {
 	}
 	for _, c := range codes {
 		if c.server != c.want {
-			t.Errorf("server.Code %s = %q, want %q (update the README error-code table)", c.name, c.server, c.want)
+			t.Errorf("server.Code %s = %q, want %q (update the error-code table in %s)", c.name, c.server, c.want, apiDoc)
 		}
 		if c.client != c.want {
 			t.Errorf("client.Code %s = %q, want %q (drifted from the server's wire value)", c.name, c.client, c.want)

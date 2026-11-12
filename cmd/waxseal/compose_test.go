@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/readmedoc"
+	"github.com/colespringer/waxseal/internal/docexample"
 )
 
 // TestREADMEEmbedsComposeFile holds the compose block the README's quick start
@@ -17,7 +17,7 @@ func TestREADMEEmbedsComposeFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := readmedoc.Fence("../../README.md", "Quick start", "yaml")
+	got, err := docexample.Fence("../../README.md", "Quick start", "yaml")
 	if err != nil {
 		t.Fatalf("locate the README's compose block: %v", err)
 	}

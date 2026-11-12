@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/internal/readmedoc"
+	"github.com/colespringer/waxseal/internal/docexample"
 )
 
 func TestPOToken(t *testing.T) {
@@ -458,21 +458,24 @@ func TestReportHTTPError(t *testing.T) {
 	}
 }
 
-// TestClientDecodesREADMEExamples serves the README's response examples to the
-// client and checks each value decodes. The server/ shape contracts pin those
-// keys against the structs that write them, but a key can match there and still
-// decode into nothing here. cookie_header is skipped: the client does not
+// apiDoc is the API reference, whose response blocks are the contract.
+const apiDoc = "../docs/api.md"
+
+// TestClientDecodesDocumentedExamples serves docs/api.md's response examples to
+// the client and checks each value decodes. The server/ shape contracts pin
+// those keys against the structs that write them, but a key can match there and
+// still decode into nothing here. cookie_header is skipped: the client does not
 // decode it, since the cookies carry the same data.
-func TestClientDecodesREADMEExamples(t *testing.T) {
+func TestClientDecodesDocumentedExamples(t *testing.T) {
 	serve := func(t *testing.T, heading string) (*client.Client, map[string]any) {
 		t.Helper()
-		raw, err := readmedoc.Response("../README.md", heading)
+		raw, err := docexample.Response(apiDoc, heading)
 		if err != nil {
-			t.Fatalf("locate the README %s response block: %v", heading, err)
+			t.Fatalf("locate the %s %s response block: %v", apiDoc, heading, err)
 		}
 		var documented map[string]any
 		if err := json.Unmarshal(raw, &documented); err != nil {
-			t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
+			t.Fatalf("the %s %s response block is not JSON once its comments are stripped: %v", apiDoc, heading, err)
 		}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -539,7 +542,7 @@ func TestClientDecodesREADMEExamples(t *testing.T) {
 
 		documented, _ := want["cookies"].([]any)
 		if len(documented) == 0 || len(sess.Cookies) != len(documented) {
-			t.Fatalf("cookies = %d, want the %d the README documents", len(sess.Cookies), len(documented))
+			t.Fatalf("cookies = %d, want the %d that %s documents", len(sess.Cookies), len(documented), apiDoc)
 		}
 		for i, raw := range documented {
 			doc := raw.(map[string]any)
@@ -558,7 +561,7 @@ func TestClientDecodesREADMEExamples(t *testing.T) {
 	})
 }
 
-// wireSameSite is the README's same_site mapping, written out independently: a
+// wireSameSite is docs/api.md's same_site mapping, written out independently: a
 // test that reused the client's mapper could not tell a wrong mapping from a
 // consistent one.
 func wireSameSite(v any) http.SameSite {

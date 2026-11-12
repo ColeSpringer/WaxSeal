@@ -121,7 +121,7 @@ consumer-check:
 # test runs the offline suite with the race detector, as CI does: the root
 # module, then provider/. The committed bundle means it needs no Node. The
 # -tags e2e suite needs network and Chromium, and each test starts its own
-# daemon unless WAXSEAL_URL names one; the README covers it.
+# daemon unless WAXSEAL_URL names one; docs/development.md covers it.
 test: fmt-check
 	go test -race ./...
 	cd provider && go test -race ./...

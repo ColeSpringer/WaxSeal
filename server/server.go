@@ -661,7 +661,7 @@ type ReportResponse struct {
 }
 
 // SessionResponse is the /session response. It is exported, with SessionCookie,
-// so the README block stays a checkable contract (TestSessionShapeContract).
+// so the docs/api.md block stays a checkable contract (TestSessionShapeContract).
 type SessionResponse struct {
 	VisitorData       string          `json:"visitor_data"`
 	UserAgent         string          `json:"user_agent"`

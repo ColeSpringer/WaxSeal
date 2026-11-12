@@ -11,14 +11,17 @@ import (
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/internal/readmedoc"
+	"github.com/colespringer/waxseal/internal/docexample"
 	"github.com/colespringer/waxseal/server"
 )
 
+// apiDoc is the API reference, whose response blocks are the contract.
+const apiDoc = "../docs/api.md"
+
 // TestPlayerContextShapeContract holds the three descriptions of the
 // /player-context response together: the browser struct the handler embeds, the
-// client struct a consumer decodes into, and the README block, which is the
-// contract. Each reduces to a shape (JSON key to value kind), so a field
+// client struct a consumer decodes into, and the docs/api.md block, which is
+// the contract. Each reduces to a shape (JSON key to value kind), so a field
 // missing or mistyped in one fails here instead of reaching a consumer.
 func TestPlayerContextShapeContract(t *testing.T) {
 	browserShape := structShape(reflect.TypeFor[browser.PlayerContext]())
@@ -31,17 +34,17 @@ func TestPlayerContextShapeContract(t *testing.T) {
 	if diff := shapeDiff(want, clientShape); diff != "" {
 		t.Errorf("client.PlayerContext drifted from browser.PlayerContext plus session_generation:\n%s", diff)
 	}
-	if diff := shapeDiff(want, readmeResponseShape(t, "/player-context")); diff != "" {
-		t.Errorf("the README /player-context block drifted from the structs (the README shape is the contract):\n%s", diff)
+	if diff := shapeDiff(want, docResponseShape(t, "/player-context")); diff != "" {
+		t.Errorf("the %s /player-context block drifted from the structs (the documented shape is the contract):\n%s", apiDoc, diff)
 	}
 }
 
-// TestSessionShapeContract holds server.SessionResponse to the README /session
-// block the way TestPlayerContextShapeContract holds /player-context. WaxTap
-// reads the identity from this response, so a renamed key fails here.
+// TestSessionShapeContract holds server.SessionResponse to the docs/api.md
+// /session block the way TestPlayerContextShapeContract holds /player-context.
+// WaxTap reads the identity from this response, so a renamed key fails here.
 func TestSessionShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeFor[server.SessionResponse]()), readmeResponseShape(t, "/session")); diff != "" {
-		t.Errorf("the README /session block drifted from server.SessionResponse (the README shape is the contract):\n%s", diff)
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.SessionResponse]()), docResponseShape(t, "/session")); diff != "" {
+		t.Errorf("the %s /session block drifted from server.SessionResponse (the documented shape is the contract):\n%s", apiDoc, diff)
 	}
 }
 
@@ -49,14 +52,30 @@ func TestSessionShapeContract(t *testing.T) {
 // and /report. They depend on those handlers writing structs: a map literal has
 // no shape to read.
 func TestGetPotShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeFor[server.TokenResponse]()), readmeResponseShape(t, "/get_pot")); diff != "" {
-		t.Errorf("the README /get_pot block drifted from server.TokenResponse (the README shape is the contract):\n%s", diff)
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.TokenResponse]()), docResponseShape(t, "/get_pot")); diff != "" {
+		t.Errorf("the %s /get_pot block drifted from server.TokenResponse (the documented shape is the contract):\n%s", apiDoc, diff)
 	}
 }
 
 func TestReportShapeContract(t *testing.T) {
-	if diff := shapeDiff(structShape(reflect.TypeFor[server.ReportResponse]()), readmeResponseShape(t, "/report")); diff != "" {
-		t.Errorf("the README /report block drifted from server.ReportResponse (the README shape is the contract):\n%s", diff)
+	if diff := shapeDiff(structShape(reflect.TypeFor[server.ReportResponse]()), docResponseShape(t, "/report")); diff != "" {
+		t.Errorf("the %s /report block drifted from server.ReportResponse (the documented shape is the contract):\n%s", apiDoc, diff)
+	}
+}
+
+// TestQuickStartExampleShape holds the README's quick start response to what
+// /get_pot writes for a token with no warning, the one key omitempty drops.
+func TestQuickStartExampleShape(t *testing.T) {
+	example, err := docexample.Fence("../README.md", "Quick start", "json")
+	if err != nil {
+		t.Fatalf("locate the README's quick start response: %v", err)
+	}
+	written, err := json.Marshal(server.TokenResponse{POToken: "t", ContentBinding: "b", ExpiresAt: "e"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := shapeDiff(jsonShape(t, written), jsonShape(t, example)); diff != "" {
+		t.Errorf("the README's quick start response drifted from what /get_pot writes:\n%s", diff)
 	}
 }
 
@@ -288,17 +307,23 @@ func shapeDiff(want, got shape) string {
 	return b.String()
 }
 
-// readmeResponseShape reduces the README response example for heading to a
-// shape. internal/readmedoc locates the block; only the reduction belongs here.
-func readmeResponseShape(t *testing.T, heading string) shape {
+// docResponseShape reduces the docs/api.md response example for heading to a
+// shape. internal/docexample locates the block; only the reduction belongs here.
+func docResponseShape(t *testing.T, heading string) shape {
 	t.Helper()
-	raw, err := readmedoc.Response("../README.md", heading)
+	raw, err := docexample.Response(apiDoc, heading)
 	if err != nil {
-		t.Fatalf("locate the README %s response block: %v", heading, err)
+		t.Fatalf("locate the %s %s response block: %v", apiDoc, heading, err)
 	}
+	return jsonShape(t, raw)
+}
+
+// jsonShape reduces a JSON object to its shape.
+func jsonShape(t *testing.T, raw []byte) shape {
+	t.Helper()
 	var top map[string]any
 	if err := json.Unmarshal(raw, &top); err != nil {
-		t.Fatalf("README %s response block is not JSON once its comments are stripped: %v", heading, err)
+		t.Fatalf("not a JSON object: %v\n%s", err, raw)
 	}
 	out := make(shape)
 	for k, v := range top {

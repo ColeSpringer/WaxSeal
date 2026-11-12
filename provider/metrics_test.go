@@ -33,10 +33,10 @@ type metricsSnapshot struct {
 // readMetrics scrapes /metrics once and reads whichever shape the daemon
 // returns. A keyed daemon redacts /metrics to summed lifetime counters unless
 // the caller holds the operator --metrics-key; a tenant key never unlocks
-// detail (see server.metricsFull). So an external keyed daemon, the README's
-// WAXSEAL_URL plus WAXSEAL_KEY workflow, normally answers redacted with no
-// per_tenant map. The key is still sent: it unlocks detail when WAXSEAL_KEY is
-// the metrics key.
+// detail (see server.metricsFull). So an external keyed daemon, the WAXSEAL_URL
+// plus WAXSEAL_KEY workflow of docs/development.md, normally answers redacted
+// with no per_tenant map. The key is still sent: it unlocks detail when
+// WAXSEAL_KEY is the metrics key.
 func readMetrics(t *testing.T, base string) metricsSnapshot {
 	t.Helper()
 	m, err := fetchMetrics(base, os.Getenv("WAXSEAL_KEY"))

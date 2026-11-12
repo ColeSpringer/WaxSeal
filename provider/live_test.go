@@ -54,7 +54,7 @@ func TestFailedLaunchPingHTTP(t *testing.T) {
 
 	// Nothing has launched yet. The first request that needs a session runs
 	// the launch and is refused inside the cool-down its failure opened, which
-	// the README puts at 15 seconds for a first failure.
+	// docs/api.md puts at 15 seconds for a first failure.
 	const firstCooldown = 15 * time.Second
 	_, err := client.New(base).Session(ctx)
 	refusal, ok := errors.AsType[*client.APIError](err)

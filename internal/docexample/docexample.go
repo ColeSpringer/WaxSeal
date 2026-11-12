@@ -1,8 +1,8 @@
-// Package readmedoc extracts examples from README.md so contract tests can hold
-// the code to them. Response returns an endpoint's documented JSON, and Fence a
-// fenced block such as the compose file the quick start embeds. It is test
-// support; the daemon never calls it.
-package readmedoc
+// Package docexample extracts examples from the Markdown docs so contract tests
+// can hold the code to them. Response returns an endpoint's documented JSON,
+// and Fence a fenced block such as the compose file the README's quick start
+// embeds. It is test support; the daemon never calls it.
+package docexample
 
 import (
 	"fmt"
@@ -15,14 +15,14 @@ import (
 // section bounds the search and the example starts after its "// response"
 // line, so neither a neighboring endpoint's block nor an earlier request
 // example in the same fence leaks in.
-func Response(readmePath, heading string) ([]byte, error) {
-	lines, err := readLines(readmePath)
+func Response(path, heading string) ([]byte, error) {
+	lines, err := readLines(path)
 	if err != nil {
 		return nil, err
 	}
 	start, end, err := section(lines, heading, 3)
 	if err != nil {
-		return nil, fmt.Errorf("readmedoc: %s %w", readmePath, err)
+		return nil, fmt.Errorf("docexample: %s %w", path, err)
 	}
 	for i := start; i < end; i++ {
 		if !strings.HasPrefix(lines[i], "```") {
@@ -30,7 +30,7 @@ func Response(readmePath, heading string) ([]byte, error) {
 		}
 		stop, err := fenceEnd(lines, i)
 		if err != nil {
-			return nil, fmt.Errorf("readmedoc: %s %w", readmePath, err)
+			return nil, fmt.Errorf("docexample: %s %w", path, err)
 		}
 		for j := i + 1; j < stop; j++ {
 			if strings.TrimSpace(lines[j]) != "// response" {
@@ -40,27 +40,27 @@ func Response(readmePath, heading string) ([]byte, error) {
 			// An empty response block is a documentation bug. Say so rather than
 			// return an empty slice the caller would report as a JSON parse error.
 			if strings.TrimSpace(body) == "" {
-				return nil, fmt.Errorf("readmedoc: the %s response block is empty", heading)
+				return nil, fmt.Errorf("docexample: the %s response block is empty", heading)
 			}
 			return []byte(body), nil
 		}
 		i = stop
 	}
-	return nil, fmt.Errorf("readmedoc: the %s section has no // response block", heading)
+	return nil, fmt.Errorf("docexample: the %s section has no // response block", heading)
 }
 
 // Fence returns the body of the first fenced block whose info string's first
 // word is info ("```yaml title=x" matches "yaml"), under the first heading of
 // any level containing heading. Each line keeps its newline, so the result
 // matches a newline-terminated file byte for byte. An empty block is an error.
-func Fence(readmePath, heading, info string) ([]byte, error) {
-	lines, err := readLines(readmePath)
+func Fence(path, heading, info string) ([]byte, error) {
+	lines, err := readLines(path)
 	if err != nil {
 		return nil, err
 	}
 	start, end, err := section(lines, heading, 1)
 	if err != nil {
-		return nil, fmt.Errorf("readmedoc: %s %w", readmePath, err)
+		return nil, fmt.Errorf("docexample: %s %w", path, err)
 	}
 	for i := start; i < end; i++ {
 		if !strings.HasPrefix(lines[i], "```") {
@@ -68,17 +68,17 @@ func Fence(readmePath, heading, info string) ([]byte, error) {
 		}
 		stop, err := fenceEnd(lines, i)
 		if err != nil {
-			return nil, fmt.Errorf("readmedoc: %s %w", readmePath, err)
+			return nil, fmt.Errorf("docexample: %s %w", path, err)
 		}
 		if fenceInfo(lines[i]) == info {
 			if stop == i+1 {
-				return nil, fmt.Errorf("readmedoc: the %s section's ```%s block is empty", heading, info)
+				return nil, fmt.Errorf("docexample: the %s section's ```%s block is empty", heading, info)
 			}
 			return []byte(strings.Join(lines[i+1:stop], "\n") + "\n"), nil
 		}
 		i = stop
 	}
-	return nil, fmt.Errorf("readmedoc: the %s section has no ```%s block", heading, info)
+	return nil, fmt.Errorf("docexample: the %s section has no ```%s block", heading, info)
 }
 
 func readLines(path string) ([]string, error) {
