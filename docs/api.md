@@ -234,14 +234,14 @@ faster on a sustained basis. A report past the budget is rejected with
 - `degradation_reports_rejected_stale`: a generation other than the current
   one, replaced or not yet issued.
 - `degradation_reports_already_retired`: the current generation, already
-  retired by a crash or a prior report; a benign no-op.
+  retired with no replacement attested yet; a benign no-op.
 - `degradation_reports_duplicate_pending`: a repeat report for a generation
   whose retirement is already queued; it answers `accepted: true` but counts
   here, not under `accepted`.
 
 An accepted report drops the generation's cached tokens at once, even when its
 retirement waits. `accepted: true` with neither `retired` nor
-`retirement_pending` means a crash or recycle retired the session first.
+`retirement_pending` means the session closed before the report could retire it.
 
 ## Authentication and tenants
 

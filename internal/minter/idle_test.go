@@ -3,6 +3,7 @@ package minter
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -420,6 +421,95 @@ func TestMinterCloseIdleBooksAPendingReport(t *testing.T) {
 	m.mu.Unlock()
 	if spent < 0.9 {
 		t.Errorf("report budget moved by %.2f, want one recycle spent", spent)
+	}
+}
+
+// A report that races the idle pass is booked once: as the report's recycle
+// when it marked the session first, or as already retired when the pass closed
+// the session first. It is never accepted while the close counts as idleness.
+// Both sides start together and the report's start moves a little later each
+// round, so the rounds sweep it across the whole pass.
+func TestMinterCloseIdleRacingAReport(t *testing.T) {
+	for round := range 500 {
+		m, _, _, _ := newTestMinter(okMint)
+		if err := m.Warm(context.Background()); err != nil {
+			t.Fatalf("Warm: %v", err)
+		}
+		gen := m.Generation()
+		rewindLastUse(m, 2*time.Hour)
+		m.mu.Lock()
+		budget := m.reportTokens
+		m.mu.Unlock()
+
+		var res ReportResult
+		var wg sync.WaitGroup
+		var ready atomic.Int32
+		arrive := func() {
+			ready.Add(1)
+			for ready.Load() < 2 {
+			}
+		}
+		wg.Add(2)
+		go func() { defer wg.Done(); arrive(); m.closeIdle(time.Hour) }()
+		go func() {
+			defer wg.Done()
+			arrive()
+			for range round % 50 * 10 {
+				ready.Load()
+			}
+			res = m.ReportDegraded(gen, "vid", "truncated")
+		}()
+		wg.Wait()
+
+		snap := m.MetricsSnapshot()
+		m.mu.Lock()
+		spent := budget - m.reportTokens
+		m.mu.Unlock()
+		if res.Accepted && (snap["report_driven_recycles"] != int64(1) || snap["idle_closes"] != int64(0) || spent < 0.9) {
+			t.Fatalf("report answered %+v, but report_driven_recycles=%v idle_closes=%v and the budget moved by %.2f; want the close booked as the report's",
+				res, snap["report_driven_recycles"], snap["idle_closes"], spent)
+		}
+		if !res.Accepted && (snap["idle_closes"] != int64(1) || snap["degradation_reports_already_retired"] != int64(1) || spent > 0.1) {
+			t.Fatalf("report answered %+v, but idle_closes=%v already_retired=%v and the budget moved by %.2f; want an idle close the report found retired",
+				res, snap["idle_closes"], snap["degradation_reports_already_retired"], spent)
+		}
+	}
+}
+
+// A report naming the session an idle close retired is not accepted and
+// reads as already retired, not stale, until the next request launches a
+// session; from then on that generation is stale.
+func TestMinterReportAfterIdleClose(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	gen := m.Generation()
+	rewindLastUse(m, 2*time.Hour)
+	if !m.closeIdle(time.Hour) {
+		t.Fatal("closeIdle left a session unused for two hours")
+	}
+	if res := m.ReportDegraded(gen, "vid", "truncated"); res.Accepted || res.Generation != gen {
+		t.Errorf("report after the idle close = %+v, want not accepted at generation %d", res, gen)
+	}
+	snap := m.MetricsSnapshot()
+	if snap["degradation_reports_already_retired"] != int64(1) || snap["degradation_reports_rejected_stale"] != int64(0) || snap["degradation_reports_accepted"] != int64(0) {
+		t.Errorf("already_retired=%v rejected_stale=%v accepted=%v, want 1/0/0",
+			snap["degradation_reports_already_retired"], snap["degradation_reports_rejected_stale"], snap["degradation_reports_accepted"])
+	}
+
+	if _, _, err := m.Mint(ctx, "player", "other"); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if got := m.Generation(); got != gen+1 {
+		t.Fatalf("Generation = %d after the next request, want %d", got, gen+1)
+	}
+	if res := m.ReportDegraded(gen, "vid", "truncated"); res.Accepted || res.Generation != gen+1 {
+		t.Errorf("report naming the closed generation = %+v, want not accepted at generation %d", res, gen+1)
+	}
+	if got := m.MetricsSnapshot()["degradation_reports_rejected_stale"]; got != int64(1) {
+		t.Errorf("rejected_stale = %v once a new session launched, want 1", got)
 	}
 }
 

@@ -24,8 +24,9 @@ concurrency:
 jobs:
   # CI never sees a tag push, so this job is the gate: the tag must be on main
   # and pass the same Makefile targets a local run uses, which keeps the two
-  # from drifting. A tag on a stray commit, one whose provider pin has fallen
-  # behind the root, or one vulncheck flags stops here before anything publishes.
+  # from drifting. A tag on a stray commit, one whose provider/ requires a stale
+  # root or an untagged WaxTap, or one vulncheck flags stops here before
+  # anything publishes.
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -52,7 +53,7 @@ jobs:
             exit 1
           fi
       - name: gates
-        run: make fmt-check tidy-check vet test consumer-check vulncheck
+        run: make fmt-check tidy-check vet test consumer-check waxtap-pin-check vulncheck
 
   # Build the version-stamped binaries (the Makefile's RELEASE_PLATFORMS) and
   # attach them, with SHA256SUMS, to the tag's release, which normally already

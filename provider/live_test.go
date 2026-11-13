@@ -135,11 +135,8 @@ func TestIdleBrowserCloseAndWakeHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PingSidecar on an idle daemon: %v, want a healthy answer", err)
 	}
-	if health.OK || health.Reason != server.PingReasonNoSession || health.LaunchFailures != 0 || health.BrowserRelaunched {
-		t.Errorf("health = %+v, want a benign %q with nothing failed or relaunched", health, server.PingReasonNoSession)
-	}
-	if body := rawPing(t, ctx, base); body["browser_idle"] != true {
-		t.Errorf("/ping body = %v, want browser_idle:true", body)
+	if health.OK || health.Reason != server.PingReasonNoSession || !health.BrowserIdle || health.LaunchFailures != 0 || health.BrowserRelaunched {
+		t.Errorf("health = %+v, want a benign %q with the browser idle and nothing failed or relaunched", health, server.PingReasonNoSession)
 	}
 	if pid := srv.BrowserPID(); pid != 0 {
 		t.Fatalf("BrowserPID = %d after a probe, want 0: a probe must not wake an idle browser", pid)
@@ -154,8 +151,12 @@ func TestIdleBrowserCloseAndWakeHTTP(t *testing.T) {
 	if second == 0 || second == first {
 		t.Fatalf("BrowserPID = %d after a request (was %d before the idle close), want a new browser", second, first)
 	}
-	if body := rawPing(t, ctx, base); body["browser_idle"] != false || body["consecutive_launch_failures"] != float64(1) {
-		t.Errorf("/ping body after the wake = %v, want browser_idle:false and the failed launch counted", body)
+	health, err = waxtap.PingSidecar(ctx, base)
+	if err != nil {
+		t.Fatalf("PingSidecar after the wake: %v, want a healthy answer", err)
+	}
+	if health.BrowserIdle || health.LaunchFailures != 1 {
+		t.Errorf("health after the wake = %+v, want the browser running and the failed launch counted", health)
 	}
 
 	// Left alone again, it goes back to sleep. The counter moves once the close
@@ -186,13 +187,6 @@ func waitBrowserClosed(t *testing.T, srv *server.Server, pid int, idle time.Dura
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-// rawPing returns the strict /ping body as decoded JSON, for the fields
-// WaxTap's probe does not carry.
-func rawPing(t *testing.T, ctx context.Context, base string) map[string]any {
-	t.Helper()
-	return rawGet(t, ctx, base+"/ping?strict=true")
 }
 
 // rawGet decodes the JSON object a 200 from url carries.

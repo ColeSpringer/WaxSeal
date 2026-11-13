@@ -42,7 +42,7 @@ GOVULNCHECK_VERSION ?= v1.9.0
 # verified against the checksum database, if PATH has another patch.
 GO_TOOLCHAIN = $(or $(shell awk '$$1 == "toolchain" { print $$2 }' go.mod),$(error go.mod has no toolchain line))
 
-.PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check live jsbundle-browser \
+.PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check waxtap-pin-check live jsbundle-browser \
         verify-assets release deps clean docker-build docker-smoke compose-check docker-login \
         docker-push docker-push-authed docker-manifest docker-manifest-authed release-guard \
         image-name docker-digest docker-manifest-digest
@@ -63,6 +63,7 @@ help:
 	@echo "  vet               go vet the root and provider/ modules, plus a windows cross-vet"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  consumer-check    build provider/ as an external go get sees it (needs network)"
+	@echo "  waxtap-pin-check  fail unless provider/ requires a tagged WaxTap release"
 	@echo "  live              real-Chromium tests that need no network (root CDP transport + provider/)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
@@ -117,6 +118,16 @@ consumer-check:
 	    && go build ./... && go vet ./... \
 	    || exit 1; \
 	  echo "OK: provider/ compiles against its pinned root with no replace"
+
+# waxtap-pin-check fails unless provider/ requires a tagged WaxTap release.
+# Between releases the pin can sit on pushed main; the release gate runs this so
+# a release never makes consumers resolve an untagged commit.
+waxtap-pin-check:
+	@v=$$(cd provider && GOWORK=off go list -m -f '{{.Version}}' github.com/colespringer/waxtap/v3) || exit 1; \
+	  if ! printf '%s\n' "$$v" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+	    echo "provider/ requires waxtap $$v, not a tagged release; move the pin to a tag first"; exit 1; \
+	  fi; \
+	  echo "OK: provider/ requires the tagged waxtap $$v"
 
 # test runs the offline suite with the race detector, as CI does: the root
 # module, then provider/. The committed bundle means it needs no Node. The

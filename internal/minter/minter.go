@@ -251,8 +251,8 @@ type minterMetrics struct {
 	DegradationReportsRejectedStale atomic.Int64 // named an old or replaced generation
 	DegradationReportsRateLimited   atomic.Int64 // rejected by the debounce
 	// DegradationReportsAlreadyRetired counts reports naming the current
-	// generation whose session was already retired by a crash or a prior report.
-	// This is a benign no-op, not a stale report.
+	// generation whose session was already retired, with no replacement
+	// attested yet. This is a benign no-op, not a stale report.
 	DegradationReportsAlreadyRetired atomic.Int64
 	// DegradationReportsDuplicatePending counts a repeat report for a generation
 	// whose retirement is already pending. DegradationReportsAccepted counts only
@@ -1237,20 +1237,34 @@ func (m *Minter) runLaunch(la *launchAttempt) {
 // is true, it increments Crashes. The generation check makes concurrent
 // retirement attempts idempotent.
 func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
-	return m.retireAt(slog.LevelWarn, gen, reason, isCrash)
-}
-
-// retireAt is retire with the level its log line takes: every retirement but
-// the idle close answers something that went wrong.
-func (m *Minter) retireAt(level slog.Level, gen uint64, reason string, isCrash bool) bool {
 	m.mu.Lock()
-	if m.sess == nil || m.gen != gen {
-		m.mu.Unlock()
+	d, _, ok := m.detachLocked(gen, isCrash)
+	m.mu.Unlock()
+	if !ok {
 		return false
 	}
-	old := m.sess
+	m.closeDetached(d, slog.LevelWarn, reason)
+	return true
+}
+
+// detached is a session detachLocked took off the minter, for closeDetached to
+// finish once mu is released.
+type detached struct {
+	gen    uint64
+	sess   minterSession
+	cancel context.CancelFunc
+}
+
+// detachLocked takes generation gen's session off the minter if gen is current
+// and has one, and clears any report pending on it; reported says one was. The
+// caller holds mu, and passes what it gets to closeDetached after releasing it.
+func (m *Minter) detachLocked(gen uint64, isCrash bool) (d detached, reported, ok bool) {
+	if m.sess == nil || m.gen != gen {
+		return detached{}, false, false
+	}
+	d = detached{gen: gen, sess: m.sess, cancel: m.watchCancel}
+	reported = gen != 0 && m.reportSuspectGen == gen
 	m.sess = nil
-	cancel := m.watchCancel
 	m.watchCancel = nil
 	m.dropReportedGenerationLocked(gen)
 	m.reportSuspectGen = 0
@@ -1259,13 +1273,16 @@ func (m *Minter) retireAt(level slog.Level, gen uint64, reason string, isCrash b
 	if isCrash {
 		m.metrics.Crashes.Add(1)
 	}
-	m.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	return d, reported, true
+}
+
+// closeDetached logs a detached session's retirement at level and closes it.
+func (m *Minter) closeDetached(d detached, level slog.Level, reason string) {
+	if d.cancel != nil {
+		d.cancel()
 	}
-	m.log.Log(context.Background(), level, "minter: retiring session", "gen", gen, "reason", reason)
-	old.Close()
-	return true
+	m.log.Log(context.Background(), level, "minter: retiring session", "gen", d.gen, "reason", reason)
+	d.sess.Close()
 }
 
 // holdPage takes the page for a request, as defer m.holdPage()(). It is
@@ -1322,19 +1339,24 @@ func (m *Minter) closeIdle(idle time.Duration) bool {
 // the page in the meantime keeps the session it came for.
 func (m *Minter) closeIdleLocked(idle time.Duration) bool {
 	m.mu.Lock()
-	gen, live, unused, queued := m.gen, m.sess != nil, time.Since(m.lastUsedAt), m.pageUsers > 0
-	m.mu.Unlock()
-	if !live || queued || unused < idle {
+	unused := time.Since(m.lastUsedAt)
+	if m.sess == nil || m.pageUsers > 0 || unused < idle {
+		m.mu.Unlock()
 		return false
 	}
 	// A report still pending on the session is why it closes. The timeout only
 	// supplies the moment, so the close is the report's recycle, not an idle one.
-	if m.retireReported("consumer reported degradation; closing the idle session") {
+	// Reading the report in the hold of mu that detaches the session books one
+	// that lands during the pass the same way.
+	d, reported, _ := m.detachLocked(m.gen, false)
+	m.mu.Unlock()
+	if reported {
+		m.closeDetached(d, slog.LevelWarn, "consumer reported degradation; closing the idle session")
+		m.bookReportRecycle()
 		return false
 	}
-	if !m.retireAt(slog.LevelInfo, gen, "unused for "+unused.Round(time.Second).String(), false) {
-		return false
-	}
+	// Info, not Warn: an idle close answers nothing that went wrong.
+	m.closeDetached(d, slog.LevelInfo, "unused for "+unused.Round(time.Second).String())
 	m.metrics.IdleCloses.Add(1)
 	return true
 }
@@ -1367,9 +1389,9 @@ const reportRelaunchReason = "consumer reported degradation; relaunching"
 // retireReported retires the current generation when a consumer report is
 // pending on it, charging the report budget the way an immediate retirement
 // does. Every request that takes the page calls it first, so a deferred report
-// is consumed by the next request of any kind, and the idle close calls it for
-// a session no request came back to. reason is the log line's. The caller
-// holds mintMu.
+// is consumed by the next request of any kind, and the idle close books one
+// the same way for a session no request came back to. reason is the log
+// line's. The caller holds mintMu.
 func (m *Minter) retireReported(reason string) bool {
 	m.mu.Lock()
 	cur := m.gen
@@ -1378,12 +1400,17 @@ func (m *Minter) retireReported(reason string) bool {
 	if !suspect || !m.retire(cur, reason, false) {
 		return false
 	}
+	m.bookReportRecycle()
+	return true
+}
+
+// bookReportRecycle counts a session a consumer report closed and charges it to
+// the report budget, which deferred and immediate report-driven recycles share.
+func (m *Minter) bookReportRecycle() {
 	m.metrics.ReportDrivenRecycles.Add(1)
-	// Deferred and immediate report-driven recycles share one budget.
 	m.mu.Lock()
 	m.spendReportTokenLocked()
 	m.mu.Unlock()
-	return true
 }
 
 // refreshStreamingSession replaces a stale or reported-degraded session before a
@@ -1416,8 +1443,9 @@ func (m *Minter) Generation() uint64 {
 // ReportResult describes how the minter handled a degradation report. Accepted
 // means the report applies to the current session; Retired, that the session
 // was closed at once; RetirementPending, that the next request to take the page
-// will close it. Accepted with neither means a crash or recycle closed the
-// session first. RetryAfterSeconds is set when the report was rate-limited.
+// will close it. Accepted with neither means the session closed before the
+// report could retire it. RetryAfterSeconds is set when the report was
+// rate-limited.
 type ReportResult struct {
 	Accepted          bool
 	Retired           bool
@@ -1443,8 +1471,8 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 		m.metrics.DegradationReportsRejectedStale.Add(1)
 		return ReportResult{Accepted: false, Generation: cur}
 	case m.sess == nil:
-		// The current generation, already retired (by a crash or a prior report)
-		// before the next request relaunches: a benign no-op, not a stale report.
+		// The current generation, already retired with no replacement attested
+		// yet: a benign no-op, not a stale report.
 		// It must precede the rate-limit case: a report-driven retire leaves gen
 		// unchanged and spends budget, so a re-report can match both.
 		// TestMinterReportDegradedAlreadyRetired pins the order.
@@ -1479,12 +1507,9 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	if m.mintMu.TryLock() {
 		acted := m.retire(gen, retireReason, false)
 		if acted {
-			m.mu.Lock()
-			m.spendReportTokenLocked()
-			m.mu.Unlock()
-			m.metrics.ReportDrivenRecycles.Add(1)
+			m.bookReportRecycle()
 		} else {
-			m.log.Debug("minter: report accepted but nothing was left to retire; a crash or recycle landed first", "gen", gen)
+			m.log.Debug("minter: report accepted but its session had already closed", "gen", gen)
 		}
 		m.mintMu.Unlock()
 		return ReportResult{Accepted: true, Retired: acted, Generation: gen}
@@ -1514,8 +1539,8 @@ func (m *Minter) refillReportTokensLocked(now time.Time) {
 }
 
 // spendReportTokenLocked consumes one token of report budget. It is called only
-// after a report-driven retire recycled the session, so a no-op retire (a crash
-// or recycle got there first) never spends budget. The caller must hold m.mu.
+// after a report-driven retire recycled the session, so a no-op retire (the
+// session had already closed) never spends budget. The caller must hold m.mu.
 func (m *Minter) spendReportTokenLocked() {
 	m.refillReportTokensLocked(time.Now())
 	m.reportTokens = max(m.reportTokens-1, 0)
