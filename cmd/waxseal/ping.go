@@ -125,6 +125,7 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		Attest     string `json:"attest"`
 		Reason     string `json:"reason"`
 		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
+		Idle       bool   `json:"browser_idle"`       // the browser is closed under --idle-timeout
 		Keyed      *bool  `json:"keyed"`              // nil from a daemon older than the field
 		// LaunchFailures is nonzero when the tenant has no session because its
 		// last launches failed, and Error then says on what.
@@ -165,6 +166,9 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 			// The text is whatever answered, so it is quoted and clamped.
 			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s consecutive_launch_failures=%d error=%.512q",
 				resp.StatusCode, body.OK, body.Reason, body.LaunchFailures, body.Error)
+		case body.Idle:
+			// Not a fault: the next request wakes the daemon, and --strict passes.
+			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s (browser idle)", resp.StatusCode, body.OK, body.Reason)
 		case body.Reason != "":
 			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s", resp.StatusCode, body.OK, body.Reason)
 		}
@@ -177,6 +181,9 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	}
 	if body.Relaunched {
 		detail += ", browser relaunched"
+	}
+	if body.Idle {
+		detail += ", browser idle"
 	}
 	switch {
 	case !body.OK: // strict mode, a benign window: healthy but nothing live to describe

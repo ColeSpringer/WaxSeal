@@ -54,8 +54,9 @@ shares the daemon's network namespace
 
 `WAXSEAL_VERSION=1.6.0 docker compose up -d --wait` pins a release.
 [docs/deployment.md](docs/deployment.md) has the optional extras as paste-in
-snippets: API keys from a secret file, a memory limit, a read-only root
-filesystem, `docker run` without compose, and verifying or building the image.
+snippets: API keys from a secret file, a memory limit, an idle timeout, a
+read-only root filesystem, `docker run` without compose, and verifying or
+building the image.
 
 ## HTTP API
 
@@ -110,6 +111,7 @@ The daemon reads these environment variables, and a flag outranks its variable.
 | `WAXSEAL_METRICS_KEY`, `WAXSEAL_METRICS_KEY_FILE` | `--metrics-key`, `--metrics-key-file` | none | Operator key for per-tenant `/metrics` detail on a keyed daemon |
 | `WAXSEAL_STREAMING_MAX_AGE` | `--streaming-max-age` | `45m` | Session age that triggers a recycle; `0` or a blank value disables |
 | `WAXSEAL_REPORT_DEBOUNCE` | `--report-debounce` | `5m` | Spacing between recycles driven by `/report` |
+| `WAXSEAL_IDLE_TIMEOUT` | `--idle-timeout` | off | Time without use after which the browser closes to free its memory; minimum `1m` |
 | `WAXSEAL_SHUTDOWN_TIMEOUT` | `--shutdown-timeout` | `60s` | How long a stopping daemon drains in-flight requests |
 | `WAXSEAL_MINT_SEPARATION` | none | `12s` | Spacing kept between a token mint, a streaming proof, and a served context |
 | `WAXSEAL_CHROME_BIN` | none | auto-detected | The browser binary, for every command |

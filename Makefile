@@ -127,9 +127,9 @@ test: fmt-check
 	cd provider && go test -race ./...
 
 # live runs the tests that drive a local browser and need no network: the CDP
-# pipe-transport tests, then provider/'s, which reads a daemon whose launches
-# fail through the consumer's own probe. Set WAXSEAL_CHROME_BIN when the
-# browser is not on a well-known path.
+# pipe-transport tests, then provider/'s, which run a daemon whose session
+# launches fail offline. Set WAXSEAL_CHROME_BIN when the browser is not on a
+# well-known path.
 live:
 	go test -race -tags live ./internal/cdp
 	cd provider && go test -race -tags live ./...

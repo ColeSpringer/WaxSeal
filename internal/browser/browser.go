@@ -38,6 +38,16 @@ const playerContextTimeout = 25 * time.Second
 // playerContextPollInterval paces the player-context polling loops.
 const playerContextPollInterval = 300 * time.Millisecond
 
+// heapCollectDelay is how long the page sits unused before its JavaScript heap
+// is collected (see Session.pageWork). A watch page holds about 100 MB of
+// garbage after it loads or plays, and V8 keeps it for minutes when left alone.
+// The delay is long enough that a steady run of requests never pays for a
+// collection, only the quiet that follows it.
+const heapCollectDelay = 30 * time.Second
+
+// heapCollectTimeout bounds that collection's CDP call.
+const heapCollectTimeout = 10 * time.Second
+
 // identityCaptureTimeout bounds how long captureIdentity polls ytcfg for
 // visitor_data. setupSession's shared navigation budget is often tighter, so
 // captureIdentity also clamps to the context's deadline.
@@ -233,6 +243,7 @@ type pageDriver interface {
 	SetBypassCSP(enabled bool) error
 	SetUserAgentOverride(req *cdp.NetworkSetUserAgentOverride) error
 	WaitCrash(ctx context.Context) string
+	CollectGarbage() error
 }
 
 // cdpPage adapts *cdp.Page to pageDriver. Only Context needs a wrapper: the
@@ -254,6 +265,7 @@ type timing struct {
 	probeBudget        time.Duration // session-proof confirm budget
 	stallWindow        time.Duration // maximum time without playback or buffer progress
 	hardTimeout        time.Duration // bounds a whole proveFullLength call
+	gcDelay            time.Duration // idle time before the page's heap is collected
 }
 
 // withDefaults fills any non-positive field from the production values. A zero
@@ -275,6 +287,7 @@ func (t timing) withDefaults() timing {
 		{&t.probeBudget, d.probeBudget},
 		{&t.stallWindow, d.stallWindow},
 		{&t.hardTimeout, d.hardTimeout},
+		{&t.gcDelay, d.gcDelay},
 	} {
 		if *f.dst <= 0 {
 			*f.dst = f.def
@@ -300,6 +313,7 @@ func defaultTiming() timing {
 		probeBudget:        fullLengthProbeBudget,
 		stallWindow:        fullLengthStallWindow,
 		hardTimeout:        fullLengthHardTimeout,
+		gcDelay:            heapCollectDelay,
 	}
 }
 
@@ -339,7 +353,74 @@ type Session struct {
 	lifetimeSecs   int
 	tokenExpiresAt time.Time // when tokens from this attestation expire (attest time + lifetime)
 
+	// gcMu guards the idle heap collection (see pageWork). gcBusy counts the
+	// operations driving the page. gcPending says one of them left garbage
+	// since the last collection, which is then due at gcDue, and gcTimer fires
+	// it. gcClosed keeps a late timer off a closed page.
+	gcMu      sync.Mutex
+	gcBusy    int
+	gcPending bool
+	gcDue     time.Time
+	gcTimer   *time.Timer
+	gcClosed  bool
+
 	closeOnce sync.Once // dispose runs at most once even if Close is called concurrently
+}
+
+// pageWork brackets an operation that drives the page, as
+// defer s.pageWork(garbage)(). garbage says the operation leaves enough behind
+// to be worth collecting: a page load or playback does, a mint does not. The
+// heap is collected once gcDelay passes with no operation running after one
+// that did, so a burst pays for one collection after its last request and a
+// daemon that only mints pays for none. Operations nest: a context that proves
+// first is one stretch.
+func (s *Session) pageWork(garbage bool) (done func()) {
+	s.gcMu.Lock()
+	s.gcBusy++
+	s.gcPending = s.gcPending || garbage
+	s.gcMu.Unlock()
+	return s.pageWorkDone
+}
+
+func (s *Session) pageWorkDone() {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	if s.gcBusy--; s.gcBusy > 0 || s.gcClosed || !s.gcPending {
+		return
+	}
+	delay := s.tuning().gcDelay
+	s.gcDue = time.Now().Add(delay)
+	if s.gcTimer == nil {
+		s.gcTimer = time.AfterFunc(delay, s.collectGarbage)
+		return
+	}
+	s.gcTimer.Reset(delay)
+}
+
+// collectGarbage is the timer's callback. Stopping or resetting a timer does
+// not recall a callback already on its way, so it decides here whether the
+// collection is still wanted: not while work holds the page, not before the
+// current quiet stretch is due, and not after Close. Whatever turned it away
+// arms the next one. A failed collection costs only memory.
+//
+// It does not hold off work that begins once it has started. Nothing is
+// playing then, since no work was running, and the page runs that work's first
+// script only when the collection returns, about 0.2 s later; making pageWork
+// wait would buy the same delay with a lock held across a CDP call.
+func (s *Session) collectGarbage() {
+	s.gcMu.Lock()
+	if s.gcBusy > 0 || s.gcClosed || !s.gcPending || time.Now().Before(s.gcDue) {
+		s.gcMu.Unlock()
+		return
+	}
+	s.gcPending = false
+	s.gcMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), heapCollectTimeout)
+	defer cancel()
+	if err := s.page.Context(ctx).CollectGarbage(); err != nil {
+		s.log.Debug("waxseal: idle heap collection failed", "err", err)
+	}
 }
 
 // Launch starts a dedicated Chromium for one Session, parks a page on videoID's
@@ -621,9 +702,19 @@ var ErrPoolClosed = errors.New("waxseal: browser pool is closed")
 type browserInstance struct {
 	browser      *cdp.Browser
 	profile      profileHandle
+	exe          string          // the running binary, where the platform can name it (see browserExe)
+	pid          int             // the browser process, which leads its process group
 	uaOverride   uaOverrideCache // memoized user-agent override for this Chromium
 	onTeardown   func()          // test hook; nil in production
 	teardownOnce sync.Once       // teardown runs at most once even if Close races a relaunch
+	// tornDown is set once teardown has begun, or Suspend has committed to it,
+	// so a new session relaunches instead of opening a context on this instance.
+	tornDown atomic.Bool
+	// idleClose makes teardown release the browser's page cache as its last
+	// step, and cacheKept is whether that release left the cache alone. Suspend
+	// sets the first before the teardown and reads the second after it.
+	idleClose atomic.Bool
+	cacheKept bool
 }
 
 // teardown closes the browser (group-killing the process), then removes the
@@ -637,12 +728,19 @@ func (i *browserInstance) teardown() (ran bool) {
 	}
 	i.teardownOnce.Do(func() {
 		ran = true
+		i.tornDown.Store(true)
 		if i.browser != nil {
 			tctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
 			_ = i.browser.Context(tctx).Close()
 			cancel()
 		}
 		i.profile.cleanup()
+		// Inside the teardown, so a session waking the pool, which waits for
+		// this teardown before it launches, cannot have the release evict what
+		// its new browser has just read.
+		if i.idleClose.Load() {
+			i.cacheKept = releaseIdleCache(i.exe, i.pid)
+		}
 		if i.onTeardown != nil {
 			i.onTeardown()
 		}
@@ -656,7 +754,7 @@ func launchInstance(ctx context.Context, opts Options) (*browserInstance, error)
 	if err != nil {
 		return nil, err
 	}
-	return &browserInstance{browser: b, profile: profile}, nil
+	return &browserInstance{browser: b, profile: profile, exe: browserExe(b.PID()), pid: b.PID()}, nil
 }
 
 // Pool owns one Chromium and creates isolated incognito-context Sessions. Each
@@ -666,6 +764,9 @@ func launchInstance(ctx context.Context, opts Options) (*browserInstance, error)
 // If Chromium dies, the next NewSession attempts to relaunch it. Concurrent
 // callers share one relaunch, and repeated relaunches are subject to a capped
 // backoff.
+//
+// Suspend closes a Chromium no session is using, and the next NewSession
+// launches one again.
 type Pool struct {
 	opts Options
 
@@ -680,6 +781,7 @@ type Pool struct {
 	// failed; a refusal by the backoff is not one.
 	probeFailures    atomic.Int64
 	relaunchFailures atomic.Int64
+	idleCloses       atomic.Int64 // browsers Suspend closed
 
 	mu             sync.Mutex
 	cur            *browserInstance
@@ -687,6 +789,20 @@ type Pool struct {
 	relaunching    chan struct{} // non-nil while a relaunch is in progress
 	lastRelaunchAt time.Time     // start time of the last relaunch attempt
 	relaunchStreak int           // consecutive relaunches within the stability window
+	// users counts the sessions that are live or being created (see checkout),
+	// and suspended says Suspend closed cur and no session has asked for a
+	// browser since. cur stays the torn-down instance meanwhile. unanswered is
+	// the instance that last failed Suspend's probe, which it does not probe
+	// again until a probe or a session finds it answering.
+	users      int
+	suspended  bool
+	unanswered *browserInstance
+
+	// probing keeps Suspend and Health apart. Health holds it shared for a
+	// whole probe, and Suspend takes it exclusively, or skips its pass, to
+	// decide and mark an idle close. A probe therefore never judges a browser
+	// that an idle close took from under it, in either direction.
+	probing sync.RWMutex
 }
 
 // LaunchPool starts the shared Chromium. ctx bounds that first launch, so a
@@ -708,24 +824,138 @@ func LaunchPool(ctx context.Context, opts Options) (*Pool, error) {
 	return p, nil
 }
 
-// acquire returns the current instance unless the pool is closed.
-func (p *Pool) acquire() (*browserInstance, error) {
+// checkout returns the browser a new session will use and counts that session
+// against Suspend until release. It launches a browser first when the current
+// one is known gone: suspended, which only a checkout may wake, or lost with
+// no replacement yet.
+func (p *Pool) checkout(ctx context.Context) (*browserInstance, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed || p.cur == nil {
+		p.mu.Unlock()
 		return nil, ErrPoolClosed
 	}
-	return p.cur, nil
+	p.users++
+	p.unanswered = nil // a session is about to find out for itself
+	inst := p.cur
+	p.mu.Unlock()
+	if !inst.tornDown.Load() {
+		return inst, nil
+	}
+	inst, err := p.launchOver(ctx, inst, true)
+	if err != nil {
+		p.release()
+		return nil, err
+	}
+	return inst, nil
+}
+
+// release ends one checkout.
+func (p *Pool) release() {
+	p.mu.Lock()
+	p.users--
+	p.mu.Unlock()
+}
+
+// Suspend closes the browser if no session is live or being created, and
+// reports whether it did. Deciding that the browser has been unused for long
+// enough is the caller's part. Health reports the suspension without waking
+// it; only a session's checkout launches again.
+//
+// It closes only a browser that answers a probe. One that died or wedged on
+// its own, or was lost and not replaced, is a fault for Health to find and
+// report, not idleness to rest in, and its crash streak stands. It also stands
+// aside for a probe in flight; the next pass tries again.
+func (p *Pool) Suspend() bool {
+	if p == nil || !p.probing.TryLock() {
+		return false
+	}
+	inst := p.markIdleClose()
+	p.probing.Unlock()
+	if inst == nil {
+		return false
+	}
+	// From here a probe reads the pool as suspended and a checkout relaunches,
+	// so neither waits on, or meets, the browser going away.
+	inst.teardown()
+	p.idleCloses.Add(1)
+	p.opts.Logger.Info("waxseal: closed the idle chromium; the next session launches one")
+	if inst.cacheKept {
+		p.opts.Logger.Debug("waxseal: kept the closed chromium's page cache; something else is running that browser", "exe", inst.exe)
+	}
+	return true
+}
+
+// markIdleClose decides an idle close and marks the pool suspended for it,
+// returning the browser to tear down, or nil when there is none to close. The
+// caller holds probing.
+func (p *Pool) markIdleClose() *browserInstance {
+	p.mu.Lock()
+	inst := p.cur
+	candidate := p.unusedLocked() && p.unanswered != inst
+	p.mu.Unlock()
+	if !candidate {
+		return nil
+	}
+	if p.ping(context.Background(), inst) != nil {
+		p.mu.Lock()
+		p.unanswered = inst
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cur != inst || !p.unusedLocked() {
+		return nil // a session or a relaunch took the browser during the probe
+	}
+	// Marked under the lock, so a checkout that follows relaunches instead of
+	// opening a context on a browser that is about to exit.
+	inst.tornDown.Store(true)
+	inst.idleClose.Store(true)
+	p.suspended = true
+	// The streak counts crashes, and this browser did not crash. Left standing
+	// it would refuse the resume as a crash loop.
+	p.relaunchStreak = 0
+	return inst
+}
+
+// unusedLocked reports whether the pool holds a browser nothing is using or
+// replacing. The caller must hold p.mu.
+func (p *Pool) unusedLocked() bool {
+	return !p.closed && p.cur != nil && p.users == 0 && p.relaunching == nil && !p.cur.tornDown.Load()
+}
+
+// IdleCloses counts the browsers Suspend closed.
+func (p *Pool) IdleCloses() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.idleCloses.Load()
 }
 
 // NewSession creates a fresh isolated browser context and parks a Session in it.
 // Closing the Session disposes its context without closing the shared browser. If
 // the shared Chromium has died, NewSession relaunches it once and retries.
 func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error) {
-	inst, err := p.acquire()
+	inst, err := p.checkout(ctx)
 	if err != nil {
 		return nil, err
 	}
+	s, err := p.sessionOn(ctx, inst, videoID)
+	if err != nil {
+		p.release()
+		return nil, err
+	}
+	// The checkout is the session's until it closes.
+	closeContext := s.dispose
+	s.dispose = func() {
+		closeContext()
+		p.release()
+	}
+	return s, nil
+}
+
+// sessionOn is NewSession once the browser is checked out.
+func (p *Pool) sessionOn(ctx context.Context, inst *browserInstance, videoID string) (*Session, error) {
 	// Bind the context creation to the caller's ctx so an unresponsive browser
 	// cannot hang the request past its deadline.
 	incog, err := inst.browser.Context(ctx).Incognito()
@@ -785,6 +1015,9 @@ const (
 	// RecoveryTornDown means the browser missed two probes, so this probe tore
 	// it down and launched a replacement.
 	RecoveryTornDown
+	// RecoverySuspended means no browser is running because Suspend closed it,
+	// and the next session launches one. Nothing was probed or launched.
+	RecoverySuspended
 )
 
 func (r Recovery) String() string {
@@ -795,6 +1028,8 @@ func (r Recovery) String() string {
 		return "relaunched"
 	case RecoveryTornDown:
 		return "torn-down"
+	case RecoverySuspended:
+		return "suspended"
 	}
 	return fmt.Sprintf("recovery(%d)", int(r))
 }
@@ -803,7 +1038,8 @@ func (r Recovery) String() string {
 // Chromium answers a bounded CDP round trip, and what it had to do to get one.
 //
 // A closed connection is a known death: a replacement launches at once without
-// confirmation, so a healthy answer always means a browser is running. Any
+// confirmation, so a healthy answer always means a browser is running, unless
+// it says the pool is suspended, which is never probed or woken. Any
 // other failure is confirmed by a second probe with a fresh timeout, the same
 // guard Minter.Health applies to a session. A browser that misses both is torn
 // down, counted, and replaced, so the next request does not stall on the wedged
@@ -818,13 +1054,21 @@ func (p *Pool) Health(ctx context.Context) (Recovery, error) {
 	if p == nil {
 		return RecoveryNone, ErrPoolClosed
 	}
-	inst, err := p.acquire()
-	if err != nil {
-		return RecoveryNone, err
+	p.probing.RLock() // see Pool.probing
+	defer p.probing.RUnlock()
+	p.mu.Lock()
+	inst, closed, suspended := p.cur, p.closed, p.suspended
+	p.mu.Unlock()
+	switch {
+	case closed || inst == nil:
+		return RecoveryNone, ErrPoolClosed
+	case suspended:
+		return RecoverySuspended, nil
 	}
-	err = p.ping(ctx, inst)
+	err := p.ping(ctx, inst)
 	switch {
 	case err == nil:
+		p.answered(inst)
 		return RecoveryNone, nil
 	case errors.Is(err, cdp.ErrConnClosed):
 		return p.replace(RecoveryRelaunched, inst, err)
@@ -834,6 +1078,7 @@ func (p *Pool) Health(ctx context.Context) (Recovery, error) {
 	cerr := p.ping(ctx, inst)
 	switch {
 	case cerr == nil:
+		p.answered(inst)
 		p.opts.Logger.Warn("waxseal: pooled chromium probe recovered on confirmation; keeping the browser", "err", err)
 		return RecoveryNone, nil
 	case errors.Is(cerr, cdp.ErrConnClosed):
@@ -852,18 +1097,38 @@ func (p *Pool) Health(ctx context.Context) (Recovery, error) {
 	return p.replace(rec, inst, cerr)
 }
 
+// answered records that inst answered a probe, so Suspend may probe it again.
+func (p *Pool) answered(inst *browserInstance) {
+	p.mu.Lock()
+	if p.unanswered == inst {
+		p.unanswered = nil
+	}
+	p.mu.Unlock()
+}
+
 // replace launches a replacement for stale, or adopts one a concurrent caller
 // launched, and reports rec on success. cause is what the probe saw, for the log.
 func (p *Pool) replace(rec Recovery, stale *browserInstance, cause error) (Recovery, error) {
-	p.opts.Logger.Warn("waxseal: pooled chromium is gone; relaunching for the probe", "recovery", rec, "err", cause)
 	// The stale browser is already gone, so the probe waits for the relaunch, even
 	// one another caller started, and reports its outcome instead of giving up
 	// at its own deadline. The launch has its own handshake timeout.
-	if _, err := p.relaunch(context.Background(), stale); err != nil {
+	_, err := p.relaunch(context.Background(), stale)
+	switch {
+	case errors.Is(err, errSuspended):
+		// Unreachable while probing keeps an idle close out of a probe; kept so
+		// that a probe can never be what wakes an idle browser.
+		return RecoverySuspended, nil
+	case err != nil:
+		p.opts.Logger.Warn("waxseal: pooled chromium is gone and the probe could not relaunch it", "recovery", rec, "err", cause, "relaunch_err", err)
 		return RecoveryNone, err
 	}
+	p.opts.Logger.Warn("waxseal: pooled chromium was gone; relaunched for the probe", "recovery", rec, "err", cause)
 	return rec, nil
 }
+
+// errSuspended is a relaunch refusing to wake a suspended pool, which only a
+// session's checkout may do. A probe is the one caller that meets it.
+var errSuspended = errors.New("waxseal: browser pool is suspended")
 
 // ProbeFailures counts the browsers Health confirmed unresponsive and tore down,
 // one per browser lost rather than one per probe.
@@ -903,14 +1168,29 @@ func (e *RelaunchBackoffError) Error() string {
 // which belongs to whichever caller started it.
 //
 // Attempts are counted before launch so the backoff also covers browsers that
-// start successfully and die during session setup. The streak resets only after
-// relaunchStableWindow without another relaunch.
+// start successfully and die during session setup. The streak resets after
+// relaunchStableWindow without another relaunch, or at an idle close.
+//
+// A suspended pool is refused with errSuspended: a probe must not wake an idle
+// browser, and only a session's checkout does (see launchOver).
 func (p *Pool) relaunch(ctx context.Context, stale *browserInstance) (*browserInstance, error) {
+	return p.launchOver(ctx, stale, false)
+}
+
+// launchOver is relaunch, and with wake set the launch that ends a suspension.
+// The pool stays suspended until that launch has an outcome, so a probe
+// meanwhile reports the idle close instead of a loss: a browser installed, or
+// a failure, which leaves a pool that wanted a browser and has none.
+func (p *Pool) launchOver(ctx context.Context, stale *browserInstance, wake bool) (*browserInstance, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
 			return nil, ErrPoolClosed
+		}
+		if p.suspended && !wake {
+			p.mu.Unlock()
+			return nil, errSuspended
 		}
 		if p.cur != stale {
 			cur := p.cur // Another caller replaced the stale instance.
@@ -960,6 +1240,7 @@ func (p *Pool) relaunch(ctx context.Context, stale *browserInstance) (*browserIn
 
 		p.mu.Lock()
 		p.relaunching = nil
+		p.suspended = false
 		close(ch)
 		if lerr != nil {
 			p.mu.Unlock()
@@ -978,12 +1259,13 @@ func (p *Pool) relaunch(ctx context.Context, stale *browserInstance) (*browserIn
 }
 
 // CurrentBrowserPID returns the process ID of the current Chromium process, or 0
-// if none is available. cdp owns the Chromium process directly, so this is its
-// PID; cdp.Browser.PID guards a nil browser as 0.
+// if none is available, as while the pool is suspended. cdp owns the Chromium
+// process directly, so this is its PID; cdp.Browser.PID guards a nil browser as
+// 0.
 func (p *Pool) CurrentBrowserPID() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cur == nil {
+	if p.cur == nil || p.cur.tornDown.Load() {
 		return 0
 	}
 	return p.cur.browser.PID()
@@ -1574,6 +1856,7 @@ func (s *Session) Attest(ctx context.Context) error {
 	if s.attestKind != "" {
 		return nil
 	}
+	defer s.pageWork(true)() // the watch page has just loaded
 	ua := s.id.UserAgent
 
 	ictx := innertube.GuestContext(s.id.VisitorData, s.id.ClientVersion)
@@ -1651,6 +1934,7 @@ func classifyAttestation(it *botguard.GenerateITResult) (fallback bool, err erro
 // integrity path mints a new token in the browser. The fallback path returns the
 // single fallback token from Google. Both paths validate protobuf field 6.
 func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, error) {
+	defer s.pageWork(false)()
 	if err := s.Attest(ctx); err != nil {
 		return MintResult{}, err
 	}
@@ -1980,6 +2264,7 @@ func isUnavailableCode(code int) bool {
 // capped URL. Playback and visibility changes are reverted before the shared
 // page is reused.
 func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
+	defer s.pageWork(true)()
 	// A cold status-2 stream can buffer within the preview window. Seek past the
 	// cap before returning a context claimed to support full-length streaming.
 	if err := s.EnsureEstablished(ctx); err != nil {
@@ -2418,6 +2703,7 @@ func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLen
 // only when the context is canceled, the hard timeout expires, the video has a
 // terminal playability status, or the session hits a bot check.
 func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
+	defer s.pageWork(true)()
 	tm := s.tuning()
 	ctx, cancelHard := context.WithTimeout(ctx, tm.hardTimeout)
 	defer cancelHard()
@@ -2875,6 +3161,12 @@ func (s *Session) Close() {
 		return
 	}
 	s.closeOnce.Do(func() {
+		s.gcMu.Lock()
+		s.gcClosed = true
+		if s.gcTimer != nil {
+			s.gcTimer.Stop()
+		}
+		s.gcMu.Unlock()
 		if s.dispose != nil {
 			s.dispose()
 		}

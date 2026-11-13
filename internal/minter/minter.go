@@ -117,6 +117,15 @@ type Minter struct {
 	// second one.
 	botCheckRelaunchedAt time.Time
 
+	// What the idle timeout measures (see holdPage, closeIdle), guarded by mu.
+	// lastUsedAt is when a request that took the browser last released the
+	// page, or the session was published. pageUsers counts the requests holding
+	// the page or queued for it, and browserUsed says the one holding it was
+	// handed a session or ran a launch for one.
+	lastUsedAt  time.Time
+	pageUsers   int
+	browserUsed bool
+
 	// retiredGen and retiredCrash record the last generation torn down and
 	// whether the browser died under it, so sessionDied cannot mistake an
 	// off-request recycle for a browser death. Only the newest teardown is kept.
@@ -233,6 +242,9 @@ type minterMetrics struct {
 	// Session recycles are separated by cause.
 	StreamingRecycles    atomic.Int64 // time-based recycle on a streaming handoff
 	ReportDrivenRecycles atomic.Int64 // recycle triggered by a consumer degradation report
+	// IdleCloses counts sessions closed for going unused past the idle timeout.
+	// Nothing replaces one until a request needs it, so it is not a recycle.
+	IdleCloses atomic.Int64
 
 	// Consumer degradation reports, classified by disposition.
 	DegradationReportsAccepted      atomic.Int64
@@ -896,8 +908,7 @@ func (m *Minter) launchReal(ctx context.Context) (minterSession, error) {
 // close an aged session under a request that holds it; running Warm before
 // Serve is then a convenience, not a correctness condition.
 func (m *Minter) Warm(ctx context.Context) error {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	_, _, err := m.ensure(ctx)
 	return err
 }
@@ -1042,6 +1053,7 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		}
 		if m.sess != nil {
 			s, g := m.sess, m.gen
+			m.browserUsed = true
 			m.mu.Unlock()
 			return s, g, nil
 		}
@@ -1062,6 +1074,9 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 			m.launching = la
 			go m.runLaunch(la)
 		}
+		// A launch runs the browser whatever comes of it, so waiting on one is
+		// use; the cool-down refusal above never got this far.
+		m.browserUsed = true
 		m.mu.Unlock()
 		select {
 		case <-la.done:
@@ -1166,6 +1181,9 @@ func (m *Minter) runLaunch(la *launchAttempt) {
 	m.gen++
 	// Fixed before the pre-mint's grant is recorded, which is measured against it.
 	m.attestedAt = time.Now()
+	// A session whose launch outlived its caller still gets the whole idle
+	// timeout before closeIdle takes it.
+	m.lastUsedAt = m.attestedAt
 	// A new page starts with no marks and no proof-failure record. A
 	// successful pre-mint sets its first mark below.
 	m.lastMintAt = time.Time{}
@@ -1219,6 +1237,12 @@ func (m *Minter) runLaunch(la *launchAttempt) {
 // is true, it increments Crashes. The generation check makes concurrent
 // retirement attempts idempotent.
 func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
+	return m.retireAt(slog.LevelWarn, gen, reason, isCrash)
+}
+
+// retireAt is retire with the level its log line takes: every retirement but
+// the idle close answers something that went wrong.
+func (m *Minter) retireAt(level slog.Level, gen uint64, reason string, isCrash bool) bool {
 	m.mu.Lock()
 	if m.sess == nil || m.gen != gen {
 		m.mu.Unlock()
@@ -1239,8 +1263,79 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	if cancel != nil {
 		cancel()
 	}
-	m.log.Warn("minter: retiring session", "gen", gen, "reason", reason)
+	m.log.Log(context.Background(), level, "minter: retiring session", "gen", gen, "reason", reason)
 	old.Close()
+	return true
+}
+
+// holdPage takes the page for a request, as defer m.holdPage()(). It is
+// mintMu's Lock and Unlock with the use the idle timeout measures tied to
+// them, so a request cannot take the page without being counted. A request is
+// use from the moment it queues for the page until it lets go. What it leaves
+// behind as the last use is the moment it let go, and only if it took the
+// browser (see ensure): a token found cached after the wait and a cool-down
+// refusal never touch it, so a retry storm against a failing tenant does not
+// keep the browser awake. The paths that only try the lock (closeIdle, Health,
+// ReportDegraded) are not use.
+func (m *Minter) holdPage() (release func()) {
+	m.mu.Lock()
+	m.pageUsers++
+	m.mu.Unlock()
+	m.mintMu.Lock()
+	return func() {
+		m.mu.Lock()
+		m.pageUsers--
+		if m.browserUsed {
+			m.browserUsed = false
+			m.lastUsedAt = time.Now()
+		}
+		m.mu.Unlock()
+		m.mintMu.Unlock()
+	}
+}
+
+// lastUsed is when the tenant last used the browser: now while a request holds
+// the page or waits for it, and zero if none ever took it.
+func (m *Minter) lastUsed() time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pageUsers > 0 {
+		return time.Now()
+	}
+	return m.lastUsedAt
+}
+
+// closeIdle closes the session if no request has used it for idle, and reports
+// whether it did. A request holding the page is a use in progress. The next
+// request that needs a session launches one, as after any retirement, and the
+// cached tokens stay servable meanwhile: a token outlives the page that minted
+// it (see dropReportedGenerationLocked).
+func (m *Minter) closeIdle(idle time.Duration) bool {
+	if !m.mintMu.TryLock() {
+		return false
+	}
+	defer m.mintMu.Unlock()
+	return m.closeIdleLocked(idle)
+}
+
+// closeIdleLocked is closeIdle once it has the page. A request that queued for
+// the page in the meantime keeps the session it came for.
+func (m *Minter) closeIdleLocked(idle time.Duration) bool {
+	m.mu.Lock()
+	gen, live, unused, queued := m.gen, m.sess != nil, time.Since(m.lastUsedAt), m.pageUsers > 0
+	m.mu.Unlock()
+	if !live || queued || unused < idle {
+		return false
+	}
+	// A report still pending on the session is why it closes. The timeout only
+	// supplies the moment, so the close is the report's recycle, not an idle one.
+	if m.retireReported("consumer reported degradation; closing the idle session") {
+		return false
+	}
+	if !m.retireAt(slog.LevelInfo, gen, "unused for "+unused.Round(time.Second).String(), false) {
+		return false
+	}
+	m.metrics.IdleCloses.Add(1)
 	return true
 }
 
@@ -1265,16 +1360,22 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	m.retire(gen, reason, true)
 }
 
+// reportRelaunchReason is the retirement reason when a request consumes a
+// pending report: its own launch follows.
+const reportRelaunchReason = "consumer reported degradation; relaunching"
+
 // retireReported retires the current generation when a consumer report is
 // pending on it, charging the report budget the way an immediate retirement
 // does. Every request that takes the page calls it first, so a deferred report
-// is consumed by the next request of any kind. The caller holds mintMu.
-func (m *Minter) retireReported() bool {
+// is consumed by the next request of any kind, and the idle close calls it for
+// a session no request came back to. reason is the log line's. The caller
+// holds mintMu.
+func (m *Minter) retireReported(reason string) bool {
 	m.mu.Lock()
 	cur := m.gen
 	suspect := m.sess != nil && m.reportSuspectGen == cur && cur != 0
 	m.mu.Unlock()
-	if !suspect || !m.retire(cur, "consumer reported degradation; relaunching", false) {
+	if !suspect || !m.retire(cur, reason, false) {
 		return false
 	}
 	m.metrics.ReportDrivenRecycles.Add(1)
@@ -1290,7 +1391,7 @@ func (m *Minter) retireReported() bool {
 // recycle an otherwise usable session for age, though they do consume a pending
 // report the same way this does.
 func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, uint64, error) {
-	if !m.retireReported() {
+	if !m.retireReported(reportRelaunchReason) {
 		m.mu.Lock()
 		cur := m.gen
 		stale := m.sess != nil && !m.streamingDeadline.IsZero() && time.Now().After(m.streamingDeadline)
@@ -1434,11 +1535,10 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		}
 	}
 
-	m.mintMu.Lock() // one page, so mints serialize
-	defer m.mintMu.Unlock()
+	defer m.holdPage()() // one page, so mints serialize
 	// Taking the page consumes a pending report, so no fresh token comes from a
 	// session the consumer called degraded.
-	m.retireReported()
+	m.retireReported(reportRelaunchReason)
 	// Recheck after waiting for mintMu, which can take as long as a full-length
 	// proof: another goroutine may have filled the cache, or the session may have
 	// aged past its bound.
@@ -1561,8 +1661,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, 0, err
 	}
 
-	m.mintMu.Lock() // one page, so player-context calls serialize with mints
-	defer m.mintMu.Unlock()
+	defer m.holdPage()() // one page, so player-context calls serialize with mints
 
 	sess, gen, err := m.refreshStreamingSession(ctx)
 	if err != nil {
@@ -1969,8 +2068,7 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 // is harmless (see ensureProven). The startup self-test normally proves the
 // session first, so this costs nothing.
 func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http.Cookie, uint64, error) {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	// A session lost after its proof, while its cookies are read, is replaced
 	// once, like one that dies during the proof; the replacement is not itself
 	// replaced.
@@ -2189,8 +2287,7 @@ func (m *Minter) healthSnapshot(sess minterSession, gen uint64) HealthSnapshot {
 // in place without the relaunch ladder and returns a persistent failure; a
 // failed proof is logged and retried by the first endpoint that needs it.
 func (m *Minter) SelfTest(ctx context.Context) error {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	sess, gen, err := m.ensure(ctx)
 	if err != nil {
 		return err
@@ -2285,6 +2382,7 @@ var lifetimeCounterKeys = []string{
 	"launch_cooldown_refusals",
 	"streaming_recycles",
 	"report_driven_recycles",
+	"idle_closes",
 	"degradation_reports_accepted",
 	"degradation_reports_rejected_stale",
 	"degradation_reports_already_retired",
@@ -2318,6 +2416,7 @@ func (m *Minter) counterValues() map[string]int64 {
 		"launch_cooldown_refusals":              m.metrics.LaunchCooldownRefusals.Load(),
 		"streaming_recycles":                    m.metrics.StreamingRecycles.Load(),
 		"report_driven_recycles":                m.metrics.ReportDrivenRecycles.Load(),
+		"idle_closes":                           m.metrics.IdleCloses.Load(),
 		"degradation_reports_accepted":          m.metrics.DegradationReportsAccepted.Load(),
 		"degradation_reports_rejected_stale":    m.metrics.DegradationReportsRejectedStale.Load(),
 		"degradation_reports_already_retired":   m.metrics.DegradationReportsAlreadyRetired.Load(),

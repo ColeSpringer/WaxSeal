@@ -7,7 +7,7 @@
 --disable-component-extensions-with-background-pages
 --disable-default-apps
 --disable-dev-shm-usage
---disable-features=site-per-process,TranslateUI
+--disable-features=site-per-process,TranslateUI,AudioServiceOutOfProcess,WebUIOmniboxPopup,WebUIOmniboxAimPopup
 --disable-gpu
 --disable-hang-monitor
 --disable-ipc-flooding-protection

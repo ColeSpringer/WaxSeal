@@ -30,6 +30,7 @@ type serverOpts struct {
 	streamingMaxAge string
 	reportDebounce  string
 	shutdownTimeout string
+	idleTimeout     string
 	metricsPublic   bool
 	metricsKey      string
 	metricsKeyFile  string
@@ -43,6 +44,10 @@ const (
 	streamingMaxAgeFloor = time.Minute
 	// streamingMaxAgeWarn marks values that provide little automatic recycling.
 	streamingMaxAgeWarn = 4 * time.Hour
+
+	// idleTimeoutFloor prevents excessive re-attestation: every wake from an
+	// idle close attests a fresh session.
+	idleTimeoutFloor = time.Minute
 
 	// reportDebounceFloor prevents consumer reports from causing excessive
 	// re-attestation.
@@ -68,6 +73,8 @@ func newServerCmd() *cobra.Command {
 			"--tenant-keys), each key receives an isolated browser context; without\n" +
 			"them, the server is keyless. On SIGTERM or SIGINT it drains in-flight requests\n" +
 			"for up to --shutdown-timeout (default 60s) before tearing the browser down.\n\n" +
+			"The browser stays running between requests unless --idle-timeout is set,\n" +
+			"which trades its idle memory for a slower first request after a quiet spell.\n\n" +
 			"A startup warm-up that YouTube refuses does not stop the server: requests\n" +
 			"that need a session are answered with a Retry-After, and the launch is\n" +
 			"retried in the background until one attests. A browser that cannot set a\n" +
@@ -110,6 +117,13 @@ func newServerCmd() *cobra.Command {
 			"SIGTERM or SIGINT (flag > WAXSEAL_SHUTDOWN_TIMEOUT env > %s default).\n"+
 			"A request still running when the budget expires is severed and logged;\n"+
 			"the daemon still exits 0.", defaultShutdownTimeout))
+	f.StringVar(&o.idleTimeout, "idle-timeout", "",
+		"close a tenant's browser session once no request has used it for this Go\n"+
+			"duration, and Chromium itself once every tenant is idle, freeing their\n"+
+			"memory (flag > WAXSEAL_IDLE_TIMEOUT env > off). The next request that\n"+
+			"needs a session launches both again and waits for attestation, as the\n"+
+			"first request after a recycle does. /ping, /metrics, /report, and cached\n"+
+			"tokens are not use. Minimum 1m; \"0\" keeps the browser running.")
 	f.BoolVar(&o.metricsPublic, "metrics-public", false,
 		"serve full per-tenant /metrics detail (tenant labels + activity) to\n"+
 			"unauthenticated scrapes on a keyed daemon. Ignored without tenant keys\n"+
@@ -128,29 +142,54 @@ func newServerCmd() *cobra.Command {
 	return c
 }
 
-// resolveStreamingMaxAge applies flag, environment, and default precedence.
-// Empty and zero values disable time-based recycling.
-func resolveStreamingMaxAge(cmd *cobra.Command, o *serverOpts, logger *slog.Logger) (time.Duration, error) {
-	raw := streamingMaxAgeDefault.String()
-	if v, ok := os.LookupEnv("WAXSEAL_STREAMING_MAX_AGE"); ok {
+// offDuration is a duration setting that zero or a blank value turns off, and
+// whose floor keeps a short one from re-attesting too often. example and off
+// finish its usage errors: "use a Go duration like 45m, or 0 to disable".
+type offDuration struct {
+	flag, env    string
+	def, floor   time.Duration // def 0 is off unless set
+	example, off string
+}
+
+// resolve applies flag, environment, and default precedence. flagValue is what
+// the flag holds, read only when the flag was set.
+func (s offDuration) resolve(cmd *cobra.Command, flagValue string) (time.Duration, error) {
+	raw := ""
+	if s.def > 0 {
+		raw = s.def.String()
+	}
+	if v, ok := os.LookupEnv(s.env); ok {
 		raw = v
 	}
-	if cmd.Flags().Changed("streaming-max-age") {
-		raw = o.streamingMaxAge
+	if cmd.Flags().Changed(s.flag) {
+		raw = flagValue
 	}
 	if raw = strings.TrimSpace(raw); raw == "" {
-		logStreamingMaxAge(logger, 0)
 		return 0, nil
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: %v (use a Go duration like 45m, or 0 to disable)", raw, err)}
+		return 0, &usageError{msg: fmt.Sprintf("invalid --%s %q: %v (use a Go duration like %s, or 0 to %s)", s.flag, raw, err, s.example, s.off)}
 	}
 	if d < 0 {
-		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: must not be negative (use 0 to disable)", raw)}
+		return 0, &usageError{msg: fmt.Sprintf("invalid --%s %q: must not be negative (use 0 to %s)", s.flag, raw, s.off)}
 	}
-	if d > 0 && d < streamingMaxAgeFloor {
-		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: must be at least %s to prevent excessive re-attestation", raw, streamingMaxAgeFloor)}
+	if d > 0 && d < s.floor {
+		return 0, &usageError{msg: fmt.Sprintf("invalid --%s %q: must be at least %s to prevent excessive re-attestation", s.flag, raw, s.floor)}
+	}
+	return d, nil
+}
+
+// resolveStreamingMaxAge reads --streaming-max-age. Empty and zero values
+// disable time-based recycling.
+func resolveStreamingMaxAge(cmd *cobra.Command, o *serverOpts, logger *slog.Logger) (time.Duration, error) {
+	d, err := offDuration{
+		flag: "streaming-max-age", env: "WAXSEAL_STREAMING_MAX_AGE",
+		def: streamingMaxAgeDefault, floor: streamingMaxAgeFloor,
+		example: "45m", off: "disable",
+	}.resolve(cmd, o.streamingMaxAge)
+	if err != nil {
+		return 0, err
 	}
 	logStreamingMaxAge(logger, d)
 	return d, nil
@@ -220,6 +259,20 @@ func resolveShutdownTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logg
 	}
 	logger.Info("shutdown-timeout set", "value", d)
 	return d, nil
+}
+
+// resolveIdleTimeout reads --idle-timeout. Empty and zero keep the browser
+// running, which is the default.
+func resolveIdleTimeout(cmd *cobra.Command, o *serverOpts, logger *slog.Logger) (time.Duration, error) {
+	d, err := offDuration{
+		flag: "idle-timeout", env: "WAXSEAL_IDLE_TIMEOUT",
+		floor:   idleTimeoutFloor,
+		example: "30m", off: "keep the browser running",
+	}.resolve(cmd, o.idleTimeout)
+	if err == nil && d > 0 {
+		logger.Info("idle-timeout set", "value", d)
+	}
+	return d, err
 }
 
 // resolveMintSeparation reads WAXSEAL_MINT_SEPARATION, which has no flag, the
@@ -593,6 +646,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, err)
 	}
+	idleTimeout, err := resolveIdleTimeout(cmd, o, logger)
+	if err != nil {
+		return failStartup(logger, err)
+	}
 	tenantKeys, tenantKeysFrom, err := resolveKeyMaterial(cmd, keySource{
 		valueFlag: "tenant-keys", fileFlag: "tenant-keys-file",
 		valueEnv: "WAXSEAL_TENANT_KEYS", fileEnv: "WAXSEAL_TENANT_KEYS_FILE",
@@ -664,6 +721,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		StreamingMaxAge: streamingMaxAge,
 		ReportDebounce:  reportDebounce,
 		MintSeparation:  mintSeparation,
+		IdleTimeout:     idleTimeout,
 		MetricsPublic:   o.metricsPublic,
 		MetricsKey:      metricsKey,
 	})

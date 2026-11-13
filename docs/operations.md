@@ -21,6 +21,41 @@ streaming proof then runs with the first request that needs it. A warm-up that
 fails in the browser itself twice running, or attests and cannot mint, stops
 startup.
 
+## Idle timeout
+
+Chromium stays running between requests unless `--idle-timeout`
+(`WAXSEAL_IDLE_TIMEOUT`, minimum `1m`) is set. Each tenant is then timed on its
+own: its session closes once that tenant has gone that long without a request
+that uses the browser, whatever the other tenants are doing. Chromium itself
+exits once the last of them has. On Linux the daemon also releases the page
+cache Chromium's files leave behind, so the container's reported memory falls
+too, unless something else it can see is running the same browser; the next
+launch reads those files back from disk. A close can land a quarter of the
+timeout late, 30 seconds at most.
+
+Use means a request that takes the browser: a token the cache does not hold, a
+context, or a session export. `/ping`, `/metrics`, `/report`, cached tokens,
+and requests refused inside a launch cool-down are not use, and cached tokens
+are still served while the browser is closed.
+
+The request that next needs the browser launches Chromium and attests a
+session: about 4 seconds for a token, and about 20 for a context, which also
+waits for the streaming proof and the mint-separation gate. The session is a
+new identity, and it drops the tokens cached under the old one.
+
+What that costs depends on the consumer. A context or a session export recycles
+a session older than `--streaming-max-age` (45 minutes by default) anyway, so
+with a timeout at or above that they pay only Chromium's launch on top, under a
+second. A consumer that only asks for tokens never recycles that way: for it
+every wake is the full 4 seconds, and the end of an identity and a token cache
+it would otherwise have kept for up to 11 hours.
+
+`/ping` answers an idle daemon with the benign `no-session` and
+`browser_idle:true`, and never wakes it (see [Health checks](#health-checks)).
+It cannot tell whether a browser would start: the request that wakes the daemon
+finds out, and a launch that fails reads as it does at any other time.
+`idle_closes` and `browser_idle_closes` in `/metrics` count the closes.
+
 ## Shutdown and cleanup
 
 A normal teardown terminates Chromium's process group and removes its profile;
@@ -51,7 +86,8 @@ warm session. The reasons are:
   re-establishment is lazy, so `ok` briefly reads `false`. A tenant whose
   session launches fail (see [Errors](api.md#errors)) reads the same, whatever
   failed, with `consecutive_launch_failures` above 0, the failure in `error`,
-  and `retry_after_seconds` while the cool-down is open.
+  and `retry_after_seconds` while the cool-down is open. So does a session the
+  [idle timeout](#idle-timeout) closed.
 - `busy`: benign. The probe failed twice while a request held the page, so
   nothing was retired; the next probe re-checks once that request finishes.
 - `probe-failed`: this probe confirmed a loss, logged at `warn`.
@@ -60,15 +96,18 @@ When no page answered, the probe also checks the shared Chromium, since a
 wedged browser looks the same as a retired, busy, or missing page and would
 stall the next request for its whole budget. A browser that answers, or had
 exited and is relaunched on the spot (`browser_relaunched:true`), leaves the
-tenant reason standing. One that misses two probes is torn down, replaced,
-counted in `browser_probe_failures`, and reported as `probe-failed` with its
-error after the tenant's; one that cannot be replaced is `probe-failed` with
-the launch error. A healthy probe skips this check, costing one round trip.
+tenant reason standing. So does one the idle timeout closed
+(`browser_idle:true`), which the probe leaves closed. One that misses two
+probes is torn down, replaced, counted in `browser_probe_failures`, and
+reported as `probe-failed` with its error after the tenant's; one that cannot
+be replaced is `probe-failed` with the launch error. A healthy probe skips this
+check, costing one round trip.
 
 On a keyed daemon, a `/ping` with no key gets that browser check alone instead
 of `401`. The body says `probe:"daemon"` and carries only `ok` (a running
 Chromium answered, possibly after a relaunch), `probe`, `keyed`, `reason`,
-`browser_relaunched`, and on failure `error`.
+`browser_relaunched`, `browser_idle`, and on failure `error`. A browser the
+idle timeout closed answers `ok:false` with `no-session`.
 
 That reveals less than the redacted `/metrics`, so the check needs no key and
 no loopback source. A caller cannot make a healthy browser fail it, so it can

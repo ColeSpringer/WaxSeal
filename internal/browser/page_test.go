@@ -84,6 +84,7 @@ type fakePageState struct {
 	bypassErr  error // what SetBypassCSP returns
 	navigated  []string
 	crash      string
+	collected  int // CollectGarbage calls
 
 	// wantVideoID, when set, makes Eval fail any load or extract call that names a
 	// different video instead of handing it the canned payload (see fakeCall).
@@ -196,6 +197,20 @@ func (p fakePage) WaitCrash(context.Context) string {
 	return p.crash
 }
 
+func (p fakePage) CollectGarbage() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.collected++
+	return nil
+}
+
+// collectionCount reports how many times the page's heap was collected.
+func (p fakePage) collectionCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.collected
+}
+
 // evalCount reports how many times js was evaluated.
 func (p fakePage) evalCount(js string) int {
 	p.mu.Lock()
@@ -256,6 +271,7 @@ func fastTiming() timing {
 		probeBudget:        200 * time.Millisecond,
 		stallWindow:        40 * time.Millisecond,
 		hardTimeout:        2 * time.Second,
+		gcDelay:            20 * time.Millisecond,
 	}
 }
 

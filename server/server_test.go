@@ -2729,6 +2729,8 @@ type fakeProber struct {
 	calls      int
 	probes     int64
 	relaunches int64
+	idleCloses int64
+	suspends   atomic.Int64 // Suspend calls
 }
 
 func (f *fakeProber) Health(ctx context.Context) (browser.Recovery, error) {
@@ -2740,6 +2742,8 @@ func (f *fakeProber) Health(ctx context.Context) (browser.Recovery, error) {
 }
 func (f *fakeProber) ProbeFailures() int64    { return f.probes }
 func (f *fakeProber) RelaunchFailures() int64 { return f.relaunches }
+func (f *fakeProber) IdleCloses() int64       { return f.idleCloses }
+func (f *fakeProber) Suspend() bool           { f.suspends.Add(1); return false }
 
 // proberOf installs f as s's browser prober and returns f.
 func proberOf(s *Server, f *fakeProber) *fakeProber {

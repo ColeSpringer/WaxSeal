@@ -239,11 +239,15 @@ type fakeProber struct {
 	err        error
 	probes     int64
 	relaunches int64
+	idle       int64
+	suspends   atomic.Int64 // Suspend calls, each of which reports a close
 }
 
 func (f *fakeProber) Health(context.Context) (browser.Recovery, error) { return f.rec, f.err }
 func (f *fakeProber) ProbeFailures() int64                             { return f.probes }
 func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunches }
+func (f *fakeProber) IdleCloses() int64                                { return f.idle }
+func (f *fakeProber) Suspend() bool                                    { f.suspends.Add(1); return true }
 
 // A Minter handed out after the registry closed is born closed, and it must
 // also launch through the registry (newMinter), never through NewMinter's
@@ -288,6 +292,9 @@ func TestTenantsBrowserHealthWithoutPool(t *testing.T) {
 	if got := tn.BrowserRelaunchFailures(); got != 0 {
 		t.Errorf("BrowserRelaunchFailures with no pool = %d, want 0", got)
 	}
+	if got := tn.MetricsSnapshot()["browser_idle_closes"]; got != int64(0) {
+		t.Errorf("browser_idle_closes with no pool = %v, want 0", got)
+	}
 }
 
 // Dependent packages install a prober to drive a probe through every browser
@@ -313,9 +320,9 @@ func TestTenantsBrowserProberSeam(t *testing.T) {
 // redacted view reports them as they are, outside the summed aggregate.
 func TestTenantsMetricsCarryBrowserCounters(t *testing.T) {
 	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
-	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunches: 2})
+	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunches: 2, idle: 4})
 	full, redacted := tn.MetricsSnapshot(), tn.AggregateMetricsSnapshot()
-	want := map[string]int64{"browser_probe_failures": 3, "browser_relaunch_failures": 2}
+	want := map[string]int64{"browser_probe_failures": 3, "browser_relaunch_failures": 2, "browser_idle_closes": 4}
 	for name, snap := range map[string]map[string]any{"full": full, "redacted": redacted} {
 		for k, w := range want {
 			v, ok := snap[k]

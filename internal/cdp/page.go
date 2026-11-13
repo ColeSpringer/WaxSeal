@@ -85,6 +85,15 @@ func (p *Page) SetUserAgentOverride(req *NetworkSetUserAgentOverride) error {
 	return p.conn.call(p.ctx, p.sessionID, "Network.setUserAgentOverride", req, nil)
 }
 
+// CollectGarbage runs a full collection of the page's JavaScript heap
+// (HeapProfiler.collectGarbage) and returns the freed memory to the system. It
+// pauses the page for about 0.2 s on a watch page. A script can tell that a
+// collection ran (a WeakRef empties, a FinalizationRegistry fires), as it can
+// for the ones V8 runs unasked, but not that this one was requested.
+func (p *Page) CollectGarbage() error {
+	return p.conn.call(p.ctx, p.sessionID, "HeapProfiler.collectGarbage", nil, nil)
+}
+
 // WaitCrash enables the Inspector domain and blocks until the page's target
 // crashes or detaches, the connection is lost, or ctx is done; ctx also bounds
 // the enable call. It returns a diagnostic reason, or "" when ctx is done.

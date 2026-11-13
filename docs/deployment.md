@@ -139,6 +139,22 @@ so it sits at the service indentation. On a host with swap, leaving it out moves
 the kill point from the limit to twice the limit. The `docker run` equivalent is
 `--memory 2g --memory-swap 2g`.
 
+## Free memory while idle
+
+Chromium holds about 300 MB between requests, and `docker stats` counts its
+cached files on top. `WAXSEAL_IDLE_TIMEOUT` closes it once no request has needed
+the browser for that long, which leaves about 20 MB. Put it under
+`environment:`, in the block the file already has if you added one:
+
+```yaml
+    environment:
+      WAXSEAL_IDLE_TIMEOUT: 30m
+```
+
+The next request that needs the browser starts it again and is slower for it;
+[operations.md](operations.md#idle-timeout) has the cost. The healthcheck
+passes while the browser is closed.
+
 ## Read-only root filesystem
 
 Chromium needs a writable home for its profile and a writable `/tmp`, so a

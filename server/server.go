@@ -55,6 +55,14 @@ type Config struct {
 	// itself, so a bad value stops startup, and passes the result here.
 	MintSeparation time.Duration
 
+	// IdleTimeout closes a tenant's browser session once no request has used it
+	// for this long, and Chromium itself once that is true of every tenant; the
+	// request that next needs a session launches both again. Probes, metrics
+	// scrapes, reports, and cached tokens are not use. A non-positive value
+	// keeps the browser running. Like the other durations here it is taken as
+	// given: the server command is what refuses one under a minute.
+	IdleTimeout time.Duration
+
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
 	// without a metrics key. It is ignored for keyless daemons, which already
 	// serve full detail.
@@ -121,8 +129,10 @@ func NewWithContext(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	tenants := minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce, cfg.MintSeparation)
+	tenants.CloseIdleAfter(cfg.IdleTimeout)
 	s := &Server{
-		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce, cfg.MintSeparation),
+		tenants:       tenants,
 		log:           log,
 		metricsPublic: cfg.MetricsPublic,
 		// Hash once here; metricsFull compares fixed-length digests.
@@ -228,6 +238,9 @@ func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
 // tears down the browser either way and returns the drain's error. The waxseal
 // server command bounds ctx with --shutdown-timeout (default 60s).
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Idle closing ends before the drain, not after: a pass during it could
+	// close the browser under a request still being served.
+	s.tenants.StopIdleClose()
 	err := s.srv.Shutdown(ctx)
 	s.tenants.Close()
 	return err
@@ -457,7 +470,8 @@ var errBrowserTornDown = errors.New("the shared browser missed two probes and wa
 // no key on a keyless daemon, probes that tenant's session; no key on a keyed
 // daemon probes the shared browser (see handleDaemonPing). A tenant probe whose
 // page did not answer runs the browser check too, so a wedged Chromium is
-// replaced by the probe instead of stalling the next request.
+// replaced by the probe instead of stalling the next request. A Chromium closed
+// for idleness (Config.IdleTimeout) is reported as browser_idle and left closed.
 //
 // The body is a health report, not the error envelope, and always carries a
 // reason (the PingReason values). The probe runs on the raw request context
@@ -484,7 +498,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap, live, err := m.Health(r.Context())
-	reason, relaunched := PingReasonOK, false
+	reason, rec := PingReasonOK, browser.RecoveryNone
 	if err != nil {
 		if s.pingAbandoned(r, "tenant", label) {
 			return
@@ -496,7 +510,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		// the tenant reason standing: the failure was the page's own, or
 		// contention. The healthy path skips this because a page that answered has
 		// proved the browser.
-		reason, err, relaunched = s.checkBrowser(r.Context(), reason, err, "tenant", label)
+		reason, rec, err = s.checkBrowser(r.Context(), reason, err, "tenant", label)
 		if s.pingAbandoned(r, "tenant", label) {
 			return
 		}
@@ -519,7 +533,8 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		"last_browser_proof_outcome":  snap.LastBrowserProofOutcome,
 		"streaming_suspect":           snap.StreamingSuspect,
 		"consecutive_launch_failures": snap.ConsecutiveLaunchFailures,
-		"browser_relaunched":          relaunched,
+		"browser_relaunched":          browserRelaunched(rec),
+		"browser_idle":                rec == browser.RecoverySuspended,
 	}
 	// Present only while a launch cool-down is open, like the envelope's field:
 	// any value there tells a reader to wait.
@@ -537,21 +552,29 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 // address, so the source address identifies no one. A caller cannot make a
 // healthy browser fail, so a probe's teardown and relaunch hit only a wedged or
 // dead browser, and the pool single-flights and backs off relaunches.
+//
+// A browser closed for idleness answers the benign no-session, not ok: nothing
+// is running, and nothing is wrong.
 func (s *Server) handleDaemonPing(w http.ResponseWriter, r *http.Request) {
 	strict, ok := strictPing(r)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
 		return
 	}
-	reason, err, relaunched := s.checkBrowser(r.Context(), PingReasonOK, nil) // it names the browser itself
+	reason, rec, err := s.checkBrowser(r.Context(), PingReasonOK, nil) // it names the browser itself
 	if err != nil && s.pingAbandoned(r, "probe", PingProbeDaemon) {
 		return
 	}
+	idle := rec == browser.RecoverySuspended
+	if idle {
+		reason = PingReasonNoSession
+	}
 	writePing(w, strict, reason, err, map[string]any{
-		"ok":                 err == nil,
+		"ok":                 err == nil && !idle,
 		"probe":              PingProbeDaemon,
 		"keyed":              s.tenants.Keyed(),
-		"browser_relaunched": relaunched,
+		"browser_relaunched": browserRelaunched(rec),
+		"browser_idle":       idle,
 	})
 }
 
@@ -574,32 +597,38 @@ func tenantPingReason(err error) string {
 }
 
 // checkBrowser runs the browser check and folds its outcome into the probe's
-// reason and error so far (a tenant probe's, or ok and nil at daemon level). A
-// browser that answered leaves them, and so does one that had exited and was
-// relaunched, since the daemon has a browser again; the relaunch is reported.
+// reason and error so far (a tenant probe's, or ok and nil at daemon level),
+// returning what the check had to do beside them. A browser that answered
+// leaves them, and so does one that had exited and was relaunched, since the
+// daemon has a browser again, and one closed for idleness, which is no fault.
 // One this probe found wedged, or could not replace, is a loss: the reason
 // becomes probe-failed, logged at warn naming the browser so it is not read as
 // one tenant's, and the browser's error is appended to any tenant probe error.
 // Cancellation is returned as is, unlogged, for the abandoned-request check.
-func (s *Server) checkBrowser(ctx context.Context, reason string, err error, attrs ...any) (string, error, bool) {
+func (s *Server) checkBrowser(ctx context.Context, reason string, err error, attrs ...any) (string, browser.Recovery, error) {
 	rec, berr := s.tenants.BrowserHealth(ctx)
 	if ctx.Err() != nil {
-		return reason, ctx.Err(), false
+		return reason, browser.RecoveryNone, ctx.Err()
 	}
-	relaunched := rec != browser.RecoveryNone
 	switch {
 	case berr != nil:
 		berr = fmt.Errorf("no browser answers and none could be launched: %w", berr)
 	case rec == browser.RecoveryTornDown:
 		berr = errBrowserTornDown
 	default:
-		return reason, err, relaunched
+		return reason, rec, err
 	}
 	s.logPing(PingReasonProbeFailed, berr, append(attrs, "probe", PingProbeDaemon)...)
 	if err != nil {
 		berr = fmt.Errorf("%v; %w", err, berr)
 	}
-	return PingReasonProbeFailed, berr, relaunched
+	return PingReasonProbeFailed, rec, berr
+}
+
+// browserRelaunched reports whether the browser check launched a replacement,
+// which the health body states as browser_relaunched.
+func browserRelaunched(rec browser.Recovery) bool {
+	return rec == browser.RecoveryRelaunched || rec == browser.RecoveryTornDown
 }
 
 // pingAbandoned reports whether the caller has gone away, logging it at debug.
@@ -895,7 +924,9 @@ const (
 	// PingReasonNoSession means no session is attested: a report retires one and
 	// re-establishment is lazy, or the last launch failed, which the body's
 	// consecutive_launch_failures and error then say. Benign either way: the
-	// probe did not observe the failure, and nothing but a launch clears it.
+	// probe did not observe the failure, and nothing but a launch clears it. An
+	// idle close reads the same, on either probe, with browser_idle once
+	// Chromium itself is closed.
 	PingReasonNoSession = "no-session"
 	// PingReasonBusy means a probe failed twice while a request held the page, so
 	// nothing was retired and the next probe re-checks. Benign.

@@ -313,7 +313,7 @@ operator key or an explicit public flag:
 `--metrics-public` wins; both are ignored on a keyless daemon.
 
 The full view is `{"tenants":N,"per_tenant":{"<label>":{...}},...}` plus the
-two browser counters below. `tenants` counts the tenants used since start (the
+`browser_*` counters below. `tenants` counts the tenants used since start (the
 set `per_tenant` lists), so a probe or request on a never-used tenant raises
 it; the startup log's `configured_tenants` is the configured count. Each tenant
 object carries current state and lifetime counters such as `mints`, `crashes`,
@@ -353,8 +353,12 @@ These counters are worth knowing exactly:
   browser, not per probe.
 - `browser_relaunch_failures` counts failed relaunch attempts, from a probe or a
   request; with a failing probe, it means the daemon has no browser and cannot
-  get one. Both browser counters describe the shared Chromium, so both views
-  carry them at the top level, not among the summed counters.
+  get one.
+- `idle_closes` counts a tenant's sessions closed by `--idle-timeout`, and
+  `browser_idle_closes` the times Chromium itself was (see
+  [Idle timeout](operations.md#idle-timeout)). Neither is a loss, so `crashes`
+  does not move. The three `browser_*` counters describe the shared Chromium,
+  so both views carry them at the top level, not among the summed counters.
 - `launch_failures` counts failed session launches, and
   `launch_cooldown_refusals` the callers refused inside the cool-down a failure
   opens, without a launch: requests, and the startup retry when a request's
@@ -379,7 +383,7 @@ a deadline jittered by up to ten percent so a fleet does not recycle in
 lockstep.
 
 The redacted view is `{"redacted":true,"aggregate":{...},...}`: the counters
-summed across tenants, plus the two browser counters at the top level.
+summed across tenants, plus the `browser_*` counters at the top level.
 
 ## Errors
 

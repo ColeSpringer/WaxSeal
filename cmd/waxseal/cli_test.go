@@ -288,7 +288,7 @@ func clearServerEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"WAXSEAL_STREAMING_MAX_AGE", "WAXSEAL_REPORT_DEBOUNCE", "WAXSEAL_SHUTDOWN_TIMEOUT",
-		"WAXSEAL_MINT_SEPARATION",
+		"WAXSEAL_MINT_SEPARATION", "WAXSEAL_IDLE_TIMEOUT",
 		"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE",
 		"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE",
 	} {
@@ -912,6 +912,72 @@ func TestResolveStreamingMaxAge(t *testing.T) {
 		t.Run("reject "+bad, func(t *testing.T) {
 			os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
 			d, err := resolveSMA(t, "--streaming-max-age", bad)
+			if err == nil {
+				t.Fatalf("%q = (%v, nil), want an error", bad, d)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("%q exitCodeFor = %d, want 2", bad, got)
+			}
+		})
+	}
+}
+
+// resolveIT binds the flag before resolving it.
+func resolveIT(t *testing.T, flagArgs ...string) (time.Duration, error) {
+	t.Helper()
+	var o serverOpts
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().StringVar(&o.idleTimeout, "idle-timeout", "", "")
+	if err := cmd.ParseFlags(flagArgs); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	return resolveIdleTimeout(cmd, &o, slog.New(slog.DiscardHandler))
+}
+
+// The idle timeout is off unless asked for, and otherwise reads like the other
+// duration settings: flag over variable, with a floor that keeps a short
+// timeout from re-attesting between every pair of requests.
+func TestResolveIdleTimeout(t *testing.T) {
+	t.Run("off when unset", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_IDLE_TIMEOUT")
+		if d, err := resolveIT(t); err != nil || d != 0 {
+			t.Fatalf("default = (%v, %v), want (0, nil)", d, err)
+		}
+	})
+	t.Run("env sets it", func(t *testing.T) {
+		t.Setenv("WAXSEAL_IDLE_TIMEOUT", "30m")
+		if d, err := resolveIT(t); err != nil || d != 30*time.Minute {
+			t.Fatalf("env = (%v, %v), want 30m", d, err)
+		}
+	})
+	t.Run("flag overrides env", func(t *testing.T) {
+		t.Setenv("WAXSEAL_IDLE_TIMEOUT", "30m")
+		if d, err := resolveIT(t, "--idle-timeout", "2h"); err != nil || d != 2*time.Hour {
+			t.Fatalf("flag>env = (%v, %v), want 2h", d, err)
+		}
+	})
+	t.Run("zero turns an env value off", func(t *testing.T) {
+		t.Setenv("WAXSEAL_IDLE_TIMEOUT", "30m")
+		if d, err := resolveIT(t, "--idle-timeout", "0"); err != nil || d != 0 {
+			t.Fatalf("0 = (%v, %v), want (0, nil)", d, err)
+		}
+	})
+	t.Run("blank env is off", func(t *testing.T) {
+		t.Setenv("WAXSEAL_IDLE_TIMEOUT", "  ")
+		if d, err := resolveIT(t); err != nil || d != 0 {
+			t.Fatalf("blank = (%v, %v), want (0, nil)", d, err)
+		}
+	})
+	t.Run("floor is accepted", func(t *testing.T) {
+		os.Unsetenv("WAXSEAL_IDLE_TIMEOUT")
+		if d, err := resolveIT(t, "--idle-timeout", "1m"); err != nil || d != time.Minute {
+			t.Fatalf("1m = (%v, %v), want (1m, nil)", d, err)
+		}
+	})
+	for _, bad := range []string{"abc", "-5m", "30s", "59s"} {
+		t.Run("reject "+bad, func(t *testing.T) {
+			os.Unsetenv("WAXSEAL_IDLE_TIMEOUT")
+			d, err := resolveIT(t, "--idle-timeout", bad)
 			if err == nil {
 				t.Fatalf("%q = (%v, nil), want an error", bad, d)
 			}

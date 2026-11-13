@@ -22,7 +22,8 @@ func readFixture(t *testing.T, name string) []byte {
 }
 
 // TestArgvGolden asserts BuildArgs equals the previous driver's captured argv,
-// with remote-debugging-port replaced by remote-debugging-pipe.
+// with remote-debugging-port replaced by remote-debugging-pipe and the three
+// memory-saving names added to --disable-features (see baseArgs).
 func TestArgvGolden(t *testing.T) {
 	const profile = "/waxseal-profile"
 

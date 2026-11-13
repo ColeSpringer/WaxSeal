@@ -321,6 +321,51 @@ func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
 	}
 }
 
+// A daemon woken from an idle close serves a full-length context: the request
+// that finds the browser closed launches it again, attests, and proves before
+// anything is handed out.
+func TestIdleWakeFullLengthHTTP(t *testing.T) {
+	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
+		t.Skip("idle-wake test requires an in-process daemon")
+	}
+	// Several times what the stream below takes between its calls to the
+	// daemon, a throttled one included, so the one close under test is the one
+	// before the request and a slow download is not a second.
+	const idle = 90 * time.Second
+	srv, ln := newInProcessDaemon(t, server.Config{IdleTimeout: idle})
+	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	if err := srv.Warm(warmCtx, ""); err != nil {
+		cancel()
+		t.Fatalf("warm: %v", err)
+	}
+	cancel()
+	base := serveDaemon(t, srv, ln)
+
+	first := srv.BrowserPID()
+	if first == 0 {
+		t.Fatal("BrowserPID = 0 on a warm daemon")
+	}
+	for deadline := time.Now().Add(idle + 30*time.Second); srv.BrowserPID() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("browser %d is still running 30s past an idle timeout of %s", first, idle)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel2()
+	n, info, fellBack, warnings, ok := streamWEBContext(t, ctx, provider.New(client.New(base)), nil, bbbURL)
+	if fellBack {
+		t.Errorf("the request that woke the daemon fell back from the player-context path")
+	}
+	if info.Client != clientWebContext {
+		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
+	}
+	if ok {
+		requireFullLength(t, n, info, "first call after an idle close", warnings)
+	}
+}
+
 // A short landing video must fall back to the default proof video.
 func TestShortLandingVideoEstablishesHTTP(t *testing.T) {
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {

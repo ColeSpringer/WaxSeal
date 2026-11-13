@@ -30,6 +30,16 @@ type SpawnOptions struct {
 // is not among them. Several affect fingerprinting and process cleanup, so
 // TestArgvGolden pins the whole BuildArgs argv to testdata/argv_baseline.txt,
 // with remote-debugging-port swapped for remote-debugging-pipe.
+//
+// The last three --disable-features names save memory. AudioServiceOutOfProcess
+// runs the audio service in the browser process (about 16 MB), at the price
+// that an audio fault takes the browser, and every tenant's session, with it
+// instead of one helper. The two omnibox names drop the renderer Chromium
+// keeps for its address-bar dropdown, which a headless daemon never shows
+// (about 27 MB; either name alone leaves that renderer running). Neither
+// changes what a page observes: the AudioContext, the device list, the
+// offline-audio fingerprint, and the codec answers read the same either way
+// on Chrome 157 and Debian's Chromium 156.
 var baseArgs = []string{
 	"--remote-debugging-pipe",
 	"--no-sandbox",
@@ -39,7 +49,7 @@ var baseArgs = []string{
 	"--disable-blink-features=AutomationControlled",
 	"--no-first-run",
 	"--no-startup-window",
-	"--disable-features=site-per-process,TranslateUI",
+	"--disable-features=site-per-process,TranslateUI,AudioServiceOutOfProcess,WebUIOmniboxPopup,WebUIOmniboxAimPopup",
 	"--disable-background-networking",
 	"--disable-background-timer-throttling",
 	"--disable-backgrounding-occluded-windows",

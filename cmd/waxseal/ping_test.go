@@ -302,6 +302,28 @@ func TestPingCLIDaemonProbe(t *testing.T) {
 	}
 }
 
+// A daemon asleep under --idle-timeout answers no-session with browser_idle on
+// either probe. Strict, which a liveness check uses, calls that healthy and
+// says the browser is idle; the default mode still wants a live session, and
+// its error says why there is none.
+func TestPingCLIIdleBrowser(t *testing.T) {
+	fake := &pingFake{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.serve))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	for _, probe := range []string{"daemon", "tenant"} {
+		fake.answer(http.StatusOK, `{"ok":false,"probe":"`+probe+`","reason":"no-session","browser_idle":true,"browser_relaunched":false}`)
+		if out, err := runPingAgainst(t, addr, "--strict"); err != nil || out != "ok (reason=no-session, browser idle)\n" {
+			t.Errorf("%s probe, strict: out=%q err=%v, want %q", probe, out, err, "ok (reason=no-session, browser idle)\n")
+		}
+		_, err := runPingAgainst(t, addr)
+		if want := "unhealthy: status=200 ok=false reason=no-session (browser idle)"; err == nil || err.Error() != want {
+			t.Errorf("%s probe, default mode: err = %v, want %q", probe, err, want)
+		}
+	}
+}
+
 // runPingAgainst runs one probe against addr and returns its stdout and error.
 func runPingAgainst(t *testing.T, addr string, args ...string) (string, error) {
 	t.Helper()

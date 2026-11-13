@@ -214,6 +214,33 @@ func TestLiveNavigateWaitLoadEval(t *testing.T) {
 	}
 }
 
+// CollectGarbage is the collection a session runs on its idle page. A WeakRef
+// whose target nothing else holds reads empty once it has run.
+func TestLiveCollectGarbage(t *testing.T) {
+	b := spawnForTest(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	page, err := b.Context(ctx).Page(TargetCreateTarget{URL: "about:blank"})
+	if err != nil {
+		t.Fatalf("page: %v", err)
+	}
+	p := page.Context(ctx)
+	if _, err := p.Eval(`() => { globalThis.__weak = new WeakRef({ pad: new Array(100000).fill(0) }); return true }`); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if err := p.CollectGarbage(); err != nil {
+		t.Fatalf("CollectGarbage: %v", err)
+	}
+	got, err := p.Eval(`() => globalThis.__weak.deref() === undefined ? "collected" : "alive"`)
+	if err != nil {
+		t.Fatalf("deref: %v", err)
+	}
+	if got.Str() != "collected" {
+		t.Errorf("weak target is %s after CollectGarbage, want collected", got.Str())
+	}
+}
+
 // The Accept-Language override makes the bot wall's phrase independent of the
 // host's locale, so it is proved against a real browser. It takes Chrome's
 // pref-style list: Chrome appends its own q-values to derive the header and

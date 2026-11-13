@@ -4,7 +4,7 @@
 go test ./...                              # offline unit tests; no browser or network
 (cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
-(cd provider && go test -tags live ./...)  # the nested module's test that needs Chromium but no network
+(cd provider && go test -tags live ./...)  # the nested module's tests that need Chromium but no network
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs Chromium and network access
 make vet                                   # both modules, plus a windows cross-vet (CI vets Windows natively)
 make fmt-check                             # fail if any file needs gofmt
